@@ -4,6 +4,8 @@ This project is a Rust-based TUI for planning Factorio factories. Use Ratatui
 for the terminal user interface and prefer Rust crates, tooling, and
 implementations throughout the application.
 
+Follow the staged implementation plan in `plans/implementation.md`.
+
 Keep the factory-planning domain logic independent from terminal rendering and
 input handling so that calculations can be tested without running the TUI.
 
