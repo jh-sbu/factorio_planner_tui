@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    factorio_planner_tui::run();
 }
