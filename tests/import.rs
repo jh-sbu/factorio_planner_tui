@@ -1,8 +1,9 @@
 use std::io::Cursor;
 
 use factorio_planner_tui::catalog::{
-    CommodityId, FluidId, FuelCategory, ItemId, MachineEnergySource, MachineId, ModuleCategory,
-    ModuleEffect, Positive, RecipeCategory, RecipeId, UnsupportedEnergySource,
+    BeltId, CommodityId, FluidId, FuelCategory, FuelId, ItemId, MachineEnergySource, MachineId,
+    ModuleCategory, ModuleEffect, ModuleId, Positive, RecipeCategory, RecipeId,
+    UnsupportedEnergySource,
 };
 use factorio_planner_tui::import::{
     DiagnosticSeverity, ImportError, PrototypeDisposition, parse_data_raw,
@@ -32,6 +33,273 @@ fn invalid_data(json: &str) -> Vec<factorio_planner_tui::import::ImportDiagnosti
         Err(ImportError::InvalidData { diagnostics }) => diagnostics,
         other => panic!("expected invalid import data, got {other:?}"),
     }
+}
+
+#[test]
+fn imports_modules_fuels_and_transport_belts() {
+    let report = import(include_str!("fixtures/modules-fuels-belts-data-raw.json")).unwrap();
+    let catalog = report.catalog();
+
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(catalog.modules().len(), 2);
+    assert_eq!(catalog.fuels().len(), 2);
+    assert_eq!(catalog.belts().len(), 2);
+
+    let productivity = catalog
+        .module(&ModuleId::new("productivity-module").unwrap())
+        .unwrap();
+    assert_eq!(
+        productivity.category(),
+        &ModuleCategory::new("productivity").unwrap()
+    );
+    assert_close(productivity.speed_effect().get(), -0.15);
+    assert_close(productivity.productivity_effect().get(), 0.04);
+    assert_close(productivity.consumption_effect().get(), 0.4);
+    assert!(productivity.unsupported_effects().is_empty());
+    assert!(productivity.is_selectable());
+
+    let speed = catalog
+        .module(&ModuleId::new("speed-module").unwrap())
+        .unwrap();
+    assert_close(speed.speed_effect().get(), 0.2);
+    assert_close(speed.productivity_effect().get(), 0.0);
+    assert_close(speed.consumption_effect().get(), 0.5);
+    assert!(
+        catalog.commodity(&item("speed-module")).is_some(),
+        "module prototypes must also be item commodities"
+    );
+
+    let coal = catalog.fuel(&FuelId::new("coal").unwrap()).unwrap();
+    assert_eq!(coal.item(), &ItemId::new("coal").unwrap());
+    assert_eq!(coal.category(), &FuelCategory::new("chemical").unwrap());
+    assert_close(coal.fuel_value().get(), 8_000_000.0);
+    assert_eq!(coal.burnt_result(), Some(&ItemId::new("ash").unwrap()));
+    assert!(catalog.fuel(&FuelId::new("inert-item").unwrap()).is_none());
+
+    assert_close(
+        catalog
+            .belt(&BeltId::new("transport-belt").unwrap())
+            .unwrap()
+            .throughput()
+            .get(),
+        15.0,
+    );
+    assert_close(
+        catalog
+            .belt(&BeltId::new("fast-transport-belt").unwrap())
+            .unwrap()
+            .throughput()
+            .get(),
+        30.0,
+    );
+}
+
+#[test]
+fn converts_energy_units_for_power_and_fuel_values() {
+    let report = import(
+        r#"{
+            "item": {
+                "joule-fuel": {
+                    "type": "item",
+                    "name": "joule-fuel",
+                    "fuel_category": "chemical",
+                    "fuel_value": "60J"
+                },
+                "watt-fuel": {
+                    "type": "item",
+                    "name": "watt-fuel",
+                    "fuel_category": "chemical",
+                    "fuel_value": "60W"
+                }
+            },
+            "assembling-machine": {
+                "joule-machine": {
+                    "type": "assembling-machine",
+                    "name": "joule-machine",
+                    "crafting_categories": ["crafting"],
+                    "crafting_speed": 1,
+                    "energy_usage": "1J",
+                    "energy_source": {"type": "electric"}
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    assert_close(
+        report
+            .catalog()
+            .fuel(&FuelId::new("joule-fuel").unwrap())
+            .unwrap()
+            .fuel_value()
+            .get(),
+        60.0,
+    );
+    assert_close(
+        report
+            .catalog()
+            .fuel(&FuelId::new("watt-fuel").unwrap())
+            .unwrap()
+            .fuel_value()
+            .get(),
+        1.0,
+    );
+    assert_close(
+        report
+            .catalog()
+            .machine(&MachineId::new("joule-machine").unwrap())
+            .unwrap()
+            .energy_usage()
+            .get(),
+        60.0,
+    );
+}
+
+#[test]
+fn retains_unsupported_module_effects_as_selection_blocking_warnings() {
+    let report = import(
+        r#"{
+            "module": {
+                "future-module": {
+                    "type": "module",
+                    "name": "future-module",
+                    "category": "future",
+                    "effect": {
+                        "speed": 0.1,
+                        "pollution": -0.2,
+                        "quality": 0.05,
+                        "future-effect": {"value": 7}
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let module = report
+        .catalog()
+        .module(&ModuleId::new("future-module").unwrap())
+        .unwrap();
+
+    assert_close(module.speed_effect().get(), 0.1);
+    assert_eq!(
+        module.unsupported_effects(),
+        &["future-effect", "pollution", "quality"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert!(!module.is_selectable());
+
+    for path in [
+        "/module/future-module/effect/future-effect",
+        "/module/future-module/effect/pollution",
+        "/module/future-module/effect/quality",
+    ] {
+        assert!(report.diagnostics().iter().any(|diagnostic| {
+            diagnostic.severity == DiagnosticSeverity::Warning
+                && diagnostic.prototype_type.as_deref() == Some("module")
+                && diagnostic.prototype_id.as_deref() == Some("future-module")
+                && diagnostic.path == path
+                && diagnostic.disposition == PrototypeDisposition::PartiallyRetained
+        }));
+    }
+}
+
+#[test]
+fn reports_malformed_module_fuel_and_belt_fields_with_precise_context() {
+    let diagnostics = invalid_data(
+        r#"{
+            "item": {
+                "bad-energy": {
+                    "type": "item",
+                    "name": "bad-energy",
+                    "fuel_category": "chemical",
+                    "fuel_value": "not-energy"
+                },
+                "missing-category": {
+                    "type": "item",
+                    "name": "missing-category",
+                    "fuel_value": "1MJ"
+                },
+                "missing-burnt-result": {
+                    "type": "item",
+                    "name": "missing-burnt-result",
+                    "fuel_category": "chemical",
+                    "fuel_value": "1MJ",
+                    "burnt_result": "missing"
+                }
+            },
+            "module": {
+                "bad-module": {
+                    "type": "module",
+                    "name": "bad-module",
+                    "category": "",
+                    "effect": {
+                        "speed": "fast",
+                        "productivity": null,
+                        "consumption": []
+                    }
+                }
+            },
+            "transport-belt": {
+                "zero-belt": {
+                    "type": "transport-belt",
+                    "name": "zero-belt",
+                    "speed": 0
+                },
+                "negative-belt": {
+                    "type": "transport-belt",
+                    "name": "negative-belt",
+                    "speed": -1
+                },
+                "string-belt": {
+                    "type": "transport-belt",
+                    "name": "string-belt",
+                    "speed": "fast"
+                }
+            }
+        }"#,
+    );
+
+    for path in [
+        "/item/bad-energy/fuel_value",
+        "/item/missing-category/fuel_category",
+        "/item/missing-burnt-result/burnt_result",
+        "/module/bad-module/category",
+        "/module/bad-module/effect/speed",
+        "/module/bad-module/effect/productivity",
+        "/module/bad-module/effect/consumption",
+        "/transport-belt/zero-belt/speed",
+        "/transport-belt/negative-belt/speed",
+        "/transport-belt/string-belt/speed",
+    ] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.path == path),
+            "missing diagnostic for {path}: {diagnostics:#?}"
+        );
+    }
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Error
+            && diagnostic.disposition == PrototypeDisposition::Rejected
+    }));
+}
+
+#[test]
+fn reports_malformed_module_and_belt_collections() {
+    let diagnostics = invalid_data(
+        r#"{
+            "module": [],
+            "transport-belt": []
+        }"#,
+    );
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.prototype_type.as_deref() == Some("module") && diagnostic.path == "/module"
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.prototype_type.as_deref() == Some("transport-belt")
+            && diagnostic.path == "/transport-belt"
+    }));
 }
 
 #[test]

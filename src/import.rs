@@ -6,9 +6,10 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::catalog::{
-    Catalog, CatalogParts, Commodity, CommodityId, FluidId, FuelCategory, Ingredient, ItemId,
-    Machine, MachineEnergySource, MachineId, ModuleCategory, ModuleEffect, NonNegative, Positive,
-    Product, Recipe, RecipeCategory, RecipeId, UnsupportedEnergySource,
+    Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, Fuel,
+    FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource, MachineId, Module,
+    ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory,
+    RecipeId, UnsupportedEnergySource,
 };
 
 const DEFAULT_RECIPE_CATEGORY: &str = "crafting";
@@ -79,10 +80,13 @@ pub enum ImportError {
 struct RelevantCollections {
     item: Option<Value>,
     fluid: Option<Value>,
+    module: Option<Value>,
     recipe: Option<Value>,
     #[serde(rename = "assembling-machine")]
     assembling_machine: Option<Value>,
     furnace: Option<Value>,
+    #[serde(rename = "transport-belt")]
+    transport_belt: Option<Value>,
 }
 
 /// Parses the supported portion of a resolved Factorio `data.raw` JSON dump.
@@ -101,11 +105,11 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
 
     let mut diagnostics = Vec::new();
     let mut commodities = Vec::new();
-    parse_commodity_collection(
-        "item",
+    let mut parsed_fuels = Vec::new();
+    parse_item_collection(
         raw.item,
-        CommodityKind::Item,
         &mut commodities,
+        &mut parsed_fuels,
         &mut diagnostics,
     );
     parse_commodity_collection(
@@ -115,11 +119,19 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
         &mut commodities,
         &mut diagnostics,
     );
+    let modules = parse_module_collection(
+        raw.module,
+        &mut commodities,
+        &mut parsed_fuels,
+        &mut diagnostics,
+    );
 
     let commodity_ids = commodities
         .iter()
         .map(|commodity| commodity.id().clone())
         .collect::<BTreeSet<_>>();
+    validate_fuel_references(&parsed_fuels, &commodity_ids, &mut diagnostics);
+    let fuels = parsed_fuels.into_iter().map(|parsed| parsed.fuel).collect();
     let recipes = parse_recipe_collection(raw.recipe, &commodity_ids, &mut diagnostics);
     let mut machines = parse_machine_collection(
         "assembling-machine",
@@ -131,6 +143,7 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
         raw.furnace,
         &mut diagnostics,
     ));
+    let belts = parse_belt_collection(raw.transport_belt, &mut diagnostics);
 
     if has_errors(&diagnostics) {
         return Err(ImportError::InvalidData { diagnostics });
@@ -140,7 +153,9 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
         commodities,
         recipes,
         machines,
-        ..CatalogParts::default()
+        modules,
+        fuels,
+        belts,
     })
     .map_err(|error| ImportError::InvalidData {
         diagnostics: vec![ImportDiagnostic {
@@ -187,6 +202,626 @@ impl CommodityKind {
             Self::Fluid => FluidId::new(name).map(CommodityId::Fluid),
         }
     }
+}
+
+struct ParsedFuel {
+    fuel: Fuel,
+    prototype_type: &'static str,
+}
+
+fn parse_item_collection(
+    collection: Option<Value>,
+    commodities: &mut Vec<Commodity>,
+    fuels: &mut Vec<ParsedFuel>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) {
+    let Some(collection) = collection else {
+        return;
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("item"),
+            None,
+            "/item".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return;
+    };
+
+    for (id, prototype) in prototypes {
+        let prototype_path = format!("/item/{}", pointer_segment(&id));
+        let Value::Object(fields) = prototype else {
+            diagnostics.push(error_diagnostic(
+                Some("item"),
+                Some(&id),
+                prototype_path,
+                "prototype must be a JSON object",
+            ));
+            continue;
+        };
+
+        let initial_errors = error_count(diagnostics);
+        validate_prototype_identity(&fields, "item", &id, &prototype_path, diagnostics);
+        let item_id = ItemId::new(id.clone()).map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    "item",
+                    &id,
+                    format!("{prototype_path}/name"),
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        );
+        let fuel = item_id.as_ref().and_then(|item_id| {
+            parse_fuel("item", &id, item_id, &fields, &prototype_path, diagnostics)
+        });
+
+        if error_count(diagnostics) == initial_errors
+            && let Some(item_id) = item_id
+        {
+            commodities.push(Commodity::new(CommodityId::Item(item_id), None));
+            if let Some(fuel) = fuel {
+                fuels.push(fuel);
+            }
+        }
+    }
+}
+
+fn parse_module_collection(
+    collection: Option<Value>,
+    commodities: &mut Vec<Commodity>,
+    fuels: &mut Vec<ParsedFuel>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<Module> {
+    let Some(collection) = collection else {
+        return Vec::new();
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("module"),
+            None,
+            "/module".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return Vec::new();
+    };
+
+    let mut modules = Vec::new();
+    for (id, prototype) in prototypes {
+        let prototype_path = format!("/module/{}", pointer_segment(&id));
+        let Value::Object(fields) = prototype else {
+            diagnostics.push(error_diagnostic(
+                Some("module"),
+                Some(&id),
+                prototype_path,
+                "prototype must be a JSON object",
+            ));
+            continue;
+        };
+
+        let initial_errors = error_count(diagnostics);
+        validate_prototype_identity(&fields, "module", &id, &prototype_path, diagnostics);
+        let item_id = ItemId::new(id.clone()).map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    "module",
+                    &id,
+                    format!("{prototype_path}/name"),
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        );
+        let module_id = ModuleId::new(id.clone()).map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    "module",
+                    &id,
+                    format!("{prototype_path}/name"),
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        );
+        let category = parse_module_category(&fields, &id, &prototype_path, diagnostics);
+        let effects = parse_module_effect_values(&fields, &id, &prototype_path, diagnostics);
+        let fuel = item_id.as_ref().and_then(|item_id| {
+            parse_fuel(
+                "module",
+                &id,
+                item_id,
+                &fields,
+                &prototype_path,
+                diagnostics,
+            )
+        });
+
+        if error_count(diagnostics) == initial_errors
+            && let (Some(item_id), Some(module_id), Some(category), Some(effects)) =
+                (item_id, module_id, category, effects)
+        {
+            commodities.push(Commodity::new(CommodityId::Item(item_id), None));
+            modules.push(
+                Module::new(
+                    module_id,
+                    category,
+                    effects.speed,
+                    effects.productivity,
+                    effects.consumption,
+                )
+                .with_unsupported_effects(effects.unsupported),
+            );
+            if let Some(fuel) = fuel {
+                fuels.push(fuel);
+            }
+        }
+    }
+
+    modules
+}
+
+fn parse_module_category(
+    fields: &Map<String, Value>,
+    module_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<ModuleCategory> {
+    let path = format!("{prototype_path}/category");
+    let Some(value) = fields.get("category") else {
+        prototype_error(
+            diagnostics,
+            "module",
+            module_id,
+            path,
+            "missing required category",
+        );
+        return None;
+    };
+    let Value::String(category) = value else {
+        prototype_error(
+            diagnostics,
+            "module",
+            module_id,
+            path,
+            "category must be a string",
+        );
+        return None;
+    };
+
+    ModuleCategory::new(category).map_or_else(
+        |error| {
+            prototype_error(diagnostics, "module", module_id, path, error.to_string());
+            None
+        },
+        Some,
+    )
+}
+
+struct ParsedModuleEffects {
+    speed: Finite,
+    productivity: Finite,
+    consumption: Finite,
+    unsupported: BTreeSet<String>,
+}
+
+fn parse_module_effect_values(
+    fields: &Map<String, Value>,
+    module_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<ParsedModuleEffects> {
+    let path = format!("{prototype_path}/effect");
+    let Some(value) = fields.get("effect") else {
+        prototype_error(
+            diagnostics,
+            "module",
+            module_id,
+            path,
+            "missing required effect",
+        );
+        return None;
+    };
+    let Value::Object(effects) = value else {
+        prototype_error(
+            diagnostics,
+            "module",
+            module_id,
+            path,
+            "effect must be an object",
+        );
+        return None;
+    };
+
+    let initial_errors = error_count(diagnostics);
+    let speed = parse_module_effect_value(effects, "speed", module_id, &path, diagnostics);
+    let productivity =
+        parse_module_effect_value(effects, "productivity", module_id, &path, diagnostics);
+    let consumption =
+        parse_module_effect_value(effects, "consumption", module_id, &path, diagnostics);
+    let mut unsupported = BTreeSet::new();
+    for effect in effects.keys() {
+        if !matches!(effect.as_str(), "speed" | "productivity" | "consumption") {
+            unsupported.insert(effect.clone());
+            diagnostics.push(warning_diagnostic(
+                "module",
+                module_id,
+                format!("{path}/{}", pointer_segment(effect)),
+                format!("unsupported module effect {effect:?} blocks module selection"),
+            ));
+        }
+    }
+
+    (error_count(diagnostics) == initial_errors).then(|| ParsedModuleEffects {
+        speed: speed.expect("supported module effect parsed without errors"),
+        productivity: productivity.expect("supported module effect parsed without errors"),
+        consumption: consumption.expect("supported module effect parsed without errors"),
+        unsupported,
+    })
+}
+
+fn parse_module_effect_value(
+    effects: &Map<String, Value>,
+    effect: &str,
+    module_id: &str,
+    effect_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Finite> {
+    let Some(value) = effects.get(effect) else {
+        return Finite::new(0.0).ok();
+    };
+    let path = format!("{effect_path}/{}", pointer_segment(effect));
+    let Value::Number(number) = value else {
+        prototype_error(
+            diagnostics,
+            "module",
+            module_id,
+            path,
+            format!("{effect} effect must be a number"),
+        );
+        return None;
+    };
+    let Some(value) = number.as_f64() else {
+        prototype_error(
+            diagnostics,
+            "module",
+            module_id,
+            path,
+            format!("{effect} effect must be a finite number"),
+        );
+        return None;
+    };
+
+    Finite::new(value).map_or_else(
+        |error| {
+            prototype_error(diagnostics, "module", module_id, path, error.to_string());
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_fuel(
+    prototype_type: &'static str,
+    prototype_id: &str,
+    item_id: &ItemId,
+    fields: &Map<String, Value>,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<ParsedFuel> {
+    let fuel_value = parse_fuel_value(
+        fields,
+        prototype_type,
+        prototype_id,
+        prototype_path,
+        diagnostics,
+    )?;
+    let category = parse_fuel_category(
+        fields,
+        prototype_type,
+        prototype_id,
+        prototype_path,
+        diagnostics,
+    )?;
+    let initial_errors = error_count(diagnostics);
+    let burnt_result = parse_burnt_result(
+        fields,
+        prototype_type,
+        prototype_id,
+        prototype_path,
+        diagnostics,
+    );
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+    let fuel_id = FuelId::new(prototype_id.to_owned()).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                prototype_type,
+                prototype_id,
+                format!("{prototype_path}/name"),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )?;
+
+    Some(ParsedFuel {
+        fuel: Fuel::new(fuel_id, item_id.clone(), category, fuel_value, burnt_result),
+        prototype_type,
+    })
+}
+
+fn parse_fuel_value(
+    fields: &Map<String, Value>,
+    prototype_type: &str,
+    prototype_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Positive> {
+    let value = fields.get("fuel_value")?;
+    let fuel_value_path = format!("{prototype_path}/fuel_value");
+    let fuel_value = match parse_energy_value(value, EnergyNormalization::Joules) {
+        Ok(value) => value,
+        Err(message) => {
+            prototype_error(
+                diagnostics,
+                prototype_type,
+                prototype_id,
+                fuel_value_path,
+                format!("invalid fuel_value: {message}"),
+            );
+            return None;
+        }
+    };
+    if fuel_value == 0.0 {
+        return None;
+    }
+    Positive::new(fuel_value).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                prototype_type,
+                prototype_id,
+                fuel_value_path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_fuel_category(
+    fields: &Map<String, Value>,
+    prototype_type: &str,
+    prototype_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<FuelCategory> {
+    let category_path = format!("{prototype_path}/fuel_category");
+    let Some(category) = fields.get("fuel_category") else {
+        prototype_error(
+            diagnostics,
+            prototype_type,
+            prototype_id,
+            category_path,
+            "missing required fuel_category for positive fuel_value",
+        );
+        return None;
+    };
+    let Value::String(category) = category else {
+        prototype_error(
+            diagnostics,
+            prototype_type,
+            prototype_id,
+            category_path,
+            "fuel_category must be a string",
+        );
+        return None;
+    };
+    FuelCategory::new(category).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                prototype_type,
+                prototype_id,
+                category_path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_burnt_result(
+    fields: &Map<String, Value>,
+    prototype_type: &str,
+    prototype_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<ItemId> {
+    let burnt_result_path = format!("{prototype_path}/burnt_result");
+    match fields.get("burnt_result") {
+        None => None,
+        Some(Value::String(value)) if value.is_empty() => None,
+        Some(Value::String(value)) => ItemId::new(value.clone()).map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    prototype_type,
+                    prototype_id,
+                    burnt_result_path,
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        ),
+        Some(_) => {
+            prototype_error(
+                diagnostics,
+                prototype_type,
+                prototype_id,
+                burnt_result_path,
+                "burnt_result must be a string",
+            );
+            None
+        }
+    }
+}
+
+fn validate_fuel_references(
+    fuels: &[ParsedFuel],
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) {
+    for parsed in fuels {
+        let fuel = &parsed.fuel;
+        if !commodities.contains(&CommodityId::Item(fuel.item().clone())) {
+            prototype_error(
+                diagnostics,
+                parsed.prototype_type,
+                fuel.id().as_str(),
+                format!(
+                    "/{}/{}/name",
+                    parsed.prototype_type,
+                    pointer_segment(fuel.id().as_str())
+                ),
+                format!("references missing item {:?}", fuel.item().as_str()),
+            );
+        }
+        if let Some(burnt_result) = fuel.burnt_result()
+            && !commodities.contains(&CommodityId::Item(burnt_result.clone()))
+        {
+            prototype_error(
+                diagnostics,
+                parsed.prototype_type,
+                fuel.id().as_str(),
+                format!(
+                    "/{}/{}/burnt_result",
+                    parsed.prototype_type,
+                    pointer_segment(fuel.id().as_str())
+                ),
+                format!("references missing item {:?}", burnt_result.as_str()),
+            );
+        }
+    }
+}
+
+fn parse_belt_collection(
+    collection: Option<Value>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<Belt> {
+    let Some(collection) = collection else {
+        return Vec::new();
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("transport-belt"),
+            None,
+            "/transport-belt".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return Vec::new();
+    };
+
+    prototypes
+        .into_iter()
+        .filter_map(|(id, prototype)| parse_belt(&id, prototype, diagnostics))
+        .collect()
+}
+
+fn parse_belt(id: &str, prototype: Value, diagnostics: &mut Vec<ImportDiagnostic>) -> Option<Belt> {
+    let prototype_path = format!("/transport-belt/{}", pointer_segment(id));
+    let Value::Object(fields) = prototype else {
+        diagnostics.push(error_diagnostic(
+            Some("transport-belt"),
+            Some(id),
+            prototype_path,
+            "prototype must be a JSON object",
+        ));
+        return None;
+    };
+
+    let initial_errors = error_count(diagnostics);
+    validate_prototype_identity(&fields, "transport-belt", id, &prototype_path, diagnostics);
+    let belt_id = BeltId::new(id.to_owned()).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "transport-belt",
+                id,
+                format!("{prototype_path}/name"),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    );
+    let speed_path = format!("{prototype_path}/speed");
+    let speed = match fields.get("speed") {
+        Some(Value::Number(number)) => number.as_f64().or_else(|| {
+            prototype_error(
+                diagnostics,
+                "transport-belt",
+                id,
+                speed_path.clone(),
+                "speed must be a finite number",
+            );
+            None
+        }),
+        Some(_) => {
+            prototype_error(
+                diagnostics,
+                "transport-belt",
+                id,
+                speed_path.clone(),
+                "speed must be a number",
+            );
+            None
+        }
+        None => {
+            prototype_error(
+                diagnostics,
+                "transport-belt",
+                id,
+                speed_path.clone(),
+                "missing required speed",
+            );
+            None
+        }
+    };
+    let throughput = speed.and_then(|speed| {
+        Positive::new(speed * 480.0).map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    "transport-belt",
+                    id,
+                    speed_path,
+                    format!("invalid belt throughput: {error}"),
+                );
+                None
+            },
+            Some,
+        )
+    });
+
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+
+    Some(Belt::new(belt_id?, throughput?))
 }
 
 fn parse_commodity_collection(
@@ -742,7 +1377,7 @@ fn parse_machine_energy_usage(
         return None;
     };
 
-    parse_energy_value(value)
+    parse_energy_value(value, EnergyNormalization::Watts)
         .and_then(|watts| Positive::new(watts).map_err(|error| error.to_string()))
         .map_or_else(
             |message| {
@@ -867,7 +1502,7 @@ fn parse_electric_energy_source(
             .expect("positive energy usage has a valid default drain"),
         Some(value) => {
             let path = format!("{source_path}/drain");
-            let watts = parse_energy_value(value).map_or_else(
+            let watts = parse_energy_value(value, EnergyNormalization::Watts).map_or_else(
                 |message| {
                     machine_error(
                         diagnostics,
@@ -1047,7 +1682,13 @@ fn unsupported_energy_source(
     MachineEnergySource::Unsupported(source)
 }
 
-fn parse_energy_value(value: &Value) -> Result<f64, String> {
+#[derive(Clone, Copy)]
+enum EnergyNormalization {
+    Joules,
+    Watts,
+}
+
+fn parse_energy_value(value: &Value, normalization: EnergyNormalization) -> Result<f64, String> {
     let Value::String(value) = value else {
         return Err("energy value must be a string".into());
     };
@@ -1086,11 +1727,18 @@ fn parse_energy_value(value: &Value) -> Result<f64, String> {
         return Err("energy value must not be negative".into());
     }
 
-    let watts = number * multiplier * if unit == 'J' { TICKS_PER_SECOND } else { 1.0 };
-    if !watts.is_finite() {
+    let value = number
+        * multiplier
+        * match (normalization, unit) {
+            (EnergyNormalization::Joules, 'J') | (EnergyNormalization::Watts, 'W') => 1.0,
+            (EnergyNormalization::Joules, 'W') => 1.0 / TICKS_PER_SECOND,
+            (EnergyNormalization::Watts, 'J') => TICKS_PER_SECOND,
+            _ => unreachable!("energy unit was validated above"),
+        };
+    if !value.is_finite() {
         return Err("normalized energy value must be finite".into());
     }
-    Ok(watts)
+    Ok(value)
 }
 
 fn parse_recipe(
@@ -1898,6 +2546,21 @@ fn machine_error(
     diagnostics.push(error_diagnostic(
         Some(prototype_type),
         Some(machine_id),
+        path,
+        message,
+    ));
+}
+
+fn prototype_error(
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    prototype_type: &str,
+    prototype_id: &str,
+    path: String,
+    message: impl Into<String>,
+) {
+    diagnostics.push(error_diagnostic(
+        Some(prototype_type),
+        Some(prototype_id),
         path,
         message,
     ));

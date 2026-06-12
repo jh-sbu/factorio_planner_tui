@@ -1,0 +1,59 @@
+{
+  "item": {
+    "ash": {
+      "type": "item",
+      "name": "ash"
+    },
+    "coal": {
+      "type": "item",
+      "name": "coal",
+      "fuel_category": "chemical",
+      "fuel_value": "8MJ",
+      "burnt_result": "ash"
+    },
+    "inert-item": {
+      "type": "item",
+      "name": "inert-item",
+      "fuel_value": "0J"
+    },
+    "wood": {
+      "type": "item",
+      "name": "wood",
+      "fuel_category": "chemical",
+      "fuel_value": "2MJ"
+    }
+  },
+  "module": {
+    "productivity-module": {
+      "type": "module",
+      "name": "productivity-module",
+      "category": "productivity",
+      "effect": {
+        "consumption": 0.4,
+        "productivity": 0.04,
+        "speed": -0.15
+      }
+    },
+    "speed-module": {
+      "type": "module",
+      "name": "speed-module",
+      "category": "speed",
+      "effect": {
+        "consumption": 0.5,
+        "speed": 0.2
+      }
+    }
+  },
+  "transport-belt": {
+    "fast-transport-belt": {
+      "type": "transport-belt",
+      "name": "fast-transport-belt",
+      "speed": 0.0625
+    },
+    "transport-belt": {
+      "type": "transport-belt",
+      "name": "transport-belt",
+      "speed": 0.03125
+    }
+  }
+}

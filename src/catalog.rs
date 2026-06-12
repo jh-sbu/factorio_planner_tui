@@ -450,6 +450,7 @@ pub struct Module {
     speed_effect: Finite,
     productivity_effect: Finite,
     consumption_effect: Finite,
+    unsupported_effects: BTreeSet<String>,
 }
 
 impl Module {
@@ -467,7 +468,14 @@ impl Module {
             speed_effect,
             productivity_effect,
             consumption_effect,
+            unsupported_effects: BTreeSet::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_unsupported_effects(mut self, effects: impl IntoIterator<Item = String>) -> Self {
+        self.unsupported_effects = effects.into_iter().collect();
+        self
     }
 
     #[must_use]
@@ -493,6 +501,16 @@ impl Module {
     #[must_use]
     pub const fn consumption_effect(&self) -> Finite {
         self.consumption_effect
+    }
+
+    #[must_use]
+    pub const fn unsupported_effects(&self) -> &BTreeSet<String> {
+        &self.unsupported_effects
+    }
+
+    #[must_use]
+    pub fn is_selectable(&self) -> bool {
+        self.unsupported_effects.is_empty()
     }
 }
 
