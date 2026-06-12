@@ -1,0 +1,130 @@
+{
+  "item": {
+    "gear": {
+      "type": "item",
+      "name": "gear"
+    },
+    "plate": {
+      "type": "item",
+      "name": "plate"
+    }
+  },
+  "recipe": {
+    "gear": {
+      "type": "recipe",
+      "name": "gear",
+      "category": "crafting",
+      "energy_required": 0.5,
+      "results": [
+        {
+          "type": "item",
+          "name": "gear",
+          "amount": 1
+        }
+      ]
+    },
+    "plate": {
+      "type": "recipe",
+      "name": "plate",
+      "category": "smelting",
+      "energy_required": 3.2,
+      "results": [
+        {
+          "type": "item",
+          "name": "plate",
+          "amount": 1
+        }
+      ]
+    }
+  },
+  "assembling-machine": {
+    "assembler-defaults": {
+      "type": "assembling-machine",
+      "name": "assembler-defaults",
+      "crafting_categories": [
+        "crafting",
+        "modded-crafting"
+      ],
+      "crafting_speed": 1.25,
+      "energy_usage": "90kW",
+      "energy_source": {
+        "type": "electric",
+        "usage_priority": "secondary-input"
+      }
+    },
+    "assembler-explicit": {
+      "type": "assembling-machine",
+      "name": "assembler-explicit",
+      "crafting_categories": [
+        "crafting"
+      ],
+      "crafting_speed": 2,
+      "module_slots": 4,
+      "allowed_effects": [
+        "speed",
+        "productivity",
+        "consumption"
+      ],
+      "allowed_module_categories": [
+        "speed",
+        "productivity"
+      ],
+      "energy_usage": "2MW",
+      "energy_source": {
+        "type": "electric",
+        "usage_priority": "secondary-input",
+        "drain": "1kW"
+      }
+    },
+    "heat-assembler": {
+      "type": "assembling-machine",
+      "name": "heat-assembler",
+      "crafting_categories": [
+        "crafting"
+      ],
+      "crafting_speed": 3,
+      "energy_usage": "3MJ",
+      "energy_source": {
+        "type": "heat"
+      }
+    }
+  },
+  "furnace": {
+    "stone-furnace": {
+      "type": "furnace",
+      "name": "stone-furnace",
+      "crafting_categories": [
+        "smelting"
+      ],
+      "crafting_speed": 1,
+      "energy_usage": "90kW",
+      "energy_source": {
+        "type": "burner",
+        "fuel_inventory_size": 1
+      },
+      "result_inventory_size": 1,
+      "source_inventory_size": 1
+    },
+    "modded-furnace": {
+      "type": "furnace",
+      "name": "modded-furnace",
+      "crafting_categories": [
+        "smelting",
+        "modded-smelting"
+      ],
+      "crafting_speed": 2,
+      "energy_usage": "180kW",
+      "energy_source": {
+        "type": "burner",
+        "fuel_inventory_size": 1,
+        "effectivity": 0.8,
+        "fuel_categories": [
+          "chemical",
+          "biofuel"
+        ]
+      },
+      "result_inventory_size": 1,
+      "source_inventory_size": 1
+    }
+  }
+}

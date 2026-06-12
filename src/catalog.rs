@@ -318,10 +318,44 @@ impl Recipe {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum MachineEnergySource {
+    Electric {
+        drain: NonNegative,
+    },
+    Burner {
+        fuel_categories: BTreeSet<FuelCategory>,
+        effectivity: Positive,
+    },
+    Unsupported(UnsupportedEnergySource),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnsupportedEnergySource {
+    Heat,
+    Fluid,
+    Void,
+    Unknown(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ModuleEffect {
+    Speed,
+    Productivity,
+    Consumption,
+    Pollution,
+    Quality,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Machine {
     id: MachineId,
     crafting_categories: BTreeSet<RecipeCategory>,
     crafting_speed: Positive,
+    module_slots: u16,
+    allowed_effects: BTreeSet<ModuleEffect>,
+    allowed_module_categories: Option<BTreeSet<ModuleCategory>>,
+    energy_usage: Positive,
+    energy_source: MachineEnergySource,
 }
 
 impl Machine {
@@ -331,10 +365,16 @@ impl Machine {
     ///
     /// Returns [`RecordError::MachineHasNoCraftingCategories`] when no
     /// crafting category is supplied.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: MachineId,
         crafting_categories: impl IntoIterator<Item = RecipeCategory>,
         crafting_speed: Positive,
+        module_slots: u16,
+        allowed_effects: impl IntoIterator<Item = ModuleEffect>,
+        allowed_module_categories: Option<BTreeSet<ModuleCategory>>,
+        energy_usage: Positive,
+        energy_source: MachineEnergySource,
     ) -> Result<Self, RecordError> {
         let crafting_categories = crafting_categories.into_iter().collect::<BTreeSet<_>>();
         if crafting_categories.is_empty() {
@@ -344,6 +384,11 @@ impl Machine {
             id,
             crafting_categories,
             crafting_speed,
+            module_slots,
+            allowed_effects: allowed_effects.into_iter().collect(),
+            allowed_module_categories,
+            energy_usage,
+            energy_source,
         })
     }
 
@@ -360,6 +405,41 @@ impl Machine {
     #[must_use]
     pub const fn crafting_speed(&self) -> Positive {
         self.crafting_speed
+    }
+
+    #[must_use]
+    pub const fn module_slots(&self) -> u16 {
+        self.module_slots
+    }
+
+    #[must_use]
+    pub const fn allowed_effects(&self) -> &BTreeSet<ModuleEffect> {
+        &self.allowed_effects
+    }
+
+    #[must_use]
+    pub const fn allowed_module_categories(&self) -> Option<&BTreeSet<ModuleCategory>> {
+        self.allowed_module_categories.as_ref()
+    }
+
+    #[must_use]
+    pub const fn energy_usage(&self) -> Positive {
+        self.energy_usage
+    }
+
+    #[must_use]
+    pub const fn energy_source(&self) -> &MachineEnergySource {
+        &self.energy_source
+    }
+
+    #[must_use]
+    pub fn supports_category(&self, category: &RecipeCategory) -> bool {
+        self.crafting_categories.contains(category)
+    }
+
+    #[must_use]
+    pub fn crafts_per_second(&self, recipe_duration: Positive) -> f64 {
+        self.crafting_speed.get() / recipe_duration.get()
     }
 }
 

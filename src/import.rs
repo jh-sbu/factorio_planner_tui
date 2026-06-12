@@ -6,13 +6,16 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::catalog::{
-    Catalog, CatalogParts, Commodity, CommodityId, FluidId, Ingredient, ItemId, Positive, Product,
-    Recipe, RecipeCategory, RecipeId,
+    Catalog, CatalogParts, Commodity, CommodityId, FluidId, FuelCategory, Ingredient, ItemId,
+    Machine, MachineEnergySource, MachineId, ModuleCategory, ModuleEffect, NonNegative, Positive,
+    Product, Recipe, RecipeCategory, RecipeId, UnsupportedEnergySource,
 };
 
 const DEFAULT_RECIPE_CATEGORY: &str = "crafting";
 const DEFAULT_RECIPE_DURATION: f64 = 0.5;
 const MINIMUM_RECIPE_DURATION: f64 = 0.001;
+const DEFAULT_BURNER_FUEL_CATEGORY: &str = "chemical";
+const TICKS_PER_SECOND: f64 = 60.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticSeverity {
@@ -77,6 +80,9 @@ struct RelevantCollections {
     item: Option<Value>,
     fluid: Option<Value>,
     recipe: Option<Value>,
+    #[serde(rename = "assembling-machine")]
+    assembling_machine: Option<Value>,
+    furnace: Option<Value>,
 }
 
 /// Parses the supported portion of a resolved Factorio `data.raw` JSON dump.
@@ -115,6 +121,16 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
         .map(|commodity| commodity.id().clone())
         .collect::<BTreeSet<_>>();
     let recipes = parse_recipe_collection(raw.recipe, &commodity_ids, &mut diagnostics);
+    let mut machines = parse_machine_collection(
+        "assembling-machine",
+        raw.assembling_machine,
+        &mut diagnostics,
+    );
+    machines.extend(parse_machine_collection(
+        "furnace",
+        raw.furnace,
+        &mut diagnostics,
+    ));
 
     if has_errors(&diagnostics) {
         return Err(ImportError::InvalidData { diagnostics });
@@ -123,6 +139,7 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
     let catalog = Catalog::try_from_parts(CatalogParts {
         commodities,
         recipes,
+        machines,
         ..CatalogParts::default()
     })
     .map_err(|error| ImportError::InvalidData {
@@ -250,6 +267,830 @@ fn parse_recipe_collection(
         .into_iter()
         .filter_map(|(id, prototype)| parse_recipe(&id, prototype, commodities, diagnostics))
         .collect()
+}
+
+fn parse_machine_collection(
+    collection_name: &str,
+    collection: Option<Value>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<Machine> {
+    let Some(collection) = collection else {
+        return Vec::new();
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some(collection_name),
+            None,
+            format!("/{collection_name}"),
+            "prototype collection must be a JSON object",
+        ));
+        return Vec::new();
+    };
+
+    prototypes
+        .into_iter()
+        .filter_map(|(id, prototype)| parse_machine(collection_name, &id, prototype, diagnostics))
+        .collect()
+}
+
+fn parse_machine(
+    prototype_type: &str,
+    id: &str,
+    prototype: Value,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Machine> {
+    let prototype_path = format!("/{prototype_type}/{}", pointer_segment(id));
+    let Value::Object(fields) = prototype else {
+        diagnostics.push(error_diagnostic(
+            Some(prototype_type),
+            Some(id),
+            prototype_path,
+            "prototype must be a JSON object",
+        ));
+        return None;
+    };
+
+    let initial_errors = error_count(diagnostics);
+    validate_prototype_identity(&fields, prototype_type, id, &prototype_path, diagnostics);
+
+    let machine_id = parse_machine_id(prototype_type, id, &prototype_path, diagnostics);
+    let crafting_categories =
+        parse_machine_categories(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let crafting_speed = parse_machine_positive_number(
+        &fields,
+        "crafting_speed",
+        prototype_type,
+        id,
+        &prototype_path,
+        diagnostics,
+    );
+    let module_slots =
+        parse_module_slots(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let allowed_effects =
+        parse_allowed_effects(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let allowed_module_categories =
+        parse_allowed_module_categories(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let energy_usage =
+        parse_machine_energy_usage(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let energy_source = parse_machine_energy_source(
+        &fields,
+        energy_usage,
+        prototype_type,
+        id,
+        &prototype_path,
+        diagnostics,
+    );
+
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+
+    match Machine::new(
+        machine_id?,
+        crafting_categories?,
+        crafting_speed?,
+        module_slots?,
+        allowed_effects?,
+        allowed_module_categories?.into_restriction(),
+        energy_usage?,
+        energy_source?,
+    ) {
+        Ok(machine) => Some(machine),
+        Err(error) => {
+            machine_error(
+                diagnostics,
+                prototype_type,
+                id,
+                prototype_path,
+                error.to_string(),
+            );
+            None
+        }
+    }
+}
+
+fn parse_machine_id(
+    prototype_type: &str,
+    machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<MachineId> {
+    MachineId::new(machine_id).map_or_else(
+        |error| {
+            machine_error(
+                diagnostics,
+                prototype_type,
+                machine_id,
+                format!("{prototype_path}/name"),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_machine_categories(
+    fields: &Map<String, Value>,
+    prototype_type: &str,
+    machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<BTreeSet<RecipeCategory>> {
+    let path = format!("{prototype_path}/crafting_categories");
+    let Some(value) = fields.get("crafting_categories") else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "missing required crafting_categories",
+        );
+        return None;
+    };
+    let Value::Array(values) = value else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "crafting_categories must be an array",
+        );
+        return None;
+    };
+    if values.is_empty() {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "crafting_categories must contain at least one category",
+        );
+        return None;
+    }
+
+    let initial_errors = error_count(diagnostics);
+    let categories = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            parse_category_id(
+                value,
+                prototype_type,
+                machine_id,
+                format!("{path}/{index}"),
+                diagnostics,
+            )
+        })
+        .collect();
+
+    (error_count(diagnostics) == initial_errors).then_some(categories)
+}
+
+fn parse_category_id(
+    value: &Value,
+    prototype_type: &str,
+    machine_id: &str,
+    path: String,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<RecipeCategory> {
+    let Value::String(category) = value else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "crafting category must be a string",
+        );
+        return None;
+    };
+
+    RecipeCategory::new(category).map_or_else(
+        |error| {
+            machine_error(
+                diagnostics,
+                prototype_type,
+                machine_id,
+                path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_machine_positive_number(
+    fields: &Map<String, Value>,
+    field: &str,
+    prototype_type: &str,
+    machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Positive> {
+    let path = format!("{prototype_path}/{field}");
+    let Some(value) = fields.get(field) else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            format!("missing required {field}"),
+        );
+        return None;
+    };
+    let Value::Number(number) = value else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            format!("{field} must be a number"),
+        );
+        return None;
+    };
+    let Some(value) = number.as_f64() else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            format!("{field} must be a finite number"),
+        );
+        return None;
+    };
+
+    Positive::new(value).map_or_else(
+        |error| {
+            machine_error(
+                diagnostics,
+                prototype_type,
+                machine_id,
+                path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_module_slots(
+    fields: &Map<String, Value>,
+    prototype_type: &str,
+    machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<u16> {
+    let Some(value) = fields.get("module_slots") else {
+        return Some(0);
+    };
+    let path = format!("{prototype_path}/module_slots");
+    let Value::Number(number) = value else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "module_slots must be a non-negative integer",
+        );
+        return None;
+    };
+    let Some(value) = number.as_u64().and_then(|value| u16::try_from(value).ok()) else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "module_slots must be an integer between 0 and 65535",
+        );
+        return None;
+    };
+
+    Some(value)
+}
+
+fn parse_allowed_effects(
+    fields: &Map<String, Value>,
+    prototype_type: &str,
+    machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<BTreeSet<ModuleEffect>> {
+    let Some(value) = fields.get("allowed_effects") else {
+        return Some(BTreeSet::new());
+    };
+    let path = format!("{prototype_path}/allowed_effects");
+    let initial_errors = error_count(diagnostics);
+    let mut effects = BTreeSet::new();
+
+    match value {
+        Value::String(effect) => {
+            if let Some(effect) =
+                parse_module_effect(effect, prototype_type, machine_id, path, diagnostics)
+            {
+                effects.insert(effect);
+            }
+        }
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                let entry_path = format!("{path}/{index}");
+                let Value::String(effect) = value else {
+                    machine_error(
+                        diagnostics,
+                        prototype_type,
+                        machine_id,
+                        entry_path,
+                        "allowed effect must be a string",
+                    );
+                    continue;
+                };
+                if let Some(effect) =
+                    parse_module_effect(effect, prototype_type, machine_id, entry_path, diagnostics)
+                {
+                    effects.insert(effect);
+                }
+            }
+        }
+        _ => {
+            machine_error(
+                diagnostics,
+                prototype_type,
+                machine_id,
+                path,
+                "allowed_effects must be a string or an array",
+            );
+        }
+    }
+
+    (error_count(diagnostics) == initial_errors).then_some(effects)
+}
+
+fn parse_module_effect(
+    effect: &str,
+    prototype_type: &str,
+    machine_id: &str,
+    path: String,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<ModuleEffect> {
+    match effect {
+        "speed" => Some(ModuleEffect::Speed),
+        "productivity" => Some(ModuleEffect::Productivity),
+        "consumption" => Some(ModuleEffect::Consumption),
+        "pollution" => Some(ModuleEffect::Pollution),
+        "quality" => Some(ModuleEffect::Quality),
+        _ => {
+            diagnostics.push(warning_diagnostic(
+                prototype_type,
+                machine_id,
+                path,
+                format!("unsupported module effect {effect:?} was not retained"),
+            ));
+            None
+        }
+    }
+}
+
+fn parse_allowed_module_categories(
+    fields: &Map<String, Value>,
+    prototype_type: &str,
+    machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<AllowedModuleCategories> {
+    let Some(value) = fields.get("allowed_module_categories") else {
+        return Some(AllowedModuleCategories::All);
+    };
+    let path = format!("{prototype_path}/allowed_module_categories");
+    let Value::Array(values) = value else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "allowed_module_categories must be an array",
+        );
+        return None;
+    };
+
+    let initial_errors = error_count(diagnostics);
+    let categories = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let entry_path = format!("{path}/{index}");
+            let Value::String(category) = value else {
+                machine_error(
+                    diagnostics,
+                    prototype_type,
+                    machine_id,
+                    entry_path,
+                    "module category must be a string",
+                );
+                return None;
+            };
+            ModuleCategory::new(category).map_or_else(
+                |error| {
+                    machine_error(
+                        diagnostics,
+                        prototype_type,
+                        machine_id,
+                        entry_path,
+                        error.to_string(),
+                    );
+                    None
+                },
+                Some,
+            )
+        })
+        .collect();
+
+    (error_count(diagnostics) == initial_errors)
+        .then_some(AllowedModuleCategories::Restricted(categories))
+}
+
+enum AllowedModuleCategories {
+    All,
+    Restricted(BTreeSet<ModuleCategory>),
+}
+
+impl AllowedModuleCategories {
+    fn into_restriction(self) -> Option<BTreeSet<ModuleCategory>> {
+        match self {
+            Self::All => None,
+            Self::Restricted(categories) => Some(categories),
+        }
+    }
+}
+
+fn parse_machine_energy_usage(
+    fields: &Map<String, Value>,
+    prototype_type: &str,
+    machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Positive> {
+    let path = format!("{prototype_path}/energy_usage");
+    let Some(value) = fields.get("energy_usage") else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "missing required energy_usage",
+        );
+        return None;
+    };
+
+    parse_energy_value(value)
+        .and_then(|watts| Positive::new(watts).map_err(|error| error.to_string()))
+        .map_or_else(
+            |message| {
+                machine_error(
+                    diagnostics,
+                    prototype_type,
+                    machine_id,
+                    path,
+                    format!("invalid energy_usage: {message}"),
+                );
+                None
+            },
+            Some,
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_machine_energy_source(
+    fields: &Map<String, Value>,
+    energy_usage: Option<Positive>,
+    prototype_type: &str,
+    machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<MachineEnergySource> {
+    let path = format!("{prototype_path}/energy_source");
+    let Some(value) = fields.get("energy_source") else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "missing required energy_source",
+        );
+        return None;
+    };
+    let Value::Object(source) = value else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "energy_source must be an object",
+        );
+        return None;
+    };
+    let type_path = format!("{path}/type");
+    let Some(source_type) = source.get("type") else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            type_path,
+            "missing required energy source type",
+        );
+        return None;
+    };
+    let Value::String(source_type) = source_type else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            type_path,
+            "energy source type must be a string",
+        );
+        return None;
+    };
+
+    match source_type.as_str() {
+        "electric" => parse_electric_energy_source(
+            source,
+            energy_usage,
+            prototype_type,
+            machine_id,
+            &path,
+            diagnostics,
+        ),
+        "burner" => {
+            parse_burner_energy_source(source, prototype_type, machine_id, &path, diagnostics)
+        }
+        "heat" => Some(unsupported_energy_source(
+            UnsupportedEnergySource::Heat,
+            prototype_type,
+            machine_id,
+            type_path,
+            diagnostics,
+        )),
+        "fluid" => Some(unsupported_energy_source(
+            UnsupportedEnergySource::Fluid,
+            prototype_type,
+            machine_id,
+            type_path,
+            diagnostics,
+        )),
+        "void" => Some(unsupported_energy_source(
+            UnsupportedEnergySource::Void,
+            prototype_type,
+            machine_id,
+            type_path,
+            diagnostics,
+        )),
+        unknown => Some(unsupported_energy_source(
+            UnsupportedEnergySource::Unknown(unknown.to_owned()),
+            prototype_type,
+            machine_id,
+            type_path,
+            diagnostics,
+        )),
+    }
+}
+
+fn parse_electric_energy_source(
+    source: &Map<String, Value>,
+    energy_usage: Option<Positive>,
+    prototype_type: &str,
+    machine_id: &str,
+    source_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<MachineEnergySource> {
+    let drain = match source.get("drain") {
+        None => NonNegative::new(energy_usage?.get() / 30.0)
+            .expect("positive energy usage has a valid default drain"),
+        Some(value) => {
+            let path = format!("{source_path}/drain");
+            let watts = parse_energy_value(value).map_or_else(
+                |message| {
+                    machine_error(
+                        diagnostics,
+                        prototype_type,
+                        machine_id,
+                        path.clone(),
+                        format!("invalid drain: {message}"),
+                    );
+                    None
+                },
+                Some,
+            )?;
+            NonNegative::new(watts).map_or_else(
+                |error| {
+                    machine_error(
+                        diagnostics,
+                        prototype_type,
+                        machine_id,
+                        path,
+                        error.to_string(),
+                    );
+                    None
+                },
+                Some,
+            )?
+        }
+    };
+
+    Some(MachineEnergySource::Electric { drain })
+}
+
+fn parse_burner_energy_source(
+    source: &Map<String, Value>,
+    prototype_type: &str,
+    machine_id: &str,
+    source_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<MachineEnergySource> {
+    let initial_errors = error_count(diagnostics);
+    let effectivity =
+        parse_burner_effectivity(source, prototype_type, machine_id, source_path, diagnostics);
+    let fuel_categories =
+        parse_burner_fuel_categories(source, prototype_type, machine_id, source_path, diagnostics);
+
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+
+    Some(MachineEnergySource::Burner {
+        fuel_categories: fuel_categories?,
+        effectivity: effectivity?,
+    })
+}
+
+fn parse_burner_effectivity(
+    source: &Map<String, Value>,
+    prototype_type: &str,
+    machine_id: &str,
+    source_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Positive> {
+    let Some(value) = source.get("effectivity") else {
+        return Positive::new(1.0).ok();
+    };
+    let path = format!("{source_path}/effectivity");
+    let Value::Number(number) = value else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "effectivity must be a number",
+        );
+        return None;
+    };
+    let Some(value) = number.as_f64() else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "effectivity must be a finite number",
+        );
+        return None;
+    };
+
+    Positive::new(value).map_or_else(
+        |error| {
+            machine_error(
+                diagnostics,
+                prototype_type,
+                machine_id,
+                path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_burner_fuel_categories(
+    source: &Map<String, Value>,
+    prototype_type: &str,
+    machine_id: &str,
+    source_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<BTreeSet<FuelCategory>> {
+    let Some(value) = source.get("fuel_categories") else {
+        return Some(
+            [FuelCategory::new(DEFAULT_BURNER_FUEL_CATEGORY)
+                .expect("the default fuel category is valid")]
+            .into_iter()
+            .collect(),
+        );
+    };
+    let path = format!("{source_path}/fuel_categories");
+    let Value::Array(values) = value else {
+        machine_error(
+            diagnostics,
+            prototype_type,
+            machine_id,
+            path,
+            "fuel_categories must be an array",
+        );
+        return None;
+    };
+
+    let initial_errors = error_count(diagnostics);
+    let categories = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let entry_path = format!("{path}/{index}");
+            let Value::String(category) = value else {
+                machine_error(
+                    diagnostics,
+                    prototype_type,
+                    machine_id,
+                    entry_path,
+                    "fuel category must be a string",
+                );
+                return None;
+            };
+            FuelCategory::new(category).map_or_else(
+                |error| {
+                    machine_error(
+                        diagnostics,
+                        prototype_type,
+                        machine_id,
+                        entry_path,
+                        error.to_string(),
+                    );
+                    None
+                },
+                Some,
+            )
+        })
+        .collect();
+
+    (error_count(diagnostics) == initial_errors).then_some(categories)
+}
+
+fn unsupported_energy_source(
+    source: UnsupportedEnergySource,
+    prototype_type: &str,
+    machine_id: &str,
+    path: String,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> MachineEnergySource {
+    diagnostics.push(warning_diagnostic(
+        prototype_type,
+        machine_id,
+        path,
+        "energy source is unsupported for power and fuel calculations",
+    ));
+    MachineEnergySource::Unsupported(source)
+}
+
+fn parse_energy_value(value: &Value) -> Result<f64, String> {
+    let Value::String(value) = value else {
+        return Err("energy value must be a string".into());
+    };
+    let Some(unit) = value.chars().last() else {
+        return Err("energy value must not be empty".into());
+    };
+    if !matches!(unit, 'W' | 'J') {
+        return Err("energy value must end in W or J".into());
+    }
+
+    let mut number = &value[..value.len() - unit.len_utf8()];
+    let (multiplier, has_multiplier) = match number.chars().last() {
+        Some('k') => (1e3, true),
+        Some('M') => (1e6, true),
+        Some('G') => (1e9, true),
+        Some('T') => (1e12, true),
+        Some('P') => (1e15, true),
+        Some('E') => (1e18, true),
+        Some('Z') => (1e21, true),
+        Some('Y') => (1e24, true),
+        Some('R') => (1e27, true),
+        Some('Q') => (1e30, true),
+        _ => (1.0, false),
+    };
+    if has_multiplier {
+        number = &number[..number.len() - 1];
+    }
+
+    let number = number
+        .parse::<f64>()
+        .map_err(|_| "energy value must start with a number".to_owned())?;
+    if !number.is_finite() {
+        return Err("energy value must be finite".into());
+    }
+    if number < 0.0 {
+        return Err("energy value must not be negative".into());
+    }
+
+    let watts = number * multiplier * if unit == 'J' { TICKS_PER_SECOND } else { 1.0 };
+    if !watts.is_finite() {
+        return Err("normalized energy value must be finite".into());
+    }
+    Ok(watts)
 }
 
 fn parse_recipe(
@@ -1047,6 +1888,21 @@ fn recipe_error(
     ));
 }
 
+fn machine_error(
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    prototype_type: &str,
+    machine_id: &str,
+    path: String,
+    message: impl Into<String>,
+) {
+    diagnostics.push(error_diagnostic(
+        Some(prototype_type),
+        Some(machine_id),
+        path,
+        message,
+    ));
+}
+
 fn error_diagnostic(
     prototype_type: Option<&str>,
     prototype_id: Option<&str>,
@@ -1063,12 +1919,33 @@ fn error_diagnostic(
     }
 }
 
+fn warning_diagnostic(
+    prototype_type: &str,
+    prototype_id: &str,
+    path: String,
+    message: impl Into<String>,
+) -> ImportDiagnostic {
+    ImportDiagnostic {
+        severity: DiagnosticSeverity::Warning,
+        prototype_type: Some(prototype_type.to_owned()),
+        prototype_id: Some(prototype_id.to_owned()),
+        path,
+        message: message.into(),
+        disposition: PrototypeDisposition::PartiallyRetained,
+    }
+}
+
 fn pointer_segment(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
-fn has_errors(diagnostics: &[ImportDiagnostic]) -> bool {
+fn error_count(diagnostics: &[ImportDiagnostic]) -> usize {
     diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        .count()
+}
+
+fn has_errors(diagnostics: &[ImportDiagnostic]) -> bool {
+    error_count(diagnostics) > 0
 }

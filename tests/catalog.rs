@@ -1,8 +1,8 @@
 use factorio_planner_tui::catalog::{
     Belt, BeltId, Catalog, CatalogError, CatalogParts, Commodity, CommodityId, DatasetFingerprint,
-    Finite, FluidId, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineId, Module,
-    ModuleCategory, ModuleId, NonNegative, NumericError, Positive, Product, Recipe, RecipeCategory,
-    RecipeId, RecordError,
+    Finite, FluidId, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource,
+    MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
+    Product, Recipe, RecipeCategory, RecipeId, RecordError,
 };
 
 fn item(name: &str) -> ItemId {
@@ -19,6 +19,25 @@ fn machine_id(name: &str) -> MachineId {
 
 fn positive(value: f64) -> Positive {
     Positive::new(value).expect("test value should be positive")
+}
+
+fn electric_machine(
+    name: &str,
+    categories: impl IntoIterator<Item = RecipeCategory>,
+    crafting_speed: f64,
+) -> Result<Machine, RecordError> {
+    Machine::new(
+        machine_id(name),
+        categories,
+        positive(crafting_speed),
+        0,
+        [],
+        None,
+        positive(90_000.0),
+        MachineEnergySource::Electric {
+            drain: NonNegative::new(3_000.0).unwrap(),
+        },
+    )
 }
 
 fn assert_close(actual: f64, expected: f64) {
@@ -139,7 +158,7 @@ fn records_validate_intrinsic_invariants() {
     );
 
     assert_eq!(
-        Machine::new(machine_id("assembler"), [], positive(1.0)),
+        electric_machine("assembler", [], 1.0),
         Err(RecordError::MachineHasNoCraftingCategories {
             machine: machine_id("assembler")
         })
@@ -149,11 +168,45 @@ fn records_validate_intrinsic_invariants() {
 #[test]
 fn machine_module_fuel_and_belt_records_expose_validated_data() {
     let crafting = RecipeCategory::new("crafting").unwrap();
-    let machine =
-        Machine::new(machine_id("assembler"), [crafting.clone()], positive(1.25)).unwrap();
+    let speed_modules = ModuleCategory::new("speed").unwrap();
+    let machine = Machine::new(
+        machine_id("assembler"),
+        [crafting.clone()],
+        positive(1.25),
+        2,
+        [ModuleEffect::Speed, ModuleEffect::Consumption],
+        Some([speed_modules.clone()].into_iter().collect()),
+        positive(90_000.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(0.8),
+        },
+    )
+    .unwrap();
     assert_eq!(machine.id(), &machine_id("assembler"));
     assert_eq!(machine.crafting_categories().iter().next(), Some(&crafting));
     assert_close(machine.crafting_speed().get(), 1.25);
+    assert_eq!(machine.module_slots(), 2);
+    assert_eq!(
+        machine.allowed_effects(),
+        &[ModuleEffect::Speed, ModuleEffect::Consumption]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        machine.allowed_module_categories(),
+        Some(&[speed_modules].into_iter().collect())
+    );
+    assert_close(machine.energy_usage().get(), 90_000.0);
+    assert!(machine.supports_category(&crafting));
+    assert_close(machine.crafts_per_second(positive(0.5)), 2.5);
+    assert!(matches!(
+        machine.energy_source(),
+        MachineEnergySource::Burner { effectivity, .. }
+            if (effectivity.get() - 0.8).abs() < f64::EPSILON
+    ));
 
     let module = Module::new(
         ModuleId::new("productivity-module").unwrap(),
@@ -213,10 +266,8 @@ fn catalog_indexes_and_looks_up_records_deterministically() {
         true,
     )
     .unwrap();
-    let fast_machine =
-        Machine::new(machine_id("z-fast"), [crafting.clone()], positive(2.0)).unwrap();
-    let slow_machine =
-        Machine::new(machine_id("a-slow"), [crafting.clone()], positive(1.0)).unwrap();
+    let fast_machine = electric_machine("z-fast", [crafting.clone()], 2.0).unwrap();
+    let slow_machine = electric_machine("a-slow", [crafting.clone()], 1.0).unwrap();
 
     let catalog = Catalog::try_from_parts(CatalogParts {
         commodities: vec![
@@ -309,12 +360,8 @@ fn catalog_rejects_duplicate_record_ids() {
         })
     );
 
-    let machine = Machine::new(
-        machine_id("assembler"),
-        [RecipeCategory::new("crafting").unwrap()],
-        positive(1.0),
-    )
-    .unwrap();
+    let machine =
+        electric_machine("assembler", [RecipeCategory::new("crafting").unwrap()], 1.0).unwrap();
     assert_eq!(
         Catalog::try_from_parts(CatalogParts {
             machines: vec![machine.clone(), machine],

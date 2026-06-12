@@ -1,6 +1,9 @@
 use std::io::Cursor;
 
-use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, RecipeCategory, RecipeId};
+use factorio_planner_tui::catalog::{
+    CommodityId, FluidId, FuelCategory, ItemId, MachineEnergySource, MachineId, ModuleCategory,
+    ModuleEffect, Positive, RecipeCategory, RecipeId, UnsupportedEnergySource,
+};
 use factorio_planner_tui::import::{
     DiagnosticSeverity, ImportError, PrototypeDisposition, parse_data_raw,
 };
@@ -29,6 +32,250 @@ fn invalid_data(json: &str) -> Vec<factorio_planner_tui::import::ImportDiagnosti
         Err(ImportError::InvalidData { diagnostics }) => diagnostics,
         other => panic!("expected invalid import data, got {other:?}"),
     }
+}
+
+#[test]
+fn imports_assemblers_furnaces_and_machine_defaults() {
+    let report = import(include_str!("fixtures/crafting-machines-data-raw.json")).unwrap();
+    let catalog = report.catalog();
+
+    assert_eq!(catalog.machines().len(), 5);
+
+    let defaults = catalog
+        .machine(&MachineId::new("assembler-defaults").unwrap())
+        .unwrap();
+    assert_close(defaults.crafting_speed().get(), 1.25);
+    assert_eq!(defaults.module_slots(), 0);
+    assert!(defaults.allowed_effects().is_empty());
+    assert_eq!(defaults.allowed_module_categories(), None);
+    assert_close(defaults.energy_usage().get(), 90_000.0);
+    assert!(defaults.supports_category(&RecipeCategory::new("modded-crafting").unwrap()));
+    assert_close(defaults.crafts_per_second(Positive::new(0.5).unwrap()), 2.5);
+    assert!(matches!(
+        defaults.energy_source(),
+        MachineEnergySource::Electric { drain }
+            if (drain.get() - 3_000.0).abs() < f64::EPSILON
+    ));
+
+    let explicit = catalog
+        .machine(&MachineId::new("assembler-explicit").unwrap())
+        .unwrap();
+    assert_eq!(explicit.module_slots(), 4);
+    assert_eq!(
+        explicit.allowed_effects(),
+        &[
+            ModuleEffect::Speed,
+            ModuleEffect::Productivity,
+            ModuleEffect::Consumption
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(
+        explicit.allowed_module_categories(),
+        Some(
+            &[
+                ModuleCategory::new("productivity").unwrap(),
+                ModuleCategory::new("speed").unwrap()
+            ]
+            .into_iter()
+            .collect()
+        )
+    );
+    assert_close(explicit.energy_usage().get(), 2_000_000.0);
+    assert!(matches!(
+        explicit.energy_source(),
+        MachineEnergySource::Electric { drain }
+            if (drain.get() - 1_000.0).abs() < f64::EPSILON
+    ));
+
+    let stone_furnace = catalog
+        .machine(&MachineId::new("stone-furnace").unwrap())
+        .unwrap();
+    assert!(matches!(
+        stone_furnace.energy_source(),
+        MachineEnergySource::Burner {
+            fuel_categories,
+            effectivity
+        } if fuel_categories == &[FuelCategory::new("chemical").unwrap()].into_iter().collect()
+            && (effectivity.get() - 1.0).abs() < f64::EPSILON
+    ));
+
+    assert_eq!(
+        catalog.machines_for_category(&RecipeCategory::new("crafting").unwrap()),
+        &[
+            MachineId::new("assembler-defaults").unwrap(),
+            MachineId::new("assembler-explicit").unwrap(),
+            MachineId::new("heat-assembler").unwrap()
+        ]
+    );
+}
+
+#[test]
+fn retains_unsupported_energy_sources_with_warnings() {
+    let report = import(include_str!("fixtures/crafting-machines-data-raw.json")).unwrap();
+    let machine = report
+        .catalog()
+        .machine(&MachineId::new("heat-assembler").unwrap())
+        .unwrap();
+
+    assert_close(machine.energy_usage().get(), 180_000_000.0);
+    assert_eq!(
+        machine.energy_source(),
+        &MachineEnergySource::Unsupported(UnsupportedEnergySource::Heat)
+    );
+    assert!(report.diagnostics().iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Warning
+            && diagnostic.prototype_type.as_deref() == Some("assembling-machine")
+            && diagnostic.prototype_id.as_deref() == Some("heat-assembler")
+            && diagnostic.path == "/assembling-machine/heat-assembler/energy_source/type"
+            && diagnostic.disposition == PrototypeDisposition::PartiallyRetained
+    }));
+}
+
+#[test]
+fn normalizes_machine_power_units_and_single_allowed_effects() {
+    let report = import(
+        r#"{
+            "assembling-machine": {
+                "watts": {
+                    "type": "assembling-machine",
+                    "name": "watts",
+                    "crafting_categories": ["crafting"],
+                    "crafting_speed": 1,
+                    "allowed_effects": "speed",
+                    "energy_usage": "90W",
+                    "energy_source": {
+                        "type": "electric",
+                        "usage_priority": "secondary-input",
+                        "drain": "2J"
+                    }
+                },
+                "kilowatts": {
+                    "type": "assembling-machine",
+                    "name": "kilowatts",
+                    "crafting_categories": ["crafting"],
+                    "crafting_speed": 1,
+                    "energy_usage": "1.5kW",
+                    "energy_source": {
+                        "type": "electric",
+                        "usage_priority": "secondary-input"
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let watts = report
+        .catalog()
+        .machine(&MachineId::new("watts").unwrap())
+        .unwrap();
+    assert_eq!(
+        watts.allowed_effects(),
+        &[ModuleEffect::Speed].into_iter().collect()
+    );
+    assert_close(watts.energy_usage().get(), 90.0);
+    assert!(matches!(
+        watts.energy_source(),
+        MachineEnergySource::Electric { drain }
+            if (drain.get() - 120.0).abs() < f64::EPSILON
+    ));
+
+    let kilowatts = report
+        .catalog()
+        .machine(&MachineId::new("kilowatts").unwrap())
+        .unwrap();
+    assert_close(kilowatts.energy_usage().get(), 1_500.0);
+}
+
+#[test]
+fn reports_malformed_machine_fields_with_precise_context() {
+    let diagnostics = invalid_data(
+        r#"{
+            "assembling-machine": {
+                "bad": {
+                    "type": "assembling-machine",
+                    "name": "bad",
+                    "crafting_categories": ["crafting", 7, ""],
+                    "crafting_speed": 0,
+                    "module_slots": -1,
+                    "allowed_effects": ["speed", 7],
+                    "allowed_module_categories": ["speed", ""],
+                    "energy_usage": "not-power",
+                    "energy_source": {
+                        "type": "burner",
+                        "effectivity": 0,
+                        "fuel_categories": ["chemical", 7]
+                    }
+                }
+            },
+            "furnace": []
+        }"#,
+    );
+
+    for path in [
+        "/assembling-machine/bad/crafting_categories/1",
+        "/assembling-machine/bad/crafting_categories/2",
+        "/assembling-machine/bad/crafting_speed",
+        "/assembling-machine/bad/module_slots",
+        "/assembling-machine/bad/allowed_effects/1",
+        "/assembling-machine/bad/allowed_module_categories/1",
+        "/assembling-machine/bad/energy_usage",
+        "/assembling-machine/bad/energy_source/effectivity",
+        "/assembling-machine/bad/energy_source/fuel_categories/1",
+        "/furnace",
+    ] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.path == path),
+            "missing diagnostic for {path}: {diagnostics:#?}"
+        );
+    }
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Error
+            && diagnostic.disposition == PrototypeDisposition::Rejected
+    }));
+}
+
+#[test]
+fn warns_about_unknown_machine_effects_and_energy_sources() {
+    let report = import(
+        r#"{
+            "assembling-machine": {
+                "future-machine": {
+                    "type": "assembling-machine",
+                    "name": "future-machine",
+                    "crafting_categories": ["crafting"],
+                    "crafting_speed": 1,
+                    "allowed_effects": ["speed", "future-effect"],
+                    "energy_usage": "1kW",
+                    "energy_source": {"type": "future-power"}
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let machine = report
+        .catalog()
+        .machine(&MachineId::new("future-machine").unwrap())
+        .unwrap();
+    assert_eq!(
+        machine.allowed_effects(),
+        &[ModuleEffect::Speed].into_iter().collect()
+    );
+    assert_eq!(
+        machine.energy_source(),
+        &MachineEnergySource::Unsupported(UnsupportedEnergySource::Unknown("future-power".into()))
+    );
+    assert_eq!(
+        report
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+            .count(),
+        2
+    );
 }
 
 #[test]
