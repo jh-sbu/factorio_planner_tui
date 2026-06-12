@@ -1,0 +1,95 @@
+{
+  "item": {
+    "iron-ore": {
+      "type": "item",
+      "name": "iron-ore"
+    },
+    "iron-plate": {
+      "type": "item",
+      "name": "iron-plate"
+    },
+    "free-item": {
+      "type": "item",
+      "name": "free-item"
+    },
+    "shared-name": {
+      "type": "item",
+      "name": "shared-name"
+    }
+  },
+  "fluid": {
+    "water": {
+      "type": "fluid",
+      "name": "water"
+    },
+    "steam": {
+      "type": "fluid",
+      "name": "steam"
+    },
+    "shared-name": {
+      "type": "fluid",
+      "name": "shared-name"
+    }
+  },
+  "recipe": {
+    "iron-plate": {
+      "type": "recipe",
+      "name": "iron-plate",
+      "category": "smelting",
+      "energy_required": 3.2,
+      "ingredients": [
+        {
+          "type": "item",
+          "name": "iron-ore",
+          "amount": 1
+        }
+      ],
+      "results": [
+        {
+          "type": "item",
+          "name": "iron-plate",
+          "amount": 1
+        }
+      ],
+      "main_product": "iron-plate",
+      "hidden": true
+    },
+    "steam": {
+      "type": "recipe",
+      "name": "steam",
+      "category": "chemistry",
+      "energy_required": 1,
+      "ingredients": [
+        {
+          "type": "fluid",
+          "name": "water",
+          "amount": 10
+        }
+      ],
+      "results": [
+        {
+          "type": "fluid",
+          "name": "steam",
+          "amount": 10
+        }
+      ]
+    },
+    "free-item": {
+      "type": "recipe",
+      "name": "free-item",
+      "results": [
+        {
+          "type": "item",
+          "name": "free-item",
+          "amount": 1
+        }
+      ]
+    }
+  },
+  "unrelated-prototype-collection": [
+    "this",
+    "shape",
+    "is",
+    "ignored"
+  ]
+}
