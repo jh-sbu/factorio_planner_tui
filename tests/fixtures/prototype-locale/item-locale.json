@@ -1,0 +1,13 @@
+{
+  "names": {
+    "coal": "Coal fuel",
+    "iron-ore": "Iron ore",
+    "iron-plate": "Iron plate",
+    "shared-name": "Shared item",
+    "speed-module": "Speed module",
+    "unknown-item": "Unknown item"
+  },
+  "descriptions": {
+    "iron-plate": "Descriptions are intentionally ignored."
+  }
+}

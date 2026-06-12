@@ -1,0 +1,91 @@
+{
+  "item": {
+    "coal": {
+      "type": "item",
+      "name": "coal",
+      "fuel_category": "chemical",
+      "fuel_value": "8MJ"
+    },
+    "copper-plate": {
+      "type": "item",
+      "name": "copper-plate"
+    },
+    "iron-ore": {
+      "type": "item",
+      "name": "iron-ore"
+    },
+    "iron-plate": {
+      "type": "item",
+      "name": "iron-plate"
+    },
+    "shared-name": {
+      "type": "item",
+      "name": "shared-name"
+    }
+  },
+  "fluid": {
+    "shared-name": {
+      "type": "fluid",
+      "name": "shared-name"
+    },
+    "water": {
+      "type": "fluid",
+      "name": "water"
+    }
+  },
+  "module": {
+    "speed-module": {
+      "type": "module",
+      "name": "speed-module",
+      "category": "speed",
+      "effect": {
+        "consumption": 0.5,
+        "speed": 0.2
+      }
+    }
+  },
+  "recipe": {
+    "iron-plate": {
+      "type": "recipe",
+      "name": "iron-plate",
+      "category": "smelting",
+      "energy_required": 3.2,
+      "ingredients": [
+        {
+          "type": "item",
+          "name": "iron-ore",
+          "amount": 1
+        }
+      ],
+      "results": [
+        {
+          "type": "item",
+          "name": "iron-plate",
+          "amount": 1
+        }
+      ],
+      "main_product": "iron-plate"
+    }
+  },
+  "assembling-machine": {
+    "assembling-machine-1": {
+      "type": "assembling-machine",
+      "name": "assembling-machine-1",
+      "crafting_categories": [
+        "smelting"
+      ],
+      "crafting_speed": 0.5,
+      "energy_usage": "75kW",
+      "energy_source": {
+        "type": "electric"
+      }
+    }
+  },
+  "transport-belt": {
+    "transport-belt": {
+      "type": "transport-belt",
+      "name": "transport-belt",
+      "speed": 0.03125
+    }
+  }
+}

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 
 use serde::Deserialize;
@@ -89,6 +89,128 @@ struct RelevantCollections {
     transport_belt: Option<Value>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LocalePrototypeKind {
+    Item,
+    Fluid,
+    Recipe,
+    Entity,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PrototypeLocale {
+    item: BTreeMap<String, String>,
+    fluid: BTreeMap<String, String>,
+    recipe: BTreeMap<String, String>,
+    entity: BTreeMap<String, String>,
+}
+
+impl PrototypeLocale {
+    #[must_use]
+    pub fn localized_name(&self, kind: LocalePrototypeKind, id: &str) -> Option<&str> {
+        self.names(kind).get(id).map(String::as_str)
+    }
+
+    fn names(&self, kind: LocalePrototypeKind) -> &BTreeMap<String, String> {
+        match kind {
+            LocalePrototypeKind::Item => &self.item,
+            LocalePrototypeKind::Fluid => &self.fluid,
+            LocalePrototypeKind::Recipe => &self.recipe,
+            LocalePrototypeKind::Entity => &self.entity,
+        }
+    }
+
+    fn names_mut(&mut self, kind: LocalePrototypeKind) -> &mut BTreeMap<String, String> {
+        match kind {
+            LocalePrototypeKind::Item => &mut self.item,
+            LocalePrototypeKind::Fluid => &mut self.fluid,
+            LocalePrototypeKind::Recipe => &mut self.recipe,
+            LocalePrototypeKind::Entity => &mut self.entity,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum LocaleError {
+    #[error("invalid {prototype_kind:?} locale JSON at line {line}, column {column}: {message}")]
+    Json {
+        prototype_kind: LocalePrototypeKind,
+        line: usize,
+        column: usize,
+        message: String,
+    },
+    #[error("invalid {prototype_kind:?} locale data at {path}: {message}")]
+    InvalidData {
+        prototype_kind: LocalePrototypeKind,
+        path: String,
+        message: String,
+    },
+}
+
+/// Parses the `names` maps from Factorio's per-prototype locale dump files.
+///
+/// Missing `names` maps and unknown fields, including descriptions, are
+/// ignored. Files for prototype kinds not needed by the planner do not need to
+/// be supplied.
+///
+/// # Errors
+///
+/// Returns [`LocaleError::Json`] for invalid JSON and
+/// [`LocaleError::InvalidData`] for malformed `names` maps.
+pub fn parse_prototype_locale<R: Read>(
+    files: impl IntoIterator<Item = (LocalePrototypeKind, R)>,
+) -> Result<PrototypeLocale, LocaleError> {
+    let mut locale = PrototypeLocale::default();
+    for (kind, reader) in files {
+        let mut deserializer = serde_json::Deserializer::from_reader(reader);
+        let value = Value::deserialize(&mut deserializer)
+            .map_err(|error| locale_json_error(kind, &error))?;
+        deserializer
+            .end()
+            .map_err(|error| locale_json_error(kind, &error))?;
+        let Value::Object(mut fields) = value else {
+            return Err(LocaleError::InvalidData {
+                prototype_kind: kind,
+                path: String::new(),
+                message: "locale file must be a JSON object".into(),
+            });
+        };
+        let Some(names) = fields.remove("names") else {
+            continue;
+        };
+        let Value::Object(names) = names else {
+            return Err(LocaleError::InvalidData {
+                prototype_kind: kind,
+                path: "/names".into(),
+                message: "names must be a JSON object".into(),
+            });
+        };
+        for (id, name) in names {
+            let Value::String(name) = name else {
+                return Err(LocaleError::InvalidData {
+                    prototype_kind: kind,
+                    path: format!("/names/{}", pointer_segment(&id)),
+                    message: "localized name must be a string".into(),
+                });
+            };
+            locale.names_mut(kind).insert(id, name);
+        }
+    }
+    Ok(locale)
+}
+
+fn locale_json_error(
+    prototype_kind: LocalePrototypeKind,
+    error: &serde_json::Error,
+) -> LocaleError {
+    LocaleError::Json {
+        prototype_kind,
+        line: error.line().max(1),
+        column: error.column().max(1),
+        message: error.to_string(),
+    }
+}
+
 /// Parses the supported portion of a resolved Factorio `data.raw` JSON dump.
 ///
 /// Unknown top-level prototype collections and unknown fields are ignored.
@@ -98,6 +220,28 @@ struct RelevantCollections {
 /// Returns [`ImportError::Json`] for invalid JSON and
 /// [`ImportError::InvalidData`] when a supported prototype is malformed.
 pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
+    parse_data_raw_inner(reader, None)
+}
+
+/// Parses supported Factorio prototypes and attaches optional localized names.
+///
+/// Internal prototype names remain the authoritative IDs used by all catalog
+/// records and indexes.
+///
+/// # Errors
+///
+/// Returns the same errors as [`parse_data_raw`].
+pub fn parse_data_raw_with_locale(
+    reader: impl Read,
+    locale: &PrototypeLocale,
+) -> Result<ImportReport, ImportError> {
+    parse_data_raw_inner(reader, Some(locale))
+}
+
+fn parse_data_raw_inner(
+    reader: impl Read,
+    locale: Option<&PrototypeLocale>,
+) -> Result<ImportReport, ImportError> {
     let mut deserializer = serde_json::Deserializer::from_reader(reader);
     let raw =
         RelevantCollections::deserialize(&mut deserializer).map_err(|error| json_error(&error))?;
@@ -111,6 +255,7 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
         &mut commodities,
         &mut parsed_fuels,
         &mut diagnostics,
+        locale,
     );
     parse_commodity_collection(
         "fluid",
@@ -118,12 +263,14 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
         CommodityKind::Fluid,
         &mut commodities,
         &mut diagnostics,
+        locale,
     );
     let modules = parse_module_collection(
         raw.module,
         &mut commodities,
         &mut parsed_fuels,
         &mut diagnostics,
+        locale,
     );
 
     let commodity_ids = commodities
@@ -132,18 +279,20 @@ pub fn parse_data_raw(reader: impl Read) -> Result<ImportReport, ImportError> {
         .collect::<BTreeSet<_>>();
     validate_fuel_references(&parsed_fuels, &commodity_ids, &mut diagnostics);
     let fuels = parsed_fuels.into_iter().map(|parsed| parsed.fuel).collect();
-    let recipes = parse_recipe_collection(raw.recipe, &commodity_ids, &mut diagnostics);
+    let recipes = parse_recipe_collection(raw.recipe, &commodity_ids, &mut diagnostics, locale);
     let mut machines = parse_machine_collection(
         "assembling-machine",
         raw.assembling_machine,
         &mut diagnostics,
+        locale,
     );
     machines.extend(parse_machine_collection(
         "furnace",
         raw.furnace,
         &mut diagnostics,
+        locale,
     ));
-    let belts = parse_belt_collection(raw.transport_belt, &mut diagnostics);
+    let belts = parse_belt_collection(raw.transport_belt, &mut diagnostics, locale);
 
     if has_errors(&diagnostics) {
         return Err(ImportError::InvalidData { diagnostics });
@@ -202,6 +351,13 @@ impl CommodityKind {
             Self::Fluid => FluidId::new(name).map(CommodityId::Fluid),
         }
     }
+
+    const fn locale_kind(self) -> LocalePrototypeKind {
+        match self {
+            Self::Item => LocalePrototypeKind::Item,
+            Self::Fluid => LocalePrototypeKind::Fluid,
+        }
+    }
 }
 
 struct ParsedFuel {
@@ -214,6 +370,7 @@ fn parse_item_collection(
     commodities: &mut Vec<Commodity>,
     fuels: &mut Vec<ParsedFuel>,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
 ) {
     let Some(collection) = collection else {
         return;
@@ -242,6 +399,7 @@ fn parse_item_collection(
 
         let initial_errors = error_count(diagnostics);
         validate_prototype_identity(&fields, "item", &id, &prototype_path, diagnostics);
+        let localized_name = locale_name(locale, LocalePrototypeKind::Item, &id);
         let item_id = ItemId::new(id.clone()).map_or_else(
             |error| {
                 prototype_error(
@@ -256,13 +414,21 @@ fn parse_item_collection(
             Some,
         );
         let fuel = item_id.as_ref().and_then(|item_id| {
-            parse_fuel("item", &id, item_id, &fields, &prototype_path, diagnostics)
+            parse_fuel(
+                "item",
+                &id,
+                item_id,
+                &fields,
+                &prototype_path,
+                diagnostics,
+                localized_name.clone(),
+            )
         });
 
         if error_count(diagnostics) == initial_errors
             && let Some(item_id) = item_id
         {
-            commodities.push(Commodity::new(CommodityId::Item(item_id), None));
+            commodities.push(Commodity::new(CommodityId::Item(item_id), localized_name));
             if let Some(fuel) = fuel {
                 fuels.push(fuel);
             }
@@ -275,6 +441,7 @@ fn parse_module_collection(
     commodities: &mut Vec<Commodity>,
     fuels: &mut Vec<ParsedFuel>,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
 ) -> Vec<Module> {
     let Some(collection) = collection else {
         return Vec::new();
@@ -304,6 +471,7 @@ fn parse_module_collection(
 
         let initial_errors = error_count(diagnostics);
         validate_prototype_identity(&fields, "module", &id, &prototype_path, diagnostics);
+        let localized_name = locale_name(locale, LocalePrototypeKind::Item, &id);
         let item_id = ItemId::new(id.clone()).map_or_else(
             |error| {
                 prototype_error(
@@ -340,6 +508,7 @@ fn parse_module_collection(
                 &fields,
                 &prototype_path,
                 diagnostics,
+                localized_name.clone(),
             )
         });
 
@@ -347,7 +516,10 @@ fn parse_module_collection(
             && let (Some(item_id), Some(module_id), Some(category), Some(effects)) =
                 (item_id, module_id, category, effects)
         {
-            commodities.push(Commodity::new(CommodityId::Item(item_id), None));
+            commodities.push(Commodity::new(
+                CommodityId::Item(item_id),
+                localized_name.clone(),
+            ));
             modules.push(
                 Module::new(
                     module_id,
@@ -356,7 +528,8 @@ fn parse_module_collection(
                     effects.productivity,
                     effects.consumption,
                 )
-                .with_unsupported_effects(effects.unsupported),
+                .with_unsupported_effects(effects.unsupported)
+                .with_localized_name(localized_name),
             );
             if let Some(fuel) = fuel {
                 fuels.push(fuel);
@@ -514,6 +687,7 @@ fn parse_fuel(
     fields: &Map<String, Value>,
     prototype_path: &str,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    localized_name: Option<String>,
 ) -> Option<ParsedFuel> {
     let fuel_value = parse_fuel_value(
         fields,
@@ -555,7 +729,8 @@ fn parse_fuel(
     )?;
 
     Some(ParsedFuel {
-        fuel: Fuel::new(fuel_id, item_id.clone(), category, fuel_value, burnt_result),
+        fuel: Fuel::new(fuel_id, item_id.clone(), category, fuel_value, burnt_result)
+            .with_localized_name(localized_name),
         prototype_type,
     })
 }
@@ -721,6 +896,7 @@ fn validate_fuel_references(
 fn parse_belt_collection(
     collection: Option<Value>,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
 ) -> Vec<Belt> {
     let Some(collection) = collection else {
         return Vec::new();
@@ -737,11 +913,16 @@ fn parse_belt_collection(
 
     prototypes
         .into_iter()
-        .filter_map(|(id, prototype)| parse_belt(&id, prototype, diagnostics))
+        .filter_map(|(id, prototype)| parse_belt(&id, prototype, diagnostics, locale))
         .collect()
 }
 
-fn parse_belt(id: &str, prototype: Value, diagnostics: &mut Vec<ImportDiagnostic>) -> Option<Belt> {
+fn parse_belt(
+    id: &str,
+    prototype: Value,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
+) -> Option<Belt> {
     let prototype_path = format!("/transport-belt/{}", pointer_segment(id));
     let Value::Object(fields) = prototype else {
         diagnostics.push(error_diagnostic(
@@ -821,7 +1002,13 @@ fn parse_belt(id: &str, prototype: Value, diagnostics: &mut Vec<ImportDiagnostic
         return None;
     }
 
-    Some(Belt::new(belt_id?, throughput?))
+    Some(
+        Belt::new(belt_id?, throughput?).with_localized_name(locale_name(
+            locale,
+            LocalePrototypeKind::Entity,
+            id,
+        )),
+    )
 }
 
 fn parse_commodity_collection(
@@ -830,6 +1017,7 @@ fn parse_commodity_collection(
     kind: CommodityKind,
     commodities: &mut Vec<Commodity>,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
 ) {
     let Some(collection) = collection else {
         return;
@@ -875,7 +1063,10 @@ fn parse_commodity_collection(
         if diagnostics.len() == initial_errors
             && let Some(commodity_id) = commodity_id
         {
-            commodities.push(Commodity::new(commodity_id, None));
+            commodities.push(Commodity::new(
+                commodity_id,
+                locale_name(locale, kind.locale_kind(), &id),
+            ));
         }
     }
 }
@@ -884,6 +1075,7 @@ fn parse_recipe_collection(
     collection: Option<Value>,
     commodities: &BTreeSet<CommodityId>,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
 ) -> Vec<Recipe> {
     let Some(collection) = collection else {
         return Vec::new();
@@ -900,7 +1092,9 @@ fn parse_recipe_collection(
 
     prototypes
         .into_iter()
-        .filter_map(|(id, prototype)| parse_recipe(&id, prototype, commodities, diagnostics))
+        .filter_map(|(id, prototype)| {
+            parse_recipe(&id, prototype, commodities, diagnostics, locale)
+        })
         .collect()
 }
 
@@ -908,6 +1102,7 @@ fn parse_machine_collection(
     collection_name: &str,
     collection: Option<Value>,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
 ) -> Vec<Machine> {
     let Some(collection) = collection else {
         return Vec::new();
@@ -924,7 +1119,9 @@ fn parse_machine_collection(
 
     prototypes
         .into_iter()
-        .filter_map(|(id, prototype)| parse_machine(collection_name, &id, prototype, diagnostics))
+        .filter_map(|(id, prototype)| {
+            parse_machine(collection_name, &id, prototype, diagnostics, locale)
+        })
         .collect()
 }
 
@@ -933,6 +1130,7 @@ fn parse_machine(
     id: &str,
     prototype: Value,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
 ) -> Option<Machine> {
     let prototype_path = format!("/{prototype_type}/{}", pointer_segment(id));
     let Value::Object(fields) = prototype else {
@@ -990,7 +1188,9 @@ fn parse_machine(
         energy_usage?,
         energy_source?,
     ) {
-        Ok(machine) => Some(machine),
+        Ok(machine) => {
+            Some(machine.with_localized_name(locale_name(locale, LocalePrototypeKind::Entity, id)))
+        }
         Err(error) => {
             machine_error(
                 diagnostics,
@@ -1746,6 +1946,7 @@ fn parse_recipe(
     prototype: Value,
     commodities: &BTreeSet<CommodityId>,
     diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
 ) -> Option<Recipe> {
     let prototype_path = format!("/recipe/{}", pointer_segment(id));
     let Value::Object(fields) = prototype else {
@@ -1803,7 +2004,9 @@ fn parse_recipe(
         visible?,
     );
     match recipe {
-        Ok(recipe) => Some(recipe),
+        Ok(recipe) => {
+            Some(recipe.with_localized_name(locale_name(locale, LocalePrototypeKind::Recipe, id)))
+        }
         Err(error) => {
             recipe_error(diagnostics, id, prototype_path, error.to_string());
             None
@@ -2600,6 +2803,16 @@ fn warning_diagnostic(
 
 fn pointer_segment(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
+}
+
+fn locale_name(
+    locale: Option<&PrototypeLocale>,
+    kind: LocalePrototypeKind,
+    id: &str,
+) -> Option<String> {
+    locale
+        .and_then(|locale| locale.localized_name(kind, id))
+        .map(str::to_owned)
 }
 
 fn error_count(diagnostics: &[ImportDiagnostic]) -> usize {

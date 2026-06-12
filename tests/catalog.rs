@@ -299,8 +299,12 @@ fn catalog_indexes_and_looks_up_records_deterministically() {
     .unwrap();
 
     assert_eq!(
-        catalog.commodity(&gear).unwrap().display_name(),
+        catalog.commodity(&gear).unwrap().localized_name(),
         Some("Iron gear wheel")
+    );
+    assert_eq!(
+        catalog.commodity(&gear).unwrap().display_name(),
+        "Iron gear wheel"
     );
     assert_eq!(
         catalog.recipes_for_product(&gear),

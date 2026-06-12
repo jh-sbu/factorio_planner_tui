@@ -81,6 +81,16 @@ impl fmt::Display for CommodityId {
     }
 }
 
+impl CommodityId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Item(id) => id.as_str(),
+            Self::Fluid(id) => id.as_str(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum NumericError {
     #[error("value must be finite, got {0}")]
@@ -162,13 +172,13 @@ impl Finite {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Commodity {
     id: CommodityId,
-    display_name: Option<String>,
+    localized_name: Option<String>,
 }
 
 impl Commodity {
     #[must_use]
-    pub const fn new(id: CommodityId, display_name: Option<String>) -> Self {
-        Self { id, display_name }
+    pub const fn new(id: CommodityId, localized_name: Option<String>) -> Self {
+        Self { id, localized_name }
     }
 
     #[must_use]
@@ -177,8 +187,13 @@ impl Commodity {
     }
 
     #[must_use]
-    pub fn display_name(&self) -> Option<&str> {
-        self.display_name.as_deref()
+    pub fn localized_name(&self) -> Option<&str> {
+        self.localized_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.localized_name().unwrap_or_else(|| self.id.as_str())
     }
 }
 
@@ -232,6 +247,7 @@ impl Product {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Recipe {
     id: RecipeId,
+    localized_name: Option<String>,
     category: RecipeCategory,
     duration: Positive,
     ingredients: Vec<Ingredient>,
@@ -272,6 +288,7 @@ impl Recipe {
         }
         Ok(Self {
             id,
+            localized_name: None,
             category,
             duration,
             ingredients,
@@ -284,6 +301,22 @@ impl Recipe {
     #[must_use]
     pub const fn id(&self) -> &RecipeId {
         &self.id
+    }
+
+    #[must_use]
+    pub fn with_localized_name(mut self, localized_name: Option<String>) -> Self {
+        self.localized_name = localized_name;
+        self
+    }
+
+    #[must_use]
+    pub fn localized_name(&self) -> Option<&str> {
+        self.localized_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.localized_name().unwrap_or_else(|| self.id.as_str())
     }
 
     #[must_use]
@@ -349,6 +382,7 @@ pub enum ModuleEffect {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Machine {
     id: MachineId,
+    localized_name: Option<String>,
     crafting_categories: BTreeSet<RecipeCategory>,
     crafting_speed: Positive,
     module_slots: u16,
@@ -382,6 +416,7 @@ impl Machine {
         }
         Ok(Self {
             id,
+            localized_name: None,
             crafting_categories,
             crafting_speed,
             module_slots,
@@ -395,6 +430,22 @@ impl Machine {
     #[must_use]
     pub const fn id(&self) -> &MachineId {
         &self.id
+    }
+
+    #[must_use]
+    pub fn with_localized_name(mut self, localized_name: Option<String>) -> Self {
+        self.localized_name = localized_name;
+        self
+    }
+
+    #[must_use]
+    pub fn localized_name(&self) -> Option<&str> {
+        self.localized_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.localized_name().unwrap_or_else(|| self.id.as_str())
     }
 
     #[must_use]
@@ -446,6 +497,7 @@ impl Machine {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     id: ModuleId,
+    localized_name: Option<String>,
     category: ModuleCategory,
     speed_effect: Finite,
     productivity_effect: Finite,
@@ -464,6 +516,7 @@ impl Module {
     ) -> Self {
         Self {
             id,
+            localized_name: None,
             category,
             speed_effect,
             productivity_effect,
@@ -479,8 +532,24 @@ impl Module {
     }
 
     #[must_use]
+    pub fn with_localized_name(mut self, localized_name: Option<String>) -> Self {
+        self.localized_name = localized_name;
+        self
+    }
+
+    #[must_use]
     pub const fn id(&self) -> &ModuleId {
         &self.id
+    }
+
+    #[must_use]
+    pub fn localized_name(&self) -> Option<&str> {
+        self.localized_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.localized_name().unwrap_or_else(|| self.id.as_str())
     }
 
     #[must_use]
@@ -517,6 +586,7 @@ impl Module {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fuel {
     id: FuelId,
+    localized_name: Option<String>,
     item: ItemId,
     category: FuelCategory,
     value: Positive,
@@ -534,6 +604,7 @@ impl Fuel {
     ) -> Self {
         Self {
             id,
+            localized_name: None,
             item,
             category,
             value: fuel_value,
@@ -544,6 +615,22 @@ impl Fuel {
     #[must_use]
     pub const fn id(&self) -> &FuelId {
         &self.id
+    }
+
+    #[must_use]
+    pub fn with_localized_name(mut self, localized_name: Option<String>) -> Self {
+        self.localized_name = localized_name;
+        self
+    }
+
+    #[must_use]
+    pub fn localized_name(&self) -> Option<&str> {
+        self.localized_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.localized_name().unwrap_or_else(|| self.id.as_str())
     }
 
     #[must_use]
@@ -570,18 +657,39 @@ impl Fuel {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Belt {
     id: BeltId,
+    localized_name: Option<String>,
     throughput: Positive,
 }
 
 impl Belt {
     #[must_use]
     pub const fn new(id: BeltId, throughput: Positive) -> Self {
-        Self { id, throughput }
+        Self {
+            id,
+            localized_name: None,
+            throughput,
+        }
     }
 
     #[must_use]
     pub const fn id(&self) -> &BeltId {
         &self.id
+    }
+
+    #[must_use]
+    pub fn with_localized_name(mut self, localized_name: Option<String>) -> Self {
+        self.localized_name = localized_name;
+        self
+    }
+
+    #[must_use]
+    pub fn localized_name(&self) -> Option<&str> {
+        self.localized_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.localized_name().unwrap_or_else(|| self.id.as_str())
     }
 
     #[must_use]
@@ -759,6 +867,70 @@ impl Catalog {
     pub fn belts(&self) -> impl ExactSizeIterator<Item = &Belt> {
         self.belts.values()
     }
+
+    #[must_use]
+    pub fn search_commodities(&self, query: &str) -> Vec<&Commodity> {
+        let query = query.to_lowercase();
+        self.commodities
+            .values()
+            .filter(|commodity| {
+                search_matches(&query, commodity.id().as_str(), commodity.localized_name())
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn search_recipes(&self, query: &str) -> Vec<&Recipe> {
+        let query = query.to_lowercase();
+        self.recipes
+            .values()
+            .filter(|recipe| search_matches(&query, recipe.id().as_str(), recipe.localized_name()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn search_machines(&self, query: &str) -> Vec<&Machine> {
+        let query = query.to_lowercase();
+        self.machines
+            .values()
+            .filter(|machine| {
+                search_matches(&query, machine.id().as_str(), machine.localized_name())
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn search_modules(&self, query: &str) -> Vec<&Module> {
+        let query = query.to_lowercase();
+        self.modules
+            .values()
+            .filter(|module| search_matches(&query, module.id().as_str(), module.localized_name()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn search_fuels(&self, query: &str) -> Vec<&Fuel> {
+        let query = query.to_lowercase();
+        self.fuels
+            .values()
+            .filter(|fuel| search_matches(&query, fuel.id().as_str(), fuel.localized_name()))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn search_belts(&self, query: &str) -> Vec<&Belt> {
+        let query = query.to_lowercase();
+        self.belts
+            .values()
+            .filter(|belt| search_matches(&query, belt.id().as_str(), belt.localized_name()))
+            .collect()
+    }
+}
+
+fn search_matches(query: &str, id: &str, localized_name: Option<&str>) -> bool {
+    query.is_empty()
+        || id.to_lowercase().contains(query)
+        || localized_name.is_some_and(|name| name.to_lowercase().contains(query))
 }
 
 fn collect_unique<T, Id, E>(
