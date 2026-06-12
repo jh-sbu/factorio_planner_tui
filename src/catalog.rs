@@ -222,6 +222,7 @@ impl Product {
         &self.commodity
     }
 
+    /// Returns the aggregated expected output per recipe craft.
     #[must_use]
     pub const fn amount(&self) -> Positive {
         self.amount

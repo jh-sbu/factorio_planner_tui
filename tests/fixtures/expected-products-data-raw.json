@@ -1,0 +1,85 @@
+{
+  "item": {
+    "fixed": {
+      "type": "item",
+      "name": "fixed"
+    },
+    "ranged": {
+      "type": "item",
+      "name": "ranged"
+    },
+    "probabilistic": {
+      "type": "item",
+      "name": "probabilistic"
+    },
+    "combined": {
+      "type": "item",
+      "name": "combined"
+    },
+    "duplicate": {
+      "type": "item",
+      "name": "duplicate"
+    }
+  },
+  "fluid": {
+    "duplicate": {
+      "type": "fluid",
+      "name": "duplicate"
+    }
+  },
+  "recipe": {
+    "expected-products": {
+      "type": "recipe",
+      "name": "expected-products",
+      "results": [
+        {
+          "type": "item",
+          "name": "fixed",
+          "amount": 4
+        },
+        {
+          "type": "item",
+          "name": "ranged",
+          "amount_min": 2,
+          "amount_max": 6
+        },
+        {
+          "type": "item",
+          "name": "probabilistic",
+          "amount": 10,
+          "probability": 0.25
+        },
+        {
+          "type": "item",
+          "name": "combined",
+          "amount_min": 2,
+          "amount_max": 10,
+          "probability": 0.5
+        },
+        {
+          "type": "item",
+          "name": "duplicate",
+          "amount": 1
+        },
+        {
+          "type": "fluid",
+          "name": "duplicate",
+          "amount": 3
+        },
+        {
+          "type": "item",
+          "name": "duplicate",
+          "amount_min": 2,
+          "amount_max": 4,
+          "probability": 0.5
+        },
+        {
+          "type": "fluid",
+          "name": "duplicate",
+          "amount": 4,
+          "probability": 0.5
+        }
+      ]
+    }
+  }
+}

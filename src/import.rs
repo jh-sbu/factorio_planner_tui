@@ -562,59 +562,211 @@ fn parse_products(
         return None;
     }
 
-    let mut products = Vec::new();
+    let mut products: Vec<AggregatedProduct> = Vec::new();
     let initial_errors = diagnostics.len();
     for (index, entry) in entries.iter().enumerate() {
         let entry_path = format!("{prototype_path}/results/{index}");
         let entry_errors = diagnostics.len();
-        let parsed = parse_fixed_entry(entry, recipe_id, &entry_path, commodities, diagnostics);
-        reject_non_fixed_product_fields(entry, recipe_id, &entry_path, diagnostics);
+        let parsed = parse_product_entry(entry, recipe_id, &entry_path, commodities, diagnostics);
         if diagnostics.len() == entry_errors
-            && let Some((commodity, amount)) = parsed
+            && let Some((commodity, expected_amount)) = parsed
         {
-            products.push(Product::new(commodity, amount));
+            if let Some(product) = products
+                .iter_mut()
+                .find(|product| product.commodity == commodity)
+            {
+                let aggregated_amount = product.expected_amount + expected_amount;
+                if aggregated_amount.is_finite() {
+                    product.expected_amount = aggregated_amount;
+                } else {
+                    recipe_error(
+                        diagnostics,
+                        recipe_id,
+                        entry_path,
+                        "aggregated expected output must be finite",
+                    );
+                }
+            } else {
+                products.push(AggregatedProduct {
+                    commodity,
+                    expected_amount,
+                    first_entry_path: entry_path,
+                });
+            }
         }
     }
+
+    let products = products
+        .into_iter()
+        .filter_map(|product| {
+            Positive::new(product.expected_amount).map_or_else(
+                |error| {
+                    recipe_error(
+                        diagnostics,
+                        recipe_id,
+                        product.first_entry_path,
+                        format!("expected output {error}"),
+                    );
+                    None
+                },
+                |amount| Some(Product::new(product.commodity, amount)),
+            )
+        })
+        .collect();
 
     (diagnostics.len() == initial_errors).then_some(products)
 }
 
-fn reject_non_fixed_product_fields(
+struct AggregatedProduct {
+    commodity: CommodityId,
+    expected_amount: f64,
+    first_entry_path: String,
+}
+
+fn parse_product_entry(
     entry: &Value,
     recipe_id: &str,
     entry_path: &str,
+    commodities: &BTreeSet<CommodityId>,
     diagnostics: &mut Vec<ImportDiagnostic>,
-) {
+) -> Option<(CommodityId, f64)> {
     let Value::Object(fields) = entry else {
-        return;
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            entry_path.into(),
+            "product must be a JSON object",
+        );
+        return None;
     };
-    for field in ["amount_min", "amount_max"] {
-        if fields.contains_key(field) {
-            recipe_error(
-                diagnostics,
-                recipe_id,
-                format!("{entry_path}/{field}"),
-                "ranged products are not supported by this importer milestone",
-            );
-        }
+
+    let initial_errors = diagnostics.len();
+    let commodity = parse_entry_commodity(fields, recipe_id, entry_path, commodities, diagnostics);
+    let amount = parse_product_amount(fields, recipe_id, entry_path, diagnostics);
+    let probability = parse_product_probability(fields, recipe_id, entry_path, diagnostics);
+
+    if diagnostics.len() == initial_errors {
+        Some((commodity?, amount? * probability?))
+    } else {
+        None
     }
-    if let Some(probability) = fields.get("probability") {
-        match probability {
-            Value::Number(number) if number.as_f64() == Some(1.0) => {}
-            Value::Number(_) => recipe_error(
-                diagnostics,
-                recipe_id,
-                format!("{entry_path}/probability"),
-                "probabilistic products are not supported by this importer milestone",
-            ),
-            _ => recipe_error(
-                diagnostics,
-                recipe_id,
-                format!("{entry_path}/probability"),
-                "probability must be a number",
-            ),
-        }
+}
+
+fn parse_product_amount(
+    fields: &Map<String, Value>,
+    recipe_id: &str,
+    entry_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<f64> {
+    if fields.contains_key("amount") {
+        return parse_non_negative_number(fields, "amount", recipe_id, entry_path, diagnostics);
     }
+
+    let amount_min =
+        parse_non_negative_number(fields, "amount_min", recipe_id, entry_path, diagnostics);
+    let amount_max =
+        parse_non_negative_number(fields, "amount_max", recipe_id, entry_path, diagnostics);
+
+    match (amount_min, amount_max) {
+        (Some(amount_min), Some(amount_max)) => {
+            let amount_max = amount_max.max(amount_min);
+            Some(amount_min + (amount_max - amount_min) / 2.0)
+        }
+        _ => None,
+    }
+}
+
+fn parse_product_probability(
+    fields: &Map<String, Value>,
+    recipe_id: &str,
+    entry_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<f64> {
+    let Some(value) = fields.get("probability") else {
+        return Some(1.0);
+    };
+    let path = format!("{entry_path}/probability");
+    let Value::Number(number) = value else {
+        recipe_error(diagnostics, recipe_id, path, "probability must be a number");
+        return None;
+    };
+    let Some(probability) = number.as_f64() else {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            "probability must be a finite number",
+        );
+        return None;
+    };
+    if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            "probability must be between 0 and 1",
+        );
+        return None;
+    }
+
+    Some(probability)
+}
+
+fn parse_non_negative_number(
+    fields: &Map<String, Value>,
+    field: &str,
+    recipe_id: &str,
+    entry_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<f64> {
+    let path = format!("{entry_path}/{field}");
+    let Some(value) = fields.get(field) else {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            format!("missing required {field}"),
+        );
+        return None;
+    };
+    let Value::Number(number) = value else {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            format!("{field} must be a number"),
+        );
+        return None;
+    };
+    let Some(value) = number.as_f64() else {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            format!("{field} must be a finite number"),
+        );
+        return None;
+    };
+    if !value.is_finite() {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            format!("{field} must be a finite number"),
+        );
+        return None;
+    }
+    if value < 0.0 {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            format!("{field} must not be negative"),
+        );
+        return None;
+    }
+
+    Some(value)
 }
 
 fn parse_fixed_entry(
@@ -635,11 +787,27 @@ fn parse_fixed_entry(
     };
 
     let initial_errors = diagnostics.len();
-    let kind = parse_entry_type(fields, recipe_id, entry_path, diagnostics);
-    let name = parse_entry_name(fields, recipe_id, entry_path, diagnostics);
+    let commodity = parse_entry_commodity(fields, recipe_id, entry_path, commodities, diagnostics);
     let amount = parse_entry_amount(fields, recipe_id, entry_path, diagnostics);
 
-    let commodity = match (kind, name) {
+    if diagnostics.len() == initial_errors {
+        Some((commodity?, amount?))
+    } else {
+        None
+    }
+}
+
+fn parse_entry_commodity(
+    fields: &Map<String, Value>,
+    recipe_id: &str,
+    entry_path: &str,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<CommodityId> {
+    let kind = parse_entry_type(fields, recipe_id, entry_path, diagnostics);
+    let name = parse_entry_name(fields, recipe_id, entry_path, diagnostics);
+
+    match (kind, name) {
         (Some(kind), Some(name)) => match kind.id(name.clone()) {
             Ok(commodity) => {
                 if !commodities.contains(&commodity) {
@@ -663,12 +831,6 @@ fn parse_fixed_entry(
             }
         },
         _ => None,
-    };
-
-    if diagnostics.len() == initial_errors {
-        Some((commodity?, amount?))
-    } else {
-        None
     }
 }
 

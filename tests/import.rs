@@ -218,37 +218,217 @@ fn rejects_invalid_fixed_amount_shapes() {
 }
 
 #[test]
-fn rejects_product_math_reserved_for_the_next_milestone() {
+fn normalizes_expected_product_amounts_and_aggregates_duplicates() {
+    let report = import(include_str!("fixtures/expected-products-data-raw.json")).unwrap();
+    let recipe = report
+        .catalog()
+        .recipe(&RecipeId::new("expected-products").unwrap())
+        .unwrap();
+
+    assert!(report.diagnostics().is_empty());
+    let products = recipe.products();
+    assert_eq!(products.len(), 6);
+    assert_eq!(products[0].commodity(), &item("fixed"));
+    assert_close(products[0].amount().get(), 4.0);
+    assert_eq!(products[1].commodity(), &item("ranged"));
+    assert_close(products[1].amount().get(), 4.0);
+    assert_eq!(products[2].commodity(), &item("probabilistic"));
+    assert_close(products[2].amount().get(), 2.5);
+    assert_eq!(products[3].commodity(), &item("combined"));
+    assert_close(products[3].amount().get(), 3.0);
+    assert_eq!(products[4].commodity(), &item("duplicate"));
+    assert_close(products[4].amount().get(), 2.5);
+    assert_eq!(products[5].commodity(), &fluid("duplicate"));
+    assert_close(products[5].amount().get(), 5.0);
+    assert_eq!(recipe.main_product(), None);
+}
+
+#[test]
+fn infers_and_validates_main_product_after_duplicate_aggregation() {
+    let report = import(
+        r#"{
+            "item": {"result": {"type": "item", "name": "result"}},
+            "recipe": {
+                "inferred": {
+                    "type": "recipe",
+                    "name": "inferred",
+                    "results": [
+                        {"type": "item", "name": "result", "amount": 1},
+                        {"type": "item", "name": "result", "amount": 2}
+                    ]
+                },
+                "explicit": {
+                    "type": "recipe",
+                    "name": "explicit",
+                    "results": [
+                        {"type": "item", "name": "result", "amount": 1},
+                        {"type": "item", "name": "result", "amount": 2}
+                    ],
+                    "main_product": "result"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    for recipe_id in ["inferred", "explicit"] {
+        let recipe = report
+            .catalog()
+            .recipe(&RecipeId::new(recipe_id).unwrap())
+            .unwrap();
+        assert_eq!(recipe.products().len(), 1);
+        assert_close(recipe.products()[0].amount().get(), 3.0);
+        assert_eq!(recipe.main_product(), Some(&item("result")));
+    }
+}
+
+#[test]
+fn clamps_reversed_product_ranges_and_prefers_fixed_amounts() {
+    let report = import(
+        r#"{
+            "item": {
+                "clamped": {"type": "item", "name": "clamped"},
+                "fixed": {"type": "item", "name": "fixed"}
+            },
+            "recipe": {
+                "range-rules": {
+                    "type": "recipe",
+                    "name": "range-rules",
+                    "results": [
+                        {
+                            "type": "item",
+                            "name": "clamped",
+                            "amount_min": 5,
+                            "amount_max": 2
+                        },
+                        {
+                            "type": "item",
+                            "name": "fixed",
+                            "amount": 4,
+                            "amount_min": "ignored",
+                            "amount_max": "ignored"
+                        }
+                    ]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let recipe = report
+        .catalog()
+        .recipe(&RecipeId::new("range-rules").unwrap())
+        .unwrap();
+    assert_close(recipe.products()[0].amount().get(), 5.0);
+    assert_close(recipe.products()[1].amount().get(), 4.0);
+}
+
+#[test]
+fn allows_zero_product_rows_when_the_commodity_aggregate_is_positive() {
+    let report = import(
+        r#"{
+            "item": {"result": {"type": "item", "name": "result"}},
+            "recipe": {
+                "some-output": {
+                    "type": "recipe",
+                    "name": "some-output",
+                    "results": [
+                        {
+                            "type": "item",
+                            "name": "result",
+                            "amount": 10,
+                            "probability": 0
+                        },
+                        {"type": "item", "name": "result", "amount": 2}
+                    ]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let product = &report
+        .catalog()
+        .recipe(&RecipeId::new("some-output").unwrap())
+        .unwrap()
+        .products()[0];
+    assert_close(product.amount().get(), 2.0);
+}
+
+#[test]
+fn reports_invalid_product_amount_ranges_and_probabilities() {
     let diagnostics = invalid_data(
         r#"{
             "item": {"result": {"type": "item", "name": "result"}},
             "recipe": {
-                "ranged": {
+                "invalid-products": {
                     "type": "recipe",
-                    "name": "ranged",
-                    "results": [{
-                        "type": "item",
-                        "name": "result",
-                        "amount_min": 1,
-                        "amount_max": 3,
-                        "probability": 0.5
-                    }]
+                    "name": "invalid-products",
+                    "results": [
+                        {"type": "item", "name": "result", "amount_min": 1},
+                        {"type": "item", "name": "result", "amount_max": 2},
+                        {
+                            "type": "item",
+                            "name": "result",
+                            "amount_min": -1,
+                            "amount_max": 2
+                        },
+                        {"type": "item", "name": "result", "amount": 1, "probability": "often"},
+                        {"type": "item", "name": "result", "amount": 1, "probability": -0.1},
+                        {"type": "item", "name": "result", "amount": 1, "probability": 1.1}
+                    ]
                 }
             }
         }"#,
     );
 
     for path in [
-        "/recipe/ranged/results/0/amount",
-        "/recipe/ranged/results/0/amount_min",
-        "/recipe/ranged/results/0/amount_max",
-        "/recipe/ranged/results/0/probability",
+        "/recipe/invalid-products/results/0/amount_max",
+        "/recipe/invalid-products/results/1/amount_min",
+        "/recipe/invalid-products/results/2/amount_min",
+        "/recipe/invalid-products/results/3/probability",
+        "/recipe/invalid-products/results/4/probability",
+        "/recipe/invalid-products/results/5/probability",
     ] {
         assert!(
             diagnostics.iter().any(|diagnostic| diagnostic.path == path),
             "missing diagnostic for {path}: {diagnostics:#?}"
         );
     }
+}
+
+#[test]
+fn rejects_zero_aggregated_expected_product_output() {
+    let diagnostics = invalid_data(
+        r#"{
+            "item": {"result": {"type": "item", "name": "result"}},
+            "recipe": {
+                "no-output": {
+                    "type": "recipe",
+                    "name": "no-output",
+                    "results": [
+                        {
+                            "type": "item",
+                            "name": "result",
+                            "amount": 1,
+                            "probability": 0
+                        },
+                        {
+                            "type": "item",
+                            "name": "result",
+                            "amount_min": 0,
+                            "amount_max": 0
+                        }
+                    ]
+                }
+            }
+        }"#,
+    );
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "/recipe/no-output/results/0"
+            && diagnostic.message.contains("expected output")
+    }));
 }
 
 #[test]
