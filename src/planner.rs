@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::catalog::{
-    Catalog, CommodityId, Finite, Machine, MachineId, ModuleEffect, ModuleId, NumericError,
-    Positive, Recipe, RecipeCategory, RecipeId,
+    Catalog, CommodityId, Finite, Fuel, FuelCategory, FuelId, ItemId, Machine, MachineEnergySource,
+    MachineId, ModuleEffect, ModuleId, NonNegative, NumericError, Positive, Recipe, RecipeCategory,
+    RecipeId, UnsupportedEnergySource,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -65,6 +66,7 @@ pub struct FactoryPlan {
     recipe_choices: BTreeMap<CommodityId, RecipeId>,
     machine_choices: BTreeMap<RecipeId, MachineId>,
     module_choices: BTreeMap<CommodityId, Vec<ModuleId>>,
+    fuel_choices: BTreeMap<CommodityId, FuelId>,
     display_rate_unit: RateUnit,
 }
 
@@ -77,6 +79,7 @@ impl FactoryPlan {
             recipe_choices: BTreeMap::new(),
             machine_choices: BTreeMap::new(),
             module_choices: BTreeMap::new(),
+            fuel_choices: BTreeMap::new(),
             display_rate_unit: RateUnit::default(),
         }
     }
@@ -223,6 +226,24 @@ impl FactoryPlan {
         &self.module_choices
     }
 
+    pub fn set_fuel_choice(&mut self, commodity: CommodityId, fuel: FuelId) -> Option<FuelId> {
+        self.fuel_choices.insert(commodity, fuel)
+    }
+
+    pub fn clear_fuel_choice(&mut self, commodity: &CommodityId) -> Option<FuelId> {
+        self.fuel_choices.remove(commodity)
+    }
+
+    #[must_use]
+    pub fn fuel_choice(&self, commodity: &CommodityId) -> Option<&FuelId> {
+        self.fuel_choices.get(commodity)
+    }
+
+    #[must_use]
+    pub const fn fuel_choices(&self) -> &BTreeMap<CommodityId, FuelId> {
+        &self.fuel_choices
+    }
+
     #[must_use]
     pub const fn display_rate_unit(&self) -> RateUnit {
         self.display_rate_unit
@@ -256,6 +277,60 @@ impl CommodityRate {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ElectricPower {
+    fractional_process_watts: Positive,
+    installed_full_load_watts: Positive,
+}
+
+impl ElectricPower {
+    #[must_use]
+    pub const fn fractional_process_watts(&self) -> Positive {
+        self.fractional_process_watts
+    }
+
+    #[must_use]
+    pub const fn installed_full_load_watts(&self) -> Positive {
+        self.installed_full_load_watts
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FuelUsage {
+    fuel: FuelId,
+    fuel_item: ItemId,
+    rate_per_second: Positive,
+    burnt_result: Option<CommodityRate>,
+}
+
+impl FuelUsage {
+    #[must_use]
+    pub const fn fuel(&self) -> &FuelId {
+        &self.fuel
+    }
+
+    #[must_use]
+    pub const fn fuel_item(&self) -> &ItemId {
+        &self.fuel_item
+    }
+
+    #[must_use]
+    pub const fn rate_per_second(&self) -> Positive {
+        self.rate_per_second
+    }
+
+    #[must_use]
+    pub const fn burnt_result(&self) -> Option<&CommodityRate> {
+        self.burnt_result.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum StepEnergy {
+    Electric(ElectricPower),
+    Burner(FuelUsage),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProductionStep {
     planning_product: CommodityId,
     recipe: RecipeId,
@@ -268,6 +343,7 @@ pub struct ProductionStep {
     speed_multiplier: Positive,
     productivity_effect: Finite,
     consumption_multiplier: Positive,
+    energy: StepEnergy,
     ingredients: Vec<CommodityRate>,
     products: Vec<CommodityRate>,
 }
@@ -329,6 +405,11 @@ impl ProductionStep {
     }
 
     #[must_use]
+    pub const fn energy(&self) -> &StepEnergy {
+        &self.energy
+    }
+
+    #[must_use]
     pub fn ingredients(&self) -> &[CommodityRate] {
         &self.ingredients
     }
@@ -344,6 +425,8 @@ pub struct CalculationResult {
     production_steps: Vec<ProductionStep>,
     external_inputs: Vec<CommodityRate>,
     surplus: Vec<CommodityRate>,
+    electric_power: Option<ElectricPower>,
+    burner_fuel_demand: Vec<FuelUsage>,
     display_rate_unit: RateUnit,
 }
 
@@ -361,6 +444,16 @@ impl CalculationResult {
     #[must_use]
     pub fn surplus(&self) -> &[CommodityRate] {
         &self.surplus
+    }
+
+    #[must_use]
+    pub const fn electric_power(&self) -> Option<&ElectricPower> {
+        self.electric_power.as_ref()
+    }
+
+    #[must_use]
+    pub fn burner_fuel_demand(&self) -> &[FuelUsage] {
+        &self.burner_fuel_demand
     }
 
     #[must_use]
@@ -405,6 +498,14 @@ pub enum PlannerError {
         recipe: RecipeId,
         machine: MachineId,
         category: RecipeCategory,
+    },
+    #[error(
+        "machine {machine} selected for recipe {recipe} uses unsupported energy source {energy_source:?}"
+    )]
+    UnsupportedMachineEnergySource {
+        recipe: RecipeId,
+        machine: MachineId,
+        energy_source: UnsupportedEnergySource,
     },
     #[error("selected module {module} for {commodity} is not present in the catalog")]
     MissingModuleChoice {
@@ -453,6 +554,31 @@ pub enum PlannerError {
         module: ModuleId,
         effect: ModuleEffect,
     },
+    #[error("selected fuel {fuel} for {commodity} is not present in the catalog")]
+    MissingFuelChoice {
+        commodity: CommodityId,
+        fuel: FuelId,
+    },
+    #[error(
+        "selected fuel {fuel} category {category} is incompatible with machine {machine} for {commodity}"
+    )]
+    IncompatibleFuelChoice {
+        commodity: CommodityId,
+        machine: MachineId,
+        fuel: FuelId,
+        category: FuelCategory,
+    },
+    #[error("machine {machine} has no compatible fuel for {commodity}")]
+    NoCompatibleFuel {
+        commodity: CommodityId,
+        machine: MachineId,
+    },
+    #[error("selected fuel {fuel} for {commodity}, but machine {machine} is not a burner")]
+    FuelChoiceForNonBurnerMachine {
+        commodity: CommodityId,
+        machine: MachineId,
+        fuel: FuelId,
+    },
     #[error("selected production dependencies contain a cycle: {path:?}")]
     Cycle { path: Vec<CommodityId> },
     #[error("calculated {quantity} is invalid: {value}")]
@@ -479,8 +605,8 @@ pub fn calculate(catalog: &Catalog, plan: &FactoryPlan) -> Result<CalculationRes
         }
     }
 
-    let selected_recipes = resolve_selected_recipes(catalog, plan, &target_rates)?;
-    let mut calculation = Calculation::new(catalog, plan, selected_recipes);
+    let resolved_plan = resolve_plan(catalog, plan, &target_rates)?;
+    let mut calculation = Calculation::new(catalog, plan, resolved_plan);
     for (commodity, rate) in target_rates {
         calculation.expand(&commodity, rate)?;
     }
@@ -490,21 +616,17 @@ pub fn calculate(catalog: &Catalog, plan: &FactoryPlan) -> Result<CalculationRes
 struct Calculation<'a> {
     catalog: &'a Catalog,
     plan: &'a FactoryPlan,
-    selected_recipes: BTreeMap<CommodityId, RecipeId>,
+    resolved_plan: ResolvedPlan,
     production_steps: BTreeMap<CommodityId, ProductionStepAccumulator>,
     external_inputs: BTreeMap<CommodityId, f64>,
 }
 
 impl<'a> Calculation<'a> {
-    fn new(
-        catalog: &'a Catalog,
-        plan: &'a FactoryPlan,
-        selected_recipes: BTreeMap<CommodityId, RecipeId>,
-    ) -> Self {
+    fn new(catalog: &'a Catalog, plan: &'a FactoryPlan, resolved_plan: ResolvedPlan) -> Self {
         Self {
             catalog,
             plan,
-            selected_recipes,
+            resolved_plan,
             production_steps: BTreeMap::new(),
             external_inputs: BTreeMap::new(),
         }
@@ -519,7 +641,7 @@ impl<'a> Calculation<'a> {
             return self.add_external_input(commodity, required_rate);
         }
 
-        let Some(recipe_id) = self.selected_recipes.get(commodity) else {
+        let Some(recipe_id) = self.resolved_plan.recipes.get(commodity) else {
             return self.add_external_input(commodity, required_rate);
         };
         let recipe_id = recipe_id.clone();
@@ -527,7 +649,12 @@ impl<'a> Calculation<'a> {
             .catalog
             .recipe(&recipe_id)
             .expect("resolved recipe IDs must remain present in the catalog");
-        let machine_id = self.select_machine(recipe)?;
+        let machine_id = self
+            .resolved_plan
+            .machines
+            .get(commodity)
+            .expect("resolved production recipes must have machines")
+            .clone();
         let machine = self
             .catalog
             .machine(&machine_id)
@@ -555,6 +682,11 @@ impl<'a> Calculation<'a> {
         let fractional_machine_count = checked_positive(
             craft_rate.get() / crafts_per_second_per_machine.get(),
             "fractional machine count",
+        )?;
+        let energy = self.resolve_step_energy(
+            commodity,
+            machine,
+            module_configuration.consumption_multiplier,
         )?;
 
         let ingredients = recipe
@@ -585,12 +717,19 @@ impl<'a> Calculation<'a> {
             craft_rate,
             fractional_machine_count,
             &module_configuration,
+            &energy,
             &ingredients,
             &products,
         )?;
 
         for ingredient in ingredients {
             self.expand(ingredient.commodity(), ingredient.rate())?;
+        }
+        if let Some(fuel_rate) = energy.fuel_rate(fractional_machine_count)? {
+            self.expand(
+                &CommodityId::Item(fuel_rate.fuel_item().clone()),
+                fuel_rate.rate_per_second(),
+            )?;
         }
         Ok(())
     }
@@ -605,6 +744,7 @@ impl<'a> Calculation<'a> {
         craft_rate: Positive,
         fractional_machine_count: Positive,
         module_configuration: &ModuleConfiguration,
+        energy: &StepEnergyConfiguration,
         ingredients: &[CommodityRate],
         products: &[CommodityRate],
     ) -> Result<(), PlannerError> {
@@ -622,6 +762,7 @@ impl<'a> Calculation<'a> {
                 speed_multiplier: module_configuration.speed_multiplier,
                 productivity_effect: module_configuration.productivity_effect,
                 consumption_multiplier: module_configuration.consumption_multiplier,
+                energy: energy.clone(),
                 ingredients: BTreeMap::new(),
                 products: BTreeMap::new(),
             });
@@ -632,6 +773,7 @@ impl<'a> Calculation<'a> {
             step.productivity_effect,
             module_configuration.productivity_effect
         );
+        debug_assert_eq!(&step.energy, energy);
 
         step.required_output_rate += required_output_rate.get();
         checked_positive(
@@ -665,39 +807,53 @@ impl<'a> Calculation<'a> {
         Ok(())
     }
 
-    fn select_machine(&self, recipe: &Recipe) -> Result<MachineId, PlannerError> {
-        if let Some(machine_id) = self.plan.machine_choice(recipe.id()) {
-            let machine = self.catalog.machine(machine_id).ok_or_else(|| {
-                PlannerError::MissingMachineChoice {
-                    recipe: recipe.id().clone(),
-                    machine: machine_id.clone(),
-                }
-            })?;
-            if !machine.supports_category(recipe.category()) {
-                return Err(PlannerError::IncompatibleMachineChoice {
-                    recipe: recipe.id().clone(),
-                    machine: machine_id.clone(),
-                    category: recipe.category().clone(),
-                });
+    fn resolve_step_energy(
+        &self,
+        commodity: &CommodityId,
+        machine: &Machine,
+        consumption_multiplier: Positive,
+    ) -> Result<StepEnergyConfiguration, PlannerError> {
+        let active_watts_per_machine = checked_positive(
+            machine.energy_usage().get() * consumption_multiplier.get(),
+            "active machine power",
+        )?;
+        match machine.energy_source() {
+            MachineEnergySource::Electric { drain } => Ok(StepEnergyConfiguration::Electric {
+                active_watts_per_machine,
+                drain_watts_per_machine: *drain,
+            }),
+            MachineEnergySource::Burner { effectivity, .. } => {
+                let fuel_id = self
+                    .resolved_plan
+                    .fuels
+                    .get(commodity)
+                    .expect("resolved burner production steps must have fuels");
+                let fuel = self
+                    .catalog
+                    .fuel(fuel_id)
+                    .expect("resolved fuel IDs must remain present in the catalog");
+                Ok(StepEnergyConfiguration::Burner {
+                    fuel: fuel.id().clone(),
+                    fuel_item: fuel.item().clone(),
+                    active_watts_per_machine,
+                    effectivity: *effectivity,
+                    fuel_value: fuel.fuel_value(),
+                    burnt_result: fuel.burnt_result().cloned(),
+                })
             }
-            return Ok(machine_id.clone());
+            MachineEnergySource::Unsupported(source) => {
+                Err(PlannerError::UnsupportedMachineEnergySource {
+                    recipe: self
+                        .resolved_plan
+                        .recipes
+                        .get(commodity)
+                        .expect("resolved production steps must have recipes")
+                        .clone(),
+                    machine: machine.id().clone(),
+                    energy_source: source.clone(),
+                })
+            }
         }
-
-        let machine_ids = self.catalog.machines_for_category(recipe.category());
-        machine_ids
-            .iter()
-            .filter_map(|machine_id| self.catalog.machine(machine_id))
-            .max_by(|left, right| {
-                left.crafting_speed()
-                    .get()
-                    .total_cmp(&right.crafting_speed().get())
-                    .then_with(|| right.id().cmp(left.id()))
-            })
-            .map(|machine| machine.id().clone())
-            .ok_or_else(|| PlannerError::NoCompatibleMachine {
-                recipe: recipe.id().clone(),
-                category: recipe.category().clone(),
-            })
     }
 
     fn resolve_modules(
@@ -836,32 +992,48 @@ impl<'a> Calculation<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let surplus = aggregate_surplus(&production_steps)?;
+        let electric_power = aggregate_electric_power(&production_steps)?;
+        let burner_fuel_demand = aggregate_burner_fuel_demand(&production_steps)?;
 
         Ok(CalculationResult {
             production_steps,
             external_inputs,
             surplus,
+            electric_power,
+            burner_fuel_demand,
             display_rate_unit: self.plan.display_rate_unit(),
         })
     }
 }
 
-fn resolve_selected_recipes(
+fn resolve_plan(
     catalog: &Catalog,
     plan: &FactoryPlan,
     targets: &[(CommodityId, Positive)],
-) -> Result<BTreeMap<CommodityId, RecipeId>, PlannerError> {
+) -> Result<ResolvedPlan, PlannerError> {
     let mut resolver = RecipeResolver::new(catalog, plan);
     for (commodity, _) in targets {
         resolver.visit(commodity)?;
     }
-    Ok(resolver.selected_recipes)
+    Ok(ResolvedPlan {
+        recipes: resolver.selected_recipes,
+        machines: resolver.selected_machines,
+        fuels: resolver.selected_fuels,
+    })
+}
+
+struct ResolvedPlan {
+    recipes: BTreeMap<CommodityId, RecipeId>,
+    machines: BTreeMap<CommodityId, MachineId>,
+    fuels: BTreeMap<CommodityId, FuelId>,
 }
 
 struct RecipeResolver<'a> {
     catalog: &'a Catalog,
     plan: &'a FactoryPlan,
     selected_recipes: BTreeMap<CommodityId, RecipeId>,
+    selected_machines: BTreeMap<CommodityId, MachineId>,
+    selected_fuels: BTreeMap<CommodityId, FuelId>,
     resolved: BTreeSet<CommodityId>,
     active_path: Vec<CommodityId>,
 }
@@ -872,6 +1044,8 @@ impl<'a> RecipeResolver<'a> {
             catalog,
             plan,
             selected_recipes: BTreeMap::new(),
+            selected_machines: BTreeMap::new(),
+            selected_fuels: BTreeMap::new(),
             resolved: BTreeSet::new(),
             active_path: Vec::new(),
         }
@@ -897,16 +1071,33 @@ impl<'a> RecipeResolver<'a> {
             return Ok(());
         };
         let recipe_id = recipe.id().clone();
-        let ingredients = recipe
+        let machine_id = select_machine(self.catalog, self.plan, recipe)?;
+        let machine = self
+            .catalog
+            .machine(&machine_id)
+            .expect("selected machine IDs must remain present in the catalog");
+        let fuel_id = select_fuel(self.catalog, self.plan, commodity, machine)?;
+        let mut dependencies = recipe
             .ingredients()
             .iter()
             .map(|ingredient| ingredient.commodity().clone())
             .collect::<Vec<_>>();
+        if let Some(fuel_id) = &fuel_id {
+            let fuel = self
+                .catalog
+                .fuel(fuel_id)
+                .expect("selected fuel IDs must remain present in the catalog");
+            dependencies.push(CommodityId::Item(fuel.item().clone()));
+        }
         self.selected_recipes.insert(commodity.clone(), recipe_id);
+        self.selected_machines.insert(commodity.clone(), machine_id);
+        if let Some(fuel_id) = fuel_id {
+            self.selected_fuels.insert(commodity.clone(), fuel_id);
+        }
 
         self.active_path.push(commodity.clone());
-        for ingredient in ingredients {
-            self.visit(&ingredient)?;
+        for dependency in dependencies {
+            self.visit(&dependency)?;
         }
         self.active_path.pop();
         self.resolved.insert(commodity.clone());
@@ -954,6 +1145,137 @@ impl<'a> RecipeResolver<'a> {
     }
 }
 
+fn select_machine(
+    catalog: &Catalog,
+    plan: &FactoryPlan,
+    recipe: &Recipe,
+) -> Result<MachineId, PlannerError> {
+    if let Some(machine_id) = plan.machine_choice(recipe.id()) {
+        let machine =
+            catalog
+                .machine(machine_id)
+                .ok_or_else(|| PlannerError::MissingMachineChoice {
+                    recipe: recipe.id().clone(),
+                    machine: machine_id.clone(),
+                })?;
+        if !machine.supports_category(recipe.category()) {
+            return Err(PlannerError::IncompatibleMachineChoice {
+                recipe: recipe.id().clone(),
+                machine: machine_id.clone(),
+                category: recipe.category().clone(),
+            });
+        }
+        ensure_supported_energy_source(recipe, machine)?;
+        return Ok(machine_id.clone());
+    }
+
+    let compatible = catalog
+        .machines_for_category(recipe.category())
+        .iter()
+        .filter_map(|machine_id| catalog.machine(machine_id))
+        .collect::<Vec<_>>();
+    let fastest_supported = compatible
+        .iter()
+        .copied()
+        .filter(|machine| !matches!(machine.energy_source(), MachineEnergySource::Unsupported(_)))
+        .max_by(|left, right| compare_machines(left, right));
+    if let Some(machine) = fastest_supported {
+        return Ok(machine.id().clone());
+    }
+
+    let Some(machine) = compatible
+        .into_iter()
+        .max_by(|left, right| compare_machines(left, right))
+    else {
+        return Err(PlannerError::NoCompatibleMachine {
+            recipe: recipe.id().clone(),
+            category: recipe.category().clone(),
+        });
+    };
+    ensure_supported_energy_source(recipe, machine)?;
+    unreachable!("unsupported machines must return an error")
+}
+
+fn compare_machines(left: &Machine, right: &Machine) -> std::cmp::Ordering {
+    left.crafting_speed()
+        .get()
+        .total_cmp(&right.crafting_speed().get())
+        .then_with(|| right.id().cmp(left.id()))
+}
+
+fn ensure_supported_energy_source(recipe: &Recipe, machine: &Machine) -> Result<(), PlannerError> {
+    if let MachineEnergySource::Unsupported(source) = machine.energy_source() {
+        return Err(PlannerError::UnsupportedMachineEnergySource {
+            recipe: recipe.id().clone(),
+            machine: machine.id().clone(),
+            energy_source: source.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn select_fuel(
+    catalog: &Catalog,
+    plan: &FactoryPlan,
+    commodity: &CommodityId,
+    machine: &Machine,
+) -> Result<Option<FuelId>, PlannerError> {
+    match machine.energy_source() {
+        MachineEnergySource::Electric { .. } => {
+            if let Some(fuel) = plan.fuel_choice(commodity) {
+                return Err(PlannerError::FuelChoiceForNonBurnerMachine {
+                    commodity: commodity.clone(),
+                    machine: machine.id().clone(),
+                    fuel: fuel.clone(),
+                });
+            }
+            Ok(None)
+        }
+        MachineEnergySource::Burner {
+            fuel_categories, ..
+        } => {
+            if let Some(fuel_id) = plan.fuel_choice(commodity) {
+                let fuel =
+                    catalog
+                        .fuel(fuel_id)
+                        .ok_or_else(|| PlannerError::MissingFuelChoice {
+                            commodity: commodity.clone(),
+                            fuel: fuel_id.clone(),
+                        })?;
+                if !fuel_categories.contains(fuel.category()) {
+                    return Err(PlannerError::IncompatibleFuelChoice {
+                        commodity: commodity.clone(),
+                        machine: machine.id().clone(),
+                        fuel: fuel.id().clone(),
+                        category: fuel.category().clone(),
+                    });
+                }
+                return Ok(Some(fuel.id().clone()));
+            }
+
+            catalog
+                .fuels()
+                .filter(|fuel| fuel_categories.contains(fuel.category()))
+                .max_by(|left, right| compare_fuels(left, right))
+                .map(|fuel| Some(fuel.id().clone()))
+                .ok_or_else(|| PlannerError::NoCompatibleFuel {
+                    commodity: commodity.clone(),
+                    machine: machine.id().clone(),
+                })
+        }
+        MachineEnergySource::Unsupported(_) => {
+            unreachable!("unsupported machine energy sources are rejected during selection")
+        }
+    }
+}
+
+fn compare_fuels(left: &Fuel, right: &Fuel) -> std::cmp::Ordering {
+    left.fuel_value()
+        .get()
+        .total_cmp(&right.fuel_value().get())
+        .then_with(|| right.id().cmp(left.id()))
+}
+
 fn default_recipe_rank(recipe: &Recipe, commodity: &CommodityId) -> (u8, u8) {
     let visibility_rank = u8::from(!recipe.visible());
     let product_rank = if recipe.main_product() == Some(commodity) {
@@ -981,6 +1303,7 @@ struct ProductionStepAccumulator {
     speed_multiplier: Positive,
     productivity_effect: Finite,
     consumption_multiplier: Positive,
+    energy: StepEnergyConfiguration,
     ingredients: BTreeMap<CommodityId, f64>,
     products: BTreeMap<CommodityId, f64>,
 }
@@ -993,6 +1316,9 @@ impl ProductionStepAccumulator {
         )?;
         let installed_machine_count =
             checked_installed_machine_count(fractional_machine_count.get())?;
+        let energy = self
+            .energy
+            .finish(fractional_machine_count, installed_machine_count)?;
         let ingredients = self
             .ingredients
             .into_iter()
@@ -1025,9 +1351,95 @@ impl ProductionStepAccumulator {
             speed_multiplier: self.speed_multiplier,
             productivity_effect: self.productivity_effect,
             consumption_multiplier: self.consumption_multiplier,
+            energy,
             ingredients,
             products,
         })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum StepEnergyConfiguration {
+    Electric {
+        active_watts_per_machine: Positive,
+        drain_watts_per_machine: NonNegative,
+    },
+    Burner {
+        fuel: FuelId,
+        fuel_item: ItemId,
+        active_watts_per_machine: Positive,
+        effectivity: Positive,
+        fuel_value: Positive,
+        burnt_result: Option<ItemId>,
+    },
+}
+
+impl StepEnergyConfiguration {
+    fn fuel_rate(
+        &self,
+        fractional_machine_count: Positive,
+    ) -> Result<Option<FuelUsage>, PlannerError> {
+        let Self::Burner {
+            fuel,
+            fuel_item,
+            active_watts_per_machine,
+            effectivity,
+            fuel_value,
+            burnt_result,
+        } = self
+        else {
+            return Ok(None);
+        };
+        let rate_per_second = checked_positive(
+            active_watts_per_machine.get() * fractional_machine_count.get()
+                / (effectivity.get() * fuel_value.get()),
+            "burner fuel rate per second",
+        )?;
+        let burnt_result = burnt_result.as_ref().map(|item| CommodityRate {
+            commodity: CommodityId::Item(item.clone()),
+            rate: rate_per_second,
+        });
+        Ok(Some(FuelUsage {
+            fuel: fuel.clone(),
+            fuel_item: fuel_item.clone(),
+            rate_per_second,
+            burnt_result,
+        }))
+    }
+
+    fn finish(
+        self,
+        fractional_machine_count: Positive,
+        installed_machine_count: u64,
+    ) -> Result<StepEnergy, PlannerError> {
+        match self {
+            Self::Electric {
+                active_watts_per_machine,
+                drain_watts_per_machine,
+            } => {
+                #[allow(clippy::cast_precision_loss)]
+                let installed_machine_count = installed_machine_count as f64;
+                let fractional_process_watts = checked_positive(
+                    active_watts_per_machine.get() * fractional_machine_count.get()
+                        + drain_watts_per_machine.get() * installed_machine_count,
+                    "fractional-process electric power",
+                )?;
+                let installed_full_load_watts = checked_positive(
+                    (active_watts_per_machine.get() + drain_watts_per_machine.get())
+                        * installed_machine_count,
+                    "installed full-load electric power",
+                )?;
+                Ok(StepEnergy::Electric(ElectricPower {
+                    fractional_process_watts,
+                    installed_full_load_watts,
+                }))
+            }
+            burner @ Self::Burner { .. } => Ok(StepEnergy::Burner(
+                burner
+                    .fuel_rate(fractional_machine_count)?
+                    .expect("burner energy configuration must produce fuel usage"),
+            )),
+        }
     }
 }
 
@@ -1082,6 +1494,13 @@ fn aggregate_surplus(
             *total += product.rate().get();
             checked_positive(*total, "aggregated surplus rate per second")?;
         }
+        if let StepEnergy::Burner(fuel_usage) = step.energy()
+            && let Some(burnt_result) = fuel_usage.burnt_result()
+        {
+            let total = surplus.entry(burnt_result.commodity().clone()).or_default();
+            *total += burnt_result.rate().get();
+            checked_positive(*total, "aggregated burnt-result surplus rate per second")?;
+        }
     }
     surplus
         .into_iter()
@@ -1090,6 +1509,107 @@ fn aggregate_surplus(
                 .map(|rate| CommodityRate { commodity, rate })
         })
         .collect()
+}
+
+fn aggregate_electric_power(
+    production_steps: &[ProductionStep],
+) -> Result<Option<ElectricPower>, PlannerError> {
+    let mut fractional_process_watts = 0.0;
+    let mut installed_full_load_watts = 0.0;
+    let mut has_electric_power = false;
+    for step in production_steps {
+        if let StepEnergy::Electric(power) = step.energy() {
+            has_electric_power = true;
+            fractional_process_watts += power.fractional_process_watts().get();
+            checked_positive(
+                fractional_process_watts,
+                "aggregated fractional-process electric power",
+            )?;
+            installed_full_load_watts += power.installed_full_load_watts().get();
+            checked_positive(
+                installed_full_load_watts,
+                "aggregated installed full-load electric power",
+            )?;
+        }
+    }
+
+    if has_electric_power {
+        Ok(Some(ElectricPower {
+            fractional_process_watts: checked_positive(
+                fractional_process_watts,
+                "aggregated fractional-process electric power",
+            )?,
+            installed_full_load_watts: checked_positive(
+                installed_full_load_watts,
+                "aggregated installed full-load electric power",
+            )?,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn aggregate_burner_fuel_demand(
+    production_steps: &[ProductionStep],
+) -> Result<Vec<FuelUsage>, PlannerError> {
+    let mut rates = BTreeMap::<FuelId, FuelUsageAccumulator>::new();
+    for step in production_steps {
+        if let StepEnergy::Burner(fuel_usage) = step.energy() {
+            let entry =
+                rates
+                    .entry(fuel_usage.fuel().clone())
+                    .or_insert_with(|| FuelUsageAccumulator {
+                        fuel: fuel_usage.fuel().clone(),
+                        fuel_item: fuel_usage.fuel_item().clone(),
+                        rate_per_second: 0.0,
+                        burnt_result: fuel_usage
+                            .burnt_result()
+                            .map(|rate| rate.commodity().clone()),
+                    });
+            debug_assert_eq!(entry.fuel_item, *fuel_usage.fuel_item());
+            debug_assert_eq!(
+                entry.burnt_result.as_ref(),
+                fuel_usage
+                    .burnt_result()
+                    .map(crate::planner::CommodityRate::commodity)
+            );
+            entry.rate_per_second += fuel_usage.rate_per_second().get();
+            checked_positive(
+                entry.rate_per_second,
+                "aggregated burner fuel rate per second",
+            )?;
+        }
+    }
+
+    rates
+        .into_values()
+        .map(FuelUsageAccumulator::finish)
+        .collect()
+}
+
+struct FuelUsageAccumulator {
+    fuel: FuelId,
+    fuel_item: ItemId,
+    rate_per_second: f64,
+    burnt_result: Option<CommodityId>,
+}
+
+impl FuelUsageAccumulator {
+    fn finish(self) -> Result<FuelUsage, PlannerError> {
+        let rate_per_second = checked_positive(
+            self.rate_per_second,
+            "aggregated burner fuel rate per second",
+        )?;
+        Ok(FuelUsage {
+            fuel: self.fuel,
+            fuel_item: self.fuel_item,
+            rate_per_second,
+            burnt_result: self.burnt_result.map(|commodity| CommodityRate {
+                commodity,
+                rate: rate_per_second,
+            }),
+        })
+    }
 }
 
 fn aggregate_target_rates(

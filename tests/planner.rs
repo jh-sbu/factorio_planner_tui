@@ -1,15 +1,20 @@
 use factorio_planner_tui::catalog::{
-    Catalog, CatalogParts, Commodity, CommodityId, Finite, ItemId, Machine, MachineEnergySource,
-    MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive, Product,
-    Recipe, RecipeCategory, RecipeId,
+    Catalog, CatalogParts, Commodity, CommodityId, Finite, Fuel, FuelCategory, FuelId, ItemId,
+    Machine, MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId,
+    NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId, UnsupportedEnergySource,
 };
 use factorio_planner_tui::planner::{
-    FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit, Target, calculate,
+    FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit, StepEnergy, Target,
+    calculate,
 };
 use proptest::prelude::*;
 
 fn item(name: &str) -> CommodityId {
     CommodityId::Item(ItemId::new(name).expect("test item ID should be valid"))
+}
+
+fn item_id(name: &str) -> ItemId {
+    ItemId::new(name).expect("test item ID should be valid")
 }
 
 fn recipe_id(name: &str) -> RecipeId {
@@ -22,6 +27,10 @@ fn machine_id(name: &str) -> MachineId {
 
 fn module_id(name: &str) -> ModuleId {
     ModuleId::new(name).expect("test module ID should be valid")
+}
+
+fn fuel_id(name: &str) -> FuelId {
+    FuelId::new(name).expect("test fuel ID should be valid")
 }
 
 fn positive(value: f64) -> Positive {
@@ -164,6 +173,27 @@ fn catalog_with_modules(
     .unwrap()
 }
 
+fn catalog_with_energy(
+    commodities: impl IntoIterator<Item = CommodityId>,
+    recipes: Vec<Recipe>,
+    machines: Vec<Machine>,
+    modules: Vec<Module>,
+    fuels: Vec<Fuel>,
+) -> Catalog {
+    Catalog::try_from_parts(CatalogParts {
+        commodities: commodities
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        recipes,
+        machines,
+        modules,
+        fuels,
+        ..CatalogParts::default()
+    })
+    .unwrap()
+}
+
 fn target(commodity: CommodityId, rate_per_second: f64) -> Target {
     Target::new(commodity, rate_per_second).expect("test target should be valid")
 }
@@ -273,6 +303,16 @@ fn test_module(
         finite(speed),
         finite(productivity),
         finite(consumption),
+    )
+}
+
+fn test_fuel(name: &str, category: &str, value: f64, burnt_result: Option<&str>) -> Fuel {
+    Fuel::new(
+        fuel_id(name),
+        item_id(name),
+        FuelCategory::new(category).unwrap(),
+        positive(value),
+        burnt_result.map(item_id),
     )
 }
 
@@ -1321,6 +1361,408 @@ fn module_loadouts_are_canonicalized_without_losing_duplicate_slots() {
         ])
     );
     assert!(plan.modules_for(&plate).is_empty());
+}
+
+#[test]
+fn calculates_electric_process_and_installed_power_with_drain_and_modules() {
+    let plate = item("plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let efficiency = ModuleCategory::new("efficiency").unwrap();
+    let plate_recipe = recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0)
+        .with_module_policy(
+            [ModuleEffect::Consumption],
+            Some([efficiency.clone()].into_iter().collect()),
+            NonNegative::new(3.0).unwrap(),
+        );
+    let electric_machine = Machine::new(
+        machine_id("assembler"),
+        [crafting],
+        positive(1.0),
+        1,
+        [ModuleEffect::Consumption],
+        Some([efficiency].into_iter().collect()),
+        positive(100.0),
+        MachineEnergySource::Electric {
+            drain: NonNegative::new(10.0).unwrap(),
+        },
+    )
+    .unwrap();
+    let catalog = catalog_with_energy(
+        [plate.clone()],
+        vec![plate_recipe],
+        vec![electric_machine],
+        vec![test_module("power", "efficiency", 0.0, 0.0, 0.5)],
+        vec![],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.5));
+    plan.set_modules(plate.clone(), [module_id("power")]);
+
+    let result = calculate(&catalog, &plan).unwrap();
+    let step = step_for(&result, &plate);
+    let StepEnergy::Electric(power) = step.energy() else {
+        panic!("expected electric power");
+    };
+
+    assert_close(power.fractional_process_watts().get(), 245.0);
+    assert_close(power.installed_full_load_watts().get(), 320.0);
+    let total = result.electric_power().expect("expected electric total");
+    assert_close(total.fractional_process_watts().get(), 245.0);
+    assert_close(total.installed_full_load_watts().get(), 320.0);
+    assert!(result.burner_fuel_demand().is_empty());
+}
+
+#[test]
+fn defaults_to_the_best_compatible_fuel_and_allows_overrides() {
+    let plate = item("plate");
+    let poor = item("poor-fuel");
+    let rich_a = item("a-rich-fuel");
+    let rich_z = item("z-rich-fuel");
+    let smelting = RecipeCategory::new("smelting").unwrap();
+    let burner = Machine::new(
+        machine_id("furnace"),
+        [smelting.clone()],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(100.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(0.5),
+        },
+    )
+    .unwrap();
+    let catalog = catalog_with_energy(
+        [plate.clone(), poor.clone(), rich_a.clone(), rich_z],
+        vec![recipe("plate", &smelting, 1.0, vec![], plate.clone(), 1.0)],
+        vec![burner],
+        vec![],
+        vec![
+            test_fuel("poor-fuel", "chemical", 500.0, None),
+            test_fuel("z-rich-fuel", "chemical", 2_000.0, None),
+            test_fuel("a-rich-fuel", "chemical", 2_000.0, None),
+        ],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+
+    let defaulted = calculate(&catalog, &plan).unwrap();
+    let StepEnergy::Burner(default_fuel) = step_for(&defaulted, &plate).energy() else {
+        panic!("expected burner fuel");
+    };
+    assert_eq!(default_fuel.fuel(), &fuel_id("a-rich-fuel"));
+    assert_eq!(default_fuel.fuel_item(), &item_id("a-rich-fuel"));
+    assert_close(default_fuel.rate_per_second().get(), 0.1);
+    assert_eq!(defaulted.external_inputs()[0].commodity(), &rich_a);
+
+    assert_eq!(
+        plan.set_fuel_choice(plate.clone(), fuel_id("poor-fuel")),
+        None
+    );
+    assert_eq!(plan.fuel_choice(&plate), Some(&fuel_id("poor-fuel")));
+    let overridden = calculate(&catalog, &plan).unwrap();
+    let StepEnergy::Burner(overridden_fuel) = step_for(&overridden, &plate).energy() else {
+        panic!("expected burner fuel");
+    };
+    assert_eq!(overridden_fuel.fuel(), &fuel_id("poor-fuel"));
+    assert_close(overridden_fuel.rate_per_second().get(), 0.4);
+    assert_eq!(overridden.external_inputs()[0].commodity(), &poor);
+    assert_eq!(plan.clear_fuel_choice(&plate), Some(fuel_id("poor-fuel")));
+}
+
+#[test]
+fn recursively_produces_burner_fuel_and_reports_burnt_result_surplus() {
+    let ore = item("ore");
+    let coal = item("coal");
+    let ash = item("ash");
+    let plate = item("plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let smelting = RecipeCategory::new("smelting").unwrap();
+    let electric = Machine::new(
+        machine_id("assembler"),
+        [crafting.clone()],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(50.0),
+        MachineEnergySource::Electric {
+            drain: NonNegative::new(0.0).unwrap(),
+        },
+    )
+    .unwrap();
+    let burner = Machine::new(
+        machine_id("furnace"),
+        [smelting.clone()],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(100.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(0.5),
+        },
+    )
+    .unwrap();
+    let catalog = catalog_with_energy(
+        [ore.clone(), coal.clone(), ash.clone(), plate.clone()],
+        vec![
+            recipe(
+                "coal",
+                &crafting,
+                1.0,
+                vec![(ore.clone(), 1.0)],
+                coal.clone(),
+                2.0,
+            ),
+            recipe("plate", &smelting, 1.0, vec![], plate.clone(), 1.0),
+        ],
+        vec![electric, burner],
+        vec![],
+        vec![test_fuel("coal", "chemical", 1_000.0, Some("ash"))],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(plate.clone(), 2.0))).unwrap();
+
+    let fuel = result
+        .burner_fuel_demand()
+        .first()
+        .expect("expected aggregate burner fuel");
+    assert_eq!(fuel.fuel(), &fuel_id("coal"));
+    assert_close(fuel.rate_per_second().get(), 0.4);
+    assert_close(
+        fuel.burnt_result()
+            .expect("expected burnt result")
+            .rate()
+            .get(),
+        0.4,
+    );
+    assert_close(step_for(&result, &coal).required_output_rate().get(), 0.4);
+    assert_eq!(result.external_inputs()[0].commodity(), &ore);
+    assert_close(result.external_inputs()[0].rate().get(), 0.2);
+    assert_close(rate_for(result.surplus(), &ash), 0.4);
+}
+
+#[test]
+fn validates_explicit_fuel_choices() {
+    let plate = item("plate");
+    let coal = item("coal");
+    let biofuel = item("biofuel");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let burner = Machine::new(
+        machine_id("furnace"),
+        [crafting.clone()],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(100.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(1.0),
+        },
+    )
+    .unwrap();
+    let catalog = catalog_with_energy(
+        [plate.clone(), coal, biofuel],
+        vec![recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0)],
+        vec![burner],
+        vec![],
+        vec![test_fuel("biofuel", "biological", 1_000.0, None)],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::NoCompatibleFuel {
+            commodity: plate.clone(),
+            machine: machine_id("furnace"),
+        })
+    );
+
+    plan.set_fuel_choice(plate.clone(), fuel_id("missing"));
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::MissingFuelChoice {
+            commodity: plate.clone(),
+            fuel: fuel_id("missing"),
+        })
+    );
+
+    plan.set_fuel_choice(plate.clone(), fuel_id("biofuel"));
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::IncompatibleFuelChoice {
+            commodity: plate,
+            machine: machine_id("furnace"),
+            fuel: fuel_id("biofuel"),
+            category: FuelCategory::new("biological").unwrap(),
+        })
+    );
+}
+
+#[test]
+fn rejects_fuel_choices_for_electric_machines() {
+    let plate = item("plate");
+    let coal = item("coal");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog_with_energy(
+        [plate.clone(), coal],
+        vec![recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0)],
+        vec![machine("assembler", [crafting], 1.0)],
+        vec![],
+        vec![test_fuel("coal", "chemical", 1_000.0, None)],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+    plan.set_fuel_choice(plate.clone(), fuel_id("coal"));
+
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::FuelChoiceForNonBurnerMachine {
+            commodity: plate,
+            machine: machine_id("assembler"),
+            fuel: fuel_id("coal"),
+        })
+    );
+}
+
+#[test]
+fn detects_burner_fuel_cycles_and_resolves_them_with_external_fuel() {
+    let plate = item("plate");
+    let coal = item("coal");
+    let smelting = RecipeCategory::new("smelting").unwrap();
+    let fuel_processing = RecipeCategory::new("fuel-processing").unwrap();
+    let plate_burner = Machine::new(
+        machine_id("plate-furnace"),
+        [smelting.clone()],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(100.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(1.0),
+        },
+    )
+    .unwrap();
+    let coal_burner = Machine::new(
+        machine_id("coal-processor"),
+        [fuel_processing.clone()],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(100.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("metal").unwrap()].into_iter().collect(),
+            effectivity: positive(1.0),
+        },
+    )
+    .unwrap();
+    let catalog = catalog_with_energy(
+        [plate.clone(), coal.clone()],
+        vec![
+            recipe("plate", &smelting, 1.0, vec![], plate.clone(), 1.0),
+            recipe("coal", &fuel_processing, 1.0, vec![], coal.clone(), 1.0),
+        ],
+        vec![plate_burner, coal_burner],
+        vec![],
+        vec![
+            test_fuel("coal", "chemical", 1_000.0, None),
+            test_fuel("plate", "metal", 1_000.0, None),
+        ],
+    );
+
+    assert_eq!(
+        calculate(&catalog, &FactoryPlan::new(target(plate.clone(), 1.0))),
+        Err(PlannerError::Cycle {
+            path: vec![plate.clone(), coal.clone(), plate.clone()],
+        })
+    );
+
+    let external =
+        FactoryPlan::new(target(plate.clone(), 1.0)).with_external_inputs([coal.clone()]);
+    let result = calculate(&catalog, &external).unwrap();
+    assert_eq!(result.production_steps().len(), 1);
+    assert_eq!(result.external_inputs()[0].commodity(), &coal);
+}
+
+#[test]
+fn skips_unsupported_default_energy_sources_and_rejects_explicit_ones() {
+    let plate = item("plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let plate_recipe = recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0);
+    let heat_machine = Machine::new(
+        machine_id("heat-fast"),
+        [crafting.clone()],
+        positive(2.0),
+        0,
+        [],
+        None,
+        positive(100.0),
+        MachineEnergySource::Unsupported(UnsupportedEnergySource::Heat),
+    )
+    .unwrap();
+    let electric_machine = machine("electric-slow", [crafting.clone()], 1.0);
+    let mixed_catalog = catalog(
+        [plate.clone()],
+        vec![plate_recipe.clone()],
+        vec![heat_machine, electric_machine],
+    );
+
+    let defaulted = calculate(
+        &mixed_catalog,
+        &FactoryPlan::new(target(plate.clone(), 1.0)),
+    )
+    .unwrap();
+    assert_eq!(
+        step_for(&defaulted, &plate).machine(),
+        &machine_id("electric-slow")
+    );
+
+    let mut explicit = FactoryPlan::new(target(plate.clone(), 1.0));
+    explicit.set_machine_choice(recipe_id("plate"), machine_id("heat-fast"));
+    assert_eq!(
+        calculate(&mixed_catalog, &explicit),
+        Err(PlannerError::UnsupportedMachineEnergySource {
+            recipe: recipe_id("plate"),
+            machine: machine_id("heat-fast"),
+            energy_source: UnsupportedEnergySource::Heat,
+        })
+    );
+
+    let fluid_machine = Machine::new(
+        machine_id("fluid-only"),
+        [crafting],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(100.0),
+        MachineEnergySource::Unsupported(UnsupportedEnergySource::Fluid),
+    )
+    .unwrap();
+    let fluid_catalog = catalog([plate.clone()], vec![plate_recipe], vec![fluid_machine]);
+    assert_eq!(
+        calculate(
+            &fluid_catalog,
+            &FactoryPlan::new(target(plate.clone(), 1.0))
+        ),
+        Err(PlannerError::UnsupportedMachineEnergySource {
+            recipe: recipe_id("plate"),
+            machine: machine_id("fluid-only"),
+            energy_source: UnsupportedEnergySource::Fluid,
+        })
+    );
 }
 
 #[test]
