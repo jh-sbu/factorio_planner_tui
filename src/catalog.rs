@@ -224,12 +224,37 @@ impl Ingredient {
 pub struct Product {
     commodity: CommodityId,
     amount: Positive,
+    productivity_amount: NonNegative,
 }
 
 impl Product {
     #[must_use]
-    pub const fn new(commodity: CommodityId, amount: Positive) -> Self {
-        Self { commodity, amount }
+    pub fn new(commodity: CommodityId, amount: Positive) -> Self {
+        Self {
+            commodity,
+            amount,
+            productivity_amount: NonNegative(amount.get()),
+        }
+    }
+
+    /// Sets the expected amount eligible for productivity bonuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::ProductivityAmountExceedsProductAmount`] when
+    /// the eligible amount is greater than the product's expected amount.
+    pub fn with_productivity_amount(
+        mut self,
+        productivity_amount: NonNegative,
+    ) -> Result<Self, RecordError> {
+        if productivity_amount.get() > self.amount.get() {
+            return Err(RecordError::ProductivityAmountExceedsProductAmount {
+                product_amount: self.amount.get(),
+                productivity_amount: productivity_amount.get(),
+            });
+        }
+        self.productivity_amount = productivity_amount;
+        Ok(self)
     }
 
     #[must_use]
@@ -241,6 +266,12 @@ impl Product {
     #[must_use]
     pub const fn amount(&self) -> Positive {
         self.amount
+    }
+
+    /// Returns the expected output per craft that receives productivity.
+    #[must_use]
+    pub const fn productivity_amount(&self) -> NonNegative {
+        self.productivity_amount
     }
 }
 
@@ -255,6 +286,9 @@ pub struct Recipe {
     main_product: Option<CommodityId>,
     visible: bool,
     supported: bool,
+    allowed_effects: BTreeSet<ModuleEffect>,
+    allowed_module_categories: Option<BTreeSet<ModuleCategory>>,
+    maximum_productivity: NonNegative,
 }
 
 impl Recipe {
@@ -297,6 +331,11 @@ impl Recipe {
             main_product,
             visible,
             supported: true,
+            allowed_effects: [ModuleEffect::Speed, ModuleEffect::Consumption]
+                .into_iter()
+                .collect(),
+            allowed_module_categories: None,
+            maximum_productivity: NonNegative(3.0),
         })
     }
 
@@ -360,6 +399,34 @@ impl Recipe {
     #[must_use]
     pub const fn supported(&self) -> bool {
         self.supported
+    }
+
+    #[must_use]
+    pub fn with_module_policy(
+        mut self,
+        allowed_effects: impl IntoIterator<Item = ModuleEffect>,
+        allowed_module_categories: Option<BTreeSet<ModuleCategory>>,
+        maximum_productivity: NonNegative,
+    ) -> Self {
+        self.allowed_effects = allowed_effects.into_iter().collect();
+        self.allowed_module_categories = allowed_module_categories;
+        self.maximum_productivity = maximum_productivity;
+        self
+    }
+
+    #[must_use]
+    pub const fn allowed_effects(&self) -> &BTreeSet<ModuleEffect> {
+        &self.allowed_effects
+    }
+
+    #[must_use]
+    pub const fn allowed_module_categories(&self) -> Option<&BTreeSet<ModuleCategory>> {
+        self.allowed_module_categories.as_ref()
+    }
+
+    #[must_use]
+    pub const fn maximum_productivity(&self) -> NonNegative {
+        self.maximum_productivity
     }
 }
 
@@ -719,6 +786,13 @@ pub enum RecordError {
     MainProductNotProduced {
         recipe: RecipeId,
         commodity: CommodityId,
+    },
+    #[error(
+        "product productivity amount {productivity_amount} exceeds expected amount {product_amount}"
+    )]
+    ProductivityAmountExceedsProductAmount {
+        product_amount: f64,
+        productivity_amount: f64,
     },
     #[error("machine {machine} has no crafting categories")]
     MachineHasNoCraftingCategories { machine: MachineId },

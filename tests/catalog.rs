@@ -541,3 +541,53 @@ fn catalog_rejects_missing_fuel_burnt_results() {
         })
     );
 }
+
+#[test]
+fn recipes_and_products_expose_module_productivity_policy() {
+    let plate = CommodityId::Item(item("iron-plate"));
+    let speed = ModuleCategory::new("speed").unwrap();
+    let product = Product::new(plate.clone(), positive(2.0))
+        .with_productivity_amount(NonNegative::new(0.5).unwrap())
+        .unwrap();
+    let recipe = Recipe::new(
+        recipe_id("iron-plate"),
+        RecipeCategory::new("smelting").unwrap(),
+        positive(3.2),
+        vec![],
+        vec![product],
+        Some(plate),
+        true,
+    )
+    .unwrap()
+    .with_module_policy(
+        [ModuleEffect::Speed, ModuleEffect::Productivity],
+        Some([speed.clone()].into_iter().collect()),
+        NonNegative::new(0.25).unwrap(),
+    );
+
+    assert_close(recipe.products()[0].productivity_amount().get(), 0.5);
+    assert_eq!(
+        recipe.allowed_effects(),
+        &[ModuleEffect::Speed, ModuleEffect::Productivity]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        recipe.allowed_module_categories(),
+        Some(&[speed].into_iter().collect())
+    );
+    assert_close(recipe.maximum_productivity().get(), 0.25);
+}
+
+#[test]
+fn product_rejects_productivity_amount_above_its_expected_amount() {
+    let product = Product::new(CommodityId::Item(item("iron-plate")), positive(1.0));
+
+    assert_eq!(
+        product.with_productivity_amount(NonNegative::new(1.5).unwrap()),
+        Err(RecordError::ProductivityAmountExceedsProductAmount {
+            product_amount: 1.0,
+            productivity_amount: 1.5,
+        })
+    );
+}

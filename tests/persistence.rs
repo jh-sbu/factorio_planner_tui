@@ -460,7 +460,30 @@ fn rejects_newer_index_and_catalog_schema_versions() {
         store.open(&profile_name("main")),
         Err(ProfileError::UnsupportedCatalogSchema {
             found: 999,
-            supported: 1
+            supported: 2
+        })
+    ));
+}
+
+#[test]
+fn rejects_pre_module_policy_cached_catalogs() {
+    let directory = TempDir::new().unwrap();
+    let source_directory = TempDir::new().unwrap();
+    let store = ProfileStore::new(directory.path());
+    let data = write_data(&source_directory, "data.json", &minimal_data("iron-plate"));
+    let created = store
+        .create(&ProfileImportRequest::new(profile_name("main"), &data))
+        .unwrap();
+    let catalog_path = store.catalog_path(created.fingerprint());
+    let mut catalog: Value = serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    catalog["schema_version"] = Value::from(1);
+    fs::write(catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+
+    assert!(matches!(
+        store.open(&profile_name("main")),
+        Err(ProfileError::UnsupportedCatalogSchema {
+            found: 1,
+            supported: 2
         })
     ));
 }

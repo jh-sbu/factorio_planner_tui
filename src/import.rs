@@ -14,6 +14,7 @@ use crate::catalog::{
 
 const DEFAULT_RECIPE_CATEGORY: &str = "crafting";
 const DEFAULT_RECIPE_DURATION: f64 = 0.5;
+const DEFAULT_MAXIMUM_PRODUCTIVITY: f64 = 3.0;
 const MINIMUM_RECIPE_DURATION: f64 = 0.001;
 const DEFAULT_BURNER_FUEL_CATEGORY: &str = "chemical";
 const TICKS_PER_SECOND: f64 = 60.0;
@@ -1977,6 +1978,11 @@ fn parse_recipe(
     let category = parse_category(&fields, id, &prototype_path, diagnostics);
     let duration = parse_duration(&fields, id, &prototype_path, diagnostics);
     let visible = parse_visibility(&fields, id, &prototype_path, diagnostics);
+    let allowed_effects = parse_recipe_allowed_effects(&fields, id, &prototype_path, diagnostics);
+    let allowed_module_categories =
+        parse_allowed_module_categories(&fields, "recipe", id, &prototype_path, diagnostics);
+    let maximum_productivity =
+        parse_maximum_productivity(&fields, id, &prototype_path, diagnostics);
     let ingredients = parse_ingredients(&fields, id, &prototype_path, commodities, diagnostics);
     let products = parse_products(&fields, id, &prototype_path, commodities, diagnostics);
     let main_product = parse_main_product(
@@ -1993,6 +1999,9 @@ fn parse_recipe(
     let ParsedMainProduct::Valid(main_product) = main_product else {
         return None;
     };
+    let allowed_effects = allowed_effects?;
+    let allowed_module_categories = allowed_module_categories?.into_restriction();
+    let maximum_productivity = maximum_productivity?;
 
     let recipe = Recipe::new(
         recipe_id?,
@@ -2002,7 +2011,14 @@ fn parse_recipe(
         products?,
         main_product,
         visible?,
-    );
+    )
+    .map(|recipe| {
+        recipe.with_module_policy(
+            allowed_effects,
+            allowed_module_categories,
+            maximum_productivity,
+        )
+    });
     match recipe {
         Ok(recipe) => {
             Some(recipe.with_localized_name(locale_name(locale, LocalePrototypeKind::Recipe, id)))
@@ -2012,6 +2028,97 @@ fn parse_recipe(
             None
         }
     }
+}
+
+fn parse_recipe_allowed_effects(
+    fields: &Map<String, Value>,
+    recipe_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<BTreeSet<ModuleEffect>> {
+    let initial_errors = error_count(diagnostics);
+    let mut effects = BTreeSet::new();
+    for (field, effect, default) in [
+        ("allow_speed", ModuleEffect::Speed, true),
+        ("allow_productivity", ModuleEffect::Productivity, false),
+        ("allow_consumption", ModuleEffect::Consumption, true),
+    ] {
+        if parse_recipe_effect_permission(
+            fields,
+            field,
+            default,
+            recipe_id,
+            prototype_path,
+            diagnostics,
+        ) == Some(true)
+        {
+            effects.insert(effect);
+        }
+    }
+    (error_count(diagnostics) == initial_errors).then_some(effects)
+}
+
+fn parse_recipe_effect_permission(
+    fields: &Map<String, Value>,
+    field: &str,
+    default: bool,
+    recipe_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<bool> {
+    match fields.get(field) {
+        None => Some(default),
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => {
+            recipe_error(
+                diagnostics,
+                recipe_id,
+                format!("{prototype_path}/{field}"),
+                format!("{field} must be a boolean"),
+            );
+            None
+        }
+    }
+}
+
+fn parse_maximum_productivity(
+    fields: &Map<String, Value>,
+    recipe_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<NonNegative> {
+    let Some(value) = fields.get("maximum_productivity") else {
+        return Some(
+            NonNegative::new(DEFAULT_MAXIMUM_PRODUCTIVITY)
+                .expect("Factorio's default maximum productivity is valid"),
+        );
+    };
+    let path = format!("{prototype_path}/maximum_productivity");
+    let Value::Number(number) = value else {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            "maximum_productivity must be a number",
+        );
+        return None;
+    };
+    let Some(value) = number.as_f64() else {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            "maximum_productivity must be a finite number",
+        );
+        return None;
+    };
+    NonNegative::new(value).map_or_else(
+        |error| {
+            recipe_error(diagnostics, recipe_id, path, error.to_string());
+            None
+        },
+        Some,
+    )
 }
 
 fn validate_prototype_identity(
@@ -2261,27 +2368,30 @@ fn parse_products(
         let entry_errors = diagnostics.len();
         let parsed = parse_product_entry(entry, recipe_id, &entry_path, commodities, diagnostics);
         if diagnostics.len() == entry_errors
-            && let Some((commodity, expected_amount)) = parsed
+            && let Some((commodity, expected_amount, productivity_amount)) = parsed
         {
             if let Some(product) = products
                 .iter_mut()
                 .find(|product| product.commodity == commodity)
             {
                 let aggregated_amount = product.expected_amount + expected_amount;
-                if aggregated_amount.is_finite() {
+                let aggregated_productivity = product.productivity_amount + productivity_amount;
+                if aggregated_amount.is_finite() && aggregated_productivity.is_finite() {
                     product.expected_amount = aggregated_amount;
+                    product.productivity_amount = aggregated_productivity;
                 } else {
                     recipe_error(
                         diagnostics,
                         recipe_id,
                         entry_path,
-                        "aggregated expected output must be finite",
+                        "aggregated expected output and productivity amount must be finite",
                     );
                 }
             } else {
                 products.push(AggregatedProduct {
                     commodity,
                     expected_amount,
+                    productivity_amount,
                     first_entry_path: entry_path,
                 });
             }
@@ -2291,18 +2401,34 @@ fn parse_products(
     let products = products
         .into_iter()
         .filter_map(|product| {
-            Positive::new(product.expected_amount).map_or_else(
-                |error| {
+            let amount = match Positive::new(product.expected_amount) {
+                Ok(amount) => amount,
+                Err(error) => {
                     recipe_error(
                         diagnostics,
                         recipe_id,
                         product.first_entry_path,
                         format!("expected output {error}"),
                     );
+                    return None;
+                }
+            };
+            let productivity_amount = NonNegative::new(product.productivity_amount)
+                .expect("parsed productivity output is finite and non-negative");
+            match Product::new(product.commodity, amount)
+                .with_productivity_amount(productivity_amount)
+            {
+                Ok(product) => Some(product),
+                Err(error) => {
+                    recipe_error(
+                        diagnostics,
+                        recipe_id,
+                        product.first_entry_path,
+                        error.to_string(),
+                    );
                     None
-                },
-                |amount| Some(Product::new(product.commodity, amount)),
-            )
+                }
+            }
         })
         .collect();
 
@@ -2312,6 +2438,7 @@ fn parse_products(
 struct AggregatedProduct {
     commodity: CommodityId,
     expected_amount: f64,
+    productivity_amount: f64,
     first_entry_path: String,
 }
 
@@ -2321,7 +2448,7 @@ fn parse_product_entry(
     entry_path: &str,
     commodities: &BTreeSet<CommodityId>,
     diagnostics: &mut Vec<ImportDiagnostic>,
-) -> Option<(CommodityId, f64)> {
+) -> Option<(CommodityId, f64, f64)> {
     let Value::Object(fields) = entry else {
         recipe_error(
             diagnostics,
@@ -2336,12 +2463,77 @@ fn parse_product_entry(
     let commodity = parse_entry_commodity(fields, recipe_id, entry_path, commodities, diagnostics);
     let amount = parse_product_amount(fields, recipe_id, entry_path, diagnostics);
     let probability = parse_product_probability(fields, recipe_id, entry_path, diagnostics);
+    let ignored_by_stats = parse_optional_non_negative_number(
+        fields,
+        "ignored_by_stats",
+        recipe_id,
+        entry_path,
+        diagnostics,
+    );
+    let ignored_by_productivity = parse_optional_non_negative_number(
+        fields,
+        "ignored_by_productivity",
+        recipe_id,
+        entry_path,
+        diagnostics,
+    );
 
     if diagnostics.len() == initial_errors {
-        Some((commodity?, amount? * probability?))
+        let amount = amount?;
+        let probability = probability?;
+        let ignored = ignored_by_productivity
+            .ok()?
+            .or(ignored_by_stats.ok()?)
+            .unwrap_or(0.0);
+        Some((
+            commodity?,
+            amount * probability,
+            (amount - ignored).max(0.0) * probability,
+        ))
     } else {
         None
     }
+}
+
+fn parse_optional_non_negative_number(
+    fields: &Map<String, Value>,
+    field: &str,
+    recipe_id: &str,
+    entry_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Result<Option<f64>, ()> {
+    let Some(value) = fields.get(field) else {
+        return Ok(None);
+    };
+    let path = format!("{entry_path}/{field}");
+    let Value::Number(number) = value else {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            format!("{field} must be a number"),
+        );
+        return Err(());
+    };
+    let Some(value) = number.as_f64() else {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            format!("{field} must be a finite number"),
+        );
+        return Err(());
+    };
+    if !value.is_finite() || value < 0.0 {
+        recipe_error(
+            diagnostics,
+            recipe_id,
+            path,
+            format!("{field} must be finite and non-negative"),
+        );
+        return Err(());
+    }
+    Ok(Some(value))
 }
 
 fn parse_product_amount(

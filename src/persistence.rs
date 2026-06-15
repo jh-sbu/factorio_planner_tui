@@ -21,8 +21,8 @@ use crate::import::{
 };
 
 pub const PROFILE_INDEX_SCHEMA_VERSION: u32 = 1;
-pub const CATALOG_SCHEMA_VERSION: u32 = 1;
-pub const IMPORTER_SCHEMA_VERSION: u32 = 1;
+pub const CATALOG_SCHEMA_VERSION: u32 = 2;
+pub const IMPORTER_SCHEMA_VERSION: u32 = 2;
 
 const INDEX_FILE_NAME: &str = "profiles.json";
 const CATALOG_DIRECTORY_NAME: &str = "catalogs";
@@ -1257,6 +1257,7 @@ impl IngredientDto {
 struct ProductDto {
     commodity: CommodityIdDto,
     amount: f64,
+    productivity_amount: f64,
 }
 
 impl From<&Product> for ProductDto {
@@ -1264,16 +1265,16 @@ impl From<&Product> for ProductDto {
         Self {
             commodity: product.commodity().into(),
             amount: product.amount().get(),
+            productivity_amount: product.productivity_amount().get(),
         }
     }
 }
 
 impl ProductDto {
     fn into_record(self) -> Result<Product, ProfileError> {
-        Ok(Product::new(
-            self.commodity.into_id()?,
-            positive(self.amount)?,
-        ))
+        Product::new(self.commodity.into_id()?, positive(self.amount)?)
+            .with_productivity_amount(non_negative(self.productivity_amount)?)
+            .map_err(|error| invalid_catalog(error.to_string()))
     }
 }
 
@@ -1289,6 +1290,9 @@ struct RecipeDto {
     visible: bool,
     #[serde(default = "default_recipe_supported")]
     supported: bool,
+    allowed_effects: Vec<ModuleEffectDto>,
+    allowed_module_categories: Option<Vec<String>>,
+    maximum_productivity: f64,
 }
 
 const fn default_recipe_supported() -> bool {
@@ -1311,13 +1315,26 @@ impl From<&Recipe> for RecipeDto {
             main_product: recipe.main_product().map(CommodityIdDto::from),
             visible: recipe.visible(),
             supported: recipe.supported(),
+            allowed_effects: recipe
+                .allowed_effects()
+                .iter()
+                .copied()
+                .map(ModuleEffectDto::from)
+                .collect(),
+            allowed_module_categories: recipe.allowed_module_categories().map(|categories| {
+                categories
+                    .iter()
+                    .map(|category| category.as_str().to_owned())
+                    .collect()
+            }),
+            maximum_productivity: recipe.maximum_productivity().get(),
         }
     }
 }
 
 impl RecipeDto {
     fn into_record(self) -> Result<Recipe, ProfileError> {
-        Recipe::new(
+        let recipe = Recipe::new(
             recipe_id(self.id)?,
             recipe_category(self.category)?,
             positive(self.duration)?,
@@ -1332,12 +1349,25 @@ impl RecipeDto {
             self.main_product.map(CommodityIdDto::into_id).transpose()?,
             self.visible,
         )
-        .map(|recipe| {
-            recipe
-                .with_supported(self.supported)
-                .with_localized_name(self.localized_name)
-        })
-        .map_err(|error| invalid_catalog(error.to_string()))
+        .map_err(|error| invalid_catalog(error.to_string()))?;
+        let allowed_module_categories = self
+            .allowed_module_categories
+            .map(|categories| {
+                categories
+                    .into_iter()
+                    .map(module_category)
+                    .collect::<Result<BTreeSet<_>, _>>()
+            })
+            .transpose()?;
+
+        Ok(recipe
+            .with_supported(self.supported)
+            .with_module_policy(
+                self.allowed_effects.into_iter().map(ModuleEffect::from),
+                allowed_module_categories,
+                non_negative(self.maximum_productivity)?,
+            )
+            .with_localized_name(self.localized_name))
     }
 }
 

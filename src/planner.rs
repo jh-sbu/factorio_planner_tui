@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::catalog::{
-    Catalog, CommodityId, MachineId, NumericError, Positive, Recipe, RecipeCategory, RecipeId,
+    Catalog, CommodityId, Finite, Machine, MachineId, ModuleEffect, ModuleId, NumericError,
+    Positive, Recipe, RecipeCategory, RecipeId,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -62,6 +63,8 @@ pub struct FactoryPlan {
     targets: Vec<Target>,
     external_inputs: BTreeSet<CommodityId>,
     recipe_choices: BTreeMap<CommodityId, RecipeId>,
+    machine_choices: BTreeMap<RecipeId, MachineId>,
+    module_choices: BTreeMap<CommodityId, Vec<ModuleId>>,
     display_rate_unit: RateUnit,
 }
 
@@ -72,6 +75,8 @@ impl FactoryPlan {
             targets: vec![target],
             external_inputs: BTreeSet::new(),
             recipe_choices: BTreeMap::new(),
+            machine_choices: BTreeMap::new(),
+            module_choices: BTreeMap::new(),
             display_rate_unit: RateUnit::default(),
         }
     }
@@ -166,6 +171,58 @@ impl FactoryPlan {
         &self.recipe_choices
     }
 
+    pub fn set_machine_choice(
+        &mut self,
+        recipe: RecipeId,
+        machine: MachineId,
+    ) -> Option<MachineId> {
+        self.machine_choices.insert(recipe, machine)
+    }
+
+    pub fn clear_machine_choice(&mut self, recipe: &RecipeId) -> Option<MachineId> {
+        self.machine_choices.remove(recipe)
+    }
+
+    #[must_use]
+    pub fn machine_choice(&self, recipe: &RecipeId) -> Option<&MachineId> {
+        self.machine_choices.get(recipe)
+    }
+
+    #[must_use]
+    pub const fn machine_choices(&self) -> &BTreeMap<RecipeId, MachineId> {
+        &self.machine_choices
+    }
+
+    pub fn set_modules(
+        &mut self,
+        commodity: CommodityId,
+        modules: impl IntoIterator<Item = ModuleId>,
+    ) -> Option<Vec<ModuleId>> {
+        let mut modules = modules.into_iter().collect::<Vec<_>>();
+        modules.sort();
+        if modules.is_empty() {
+            self.module_choices.remove(&commodity)
+        } else {
+            self.module_choices.insert(commodity, modules)
+        }
+    }
+
+    pub fn clear_modules(&mut self, commodity: &CommodityId) -> Option<Vec<ModuleId>> {
+        self.module_choices.remove(commodity)
+    }
+
+    #[must_use]
+    pub fn modules_for(&self, commodity: &CommodityId) -> &[ModuleId] {
+        self.module_choices
+            .get(commodity)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub const fn module_choices(&self) -> &BTreeMap<CommodityId, Vec<ModuleId>> {
+        &self.module_choices
+    }
+
     #[must_use]
     pub const fn display_rate_unit(&self) -> RateUnit {
         self.display_rate_unit
@@ -207,6 +264,10 @@ pub struct ProductionStep {
     craft_rate: Positive,
     fractional_machine_count: Positive,
     installed_machine_count: u64,
+    modules: Vec<ModuleId>,
+    speed_multiplier: Positive,
+    productivity_effect: Finite,
+    consumption_multiplier: Positive,
     ingredients: Vec<CommodityRate>,
     products: Vec<CommodityRate>,
 }
@@ -245,6 +306,26 @@ impl ProductionStep {
     #[must_use]
     pub const fn installed_machine_count(&self) -> u64 {
         self.installed_machine_count
+    }
+
+    #[must_use]
+    pub fn modules(&self) -> &[ModuleId] {
+        &self.modules
+    }
+
+    #[must_use]
+    pub const fn speed_multiplier(&self) -> Positive {
+        self.speed_multiplier
+    }
+
+    #[must_use]
+    pub const fn productivity_effect(&self) -> Finite {
+        self.productivity_effect
+    }
+
+    #[must_use]
+    pub const fn consumption_multiplier(&self) -> Positive {
+        self.consumption_multiplier
     }
 
     #[must_use]
@@ -312,10 +393,65 @@ pub enum PlannerError {
         recipe: RecipeId,
         category: RecipeCategory,
     },
-    #[error("recipe {recipe} has multiple compatible machines and requires an explicit choice")]
-    AmbiguousMachines {
+    #[error("selected machine {machine} for recipe {recipe} is not present in the catalog")]
+    MissingMachineChoice {
         recipe: RecipeId,
-        machines: Vec<MachineId>,
+        machine: MachineId,
+    },
+    #[error(
+        "selected machine {machine} does not support category {category} required by recipe {recipe}"
+    )]
+    IncompatibleMachineChoice {
+        recipe: RecipeId,
+        machine: MachineId,
+        category: RecipeCategory,
+    },
+    #[error("selected module {module} for {commodity} is not present in the catalog")]
+    MissingModuleChoice {
+        commodity: CommodityId,
+        module: ModuleId,
+    },
+    #[error("selected module {module} for {commodity} has unsupported effects")]
+    UnsupportedModuleChoice {
+        commodity: CommodityId,
+        module: ModuleId,
+    },
+    #[error(
+        "selected {selected} modules for {commodity}, but machine {machine} has only {slots} slots"
+    )]
+    TooManyModules {
+        commodity: CommodityId,
+        machine: MachineId,
+        selected: usize,
+        slots: u16,
+    },
+    #[error("machine {machine} does not allow module {module} category {category} for {commodity}")]
+    MachineDisallowsModuleCategory {
+        commodity: CommodityId,
+        machine: MachineId,
+        module: ModuleId,
+        category: crate::catalog::ModuleCategory,
+    },
+    #[error("recipe {recipe} does not allow module {module} category {category} for {commodity}")]
+    RecipeDisallowsModuleCategory {
+        commodity: CommodityId,
+        recipe: RecipeId,
+        module: ModuleId,
+        category: crate::catalog::ModuleCategory,
+    },
+    #[error("machine {machine} does not allow module {module} effect {effect:?} for {commodity}")]
+    MachineDisallowsModuleEffect {
+        commodity: CommodityId,
+        machine: MachineId,
+        module: ModuleId,
+        effect: ModuleEffect,
+    },
+    #[error("recipe {recipe} does not allow module {module} effect {effect:?} for {commodity}")]
+    RecipeDisallowsModuleEffect {
+        commodity: CommodityId,
+        recipe: RecipeId,
+        module: ModuleId,
+        effect: ModuleEffect,
     },
     #[error("selected production dependencies contain a cycle: {path:?}")]
     Cycle { path: Vec<CommodityId> },
@@ -392,22 +528,28 @@ impl<'a> Calculation<'a> {
             .recipe(&recipe_id)
             .expect("resolved recipe IDs must remain present in the catalog");
         let machine_id = self.select_machine(recipe)?;
+        let machine = self
+            .catalog
+            .machine(&machine_id)
+            .expect("selected machine IDs must remain present in the catalog");
+        let module_configuration = self.resolve_modules(commodity, recipe, machine)?;
         let product_amount = recipe
             .products()
             .iter()
             .filter(|product| product.commodity() == commodity)
-            .map(|product| product.amount().get())
+            .map(|product| {
+                effective_product_amount(product, module_configuration.productivity_effect)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .sum::<f64>();
         let craft_rate = checked_positive(
             required_rate.get() / product_amount,
             "craft rate per second",
         )?;
-        let machine = self
-            .catalog
-            .machine(&machine_id)
-            .expect("machine IDs in the category index must resolve");
         let crafts_per_second_per_machine = checked_positive(
-            machine.crafting_speed().get() / recipe.duration().get(),
+            machine.crafting_speed().get() * module_configuration.speed_multiplier.get()
+                / recipe.duration().get(),
             "crafts per second per machine",
         )?;
         let fractional_machine_count = checked_positive(
@@ -429,7 +571,11 @@ impl<'a> Calculation<'a> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let products = aggregate_recipe_products(recipe, craft_rate)?;
+        let products = aggregate_recipe_products(
+            recipe,
+            craft_rate,
+            module_configuration.productivity_effect,
+        )?;
 
         self.add_production_step(
             commodity,
@@ -438,6 +584,7 @@ impl<'a> Calculation<'a> {
             required_rate,
             craft_rate,
             fractional_machine_count,
+            &module_configuration,
             &ingredients,
             &products,
         )?;
@@ -457,6 +604,7 @@ impl<'a> Calculation<'a> {
         required_output_rate: Positive,
         craft_rate: Positive,
         fractional_machine_count: Positive,
+        module_configuration: &ModuleConfiguration,
         ingredients: &[CommodityRate],
         products: &[CommodityRate],
     ) -> Result<(), PlannerError> {
@@ -470,11 +618,20 @@ impl<'a> Calculation<'a> {
                 required_output_rate: 0.0,
                 craft_rate: 0.0,
                 fractional_machine_count: 0.0,
+                modules: module_configuration.modules.clone(),
+                speed_multiplier: module_configuration.speed_multiplier,
+                productivity_effect: module_configuration.productivity_effect,
+                consumption_multiplier: module_configuration.consumption_multiplier,
                 ingredients: BTreeMap::new(),
                 products: BTreeMap::new(),
             });
         debug_assert_eq!(&step.recipe, recipe);
         debug_assert_eq!(&step.machine, machine);
+        debug_assert_eq!(&step.modules, &module_configuration.modules);
+        debug_assert_eq!(
+            step.productivity_effect,
+            module_configuration.productivity_effect
+        );
 
         step.required_output_rate += required_output_rate.get();
         checked_positive(
@@ -509,18 +666,148 @@ impl<'a> Calculation<'a> {
     }
 
     fn select_machine(&self, recipe: &Recipe) -> Result<MachineId, PlannerError> {
+        if let Some(machine_id) = self.plan.machine_choice(recipe.id()) {
+            let machine = self.catalog.machine(machine_id).ok_or_else(|| {
+                PlannerError::MissingMachineChoice {
+                    recipe: recipe.id().clone(),
+                    machine: machine_id.clone(),
+                }
+            })?;
+            if !machine.supports_category(recipe.category()) {
+                return Err(PlannerError::IncompatibleMachineChoice {
+                    recipe: recipe.id().clone(),
+                    machine: machine_id.clone(),
+                    category: recipe.category().clone(),
+                });
+            }
+            return Ok(machine_id.clone());
+        }
+
         let machine_ids = self.catalog.machines_for_category(recipe.category());
-        match machine_ids {
-            [] => Err(PlannerError::NoCompatibleMachine {
+        machine_ids
+            .iter()
+            .filter_map(|machine_id| self.catalog.machine(machine_id))
+            .max_by(|left, right| {
+                left.crafting_speed()
+                    .get()
+                    .total_cmp(&right.crafting_speed().get())
+                    .then_with(|| right.id().cmp(left.id()))
+            })
+            .map(|machine| machine.id().clone())
+            .ok_or_else(|| PlannerError::NoCompatibleMachine {
                 recipe: recipe.id().clone(),
                 category: recipe.category().clone(),
-            }),
-            [machine_id] => Ok(machine_id.clone()),
-            _ => Err(PlannerError::AmbiguousMachines {
-                recipe: recipe.id().clone(),
-                machines: machine_ids.to_vec(),
-            }),
+            })
+    }
+
+    fn resolve_modules(
+        &self,
+        commodity: &CommodityId,
+        recipe: &Recipe,
+        machine: &Machine,
+    ) -> Result<ModuleConfiguration, PlannerError> {
+        let module_ids = self.plan.modules_for(commodity);
+        if module_ids.len() > usize::from(machine.module_slots()) {
+            return Err(PlannerError::TooManyModules {
+                commodity: commodity.clone(),
+                machine: machine.id().clone(),
+                selected: module_ids.len(),
+                slots: machine.module_slots(),
+            });
         }
+
+        let mut speed_effect = 0.0;
+        let mut productivity_effect = 0.0;
+        let mut consumption_effect = 0.0;
+        for module_id in module_ids {
+            let module = self.catalog.module(module_id).ok_or_else(|| {
+                PlannerError::MissingModuleChoice {
+                    commodity: commodity.clone(),
+                    module: module_id.clone(),
+                }
+            })?;
+            if !module.is_selectable() {
+                return Err(PlannerError::UnsupportedModuleChoice {
+                    commodity: commodity.clone(),
+                    module: module_id.clone(),
+                });
+            }
+            if machine
+                .allowed_module_categories()
+                .is_some_and(|categories| !categories.contains(module.category()))
+            {
+                return Err(PlannerError::MachineDisallowsModuleCategory {
+                    commodity: commodity.clone(),
+                    machine: machine.id().clone(),
+                    module: module_id.clone(),
+                    category: module.category().clone(),
+                });
+            }
+            if recipe
+                .allowed_module_categories()
+                .is_some_and(|categories| !categories.contains(module.category()))
+            {
+                return Err(PlannerError::RecipeDisallowsModuleCategory {
+                    commodity: commodity.clone(),
+                    recipe: recipe.id().clone(),
+                    module: module_id.clone(),
+                    category: module.category().clone(),
+                });
+            }
+
+            for (effect, value) in [
+                (ModuleEffect::Speed, module.speed_effect().get()),
+                (
+                    ModuleEffect::Productivity,
+                    module.productivity_effect().get(),
+                ),
+                (ModuleEffect::Consumption, module.consumption_effect().get()),
+            ] {
+                if value == 0.0 {
+                    continue;
+                }
+                if !machine.allowed_effects().contains(&effect) {
+                    return Err(PlannerError::MachineDisallowsModuleEffect {
+                        commodity: commodity.clone(),
+                        machine: machine.id().clone(),
+                        module: module_id.clone(),
+                        effect,
+                    });
+                }
+                if !recipe.allowed_effects().contains(&effect) {
+                    return Err(PlannerError::RecipeDisallowsModuleEffect {
+                        commodity: commodity.clone(),
+                        recipe: recipe.id().clone(),
+                        module: module_id.clone(),
+                        effect,
+                    });
+                }
+            }
+
+            speed_effect += module.speed_effect().get();
+            productivity_effect += module.productivity_effect().get();
+            consumption_effect += module.consumption_effect().get();
+        }
+
+        let speed_multiplier =
+            checked_positive((1.0_f64 + speed_effect).max(0.2), "module speed multiplier")?;
+        let productivity_effect = productivity_effect.min(recipe.maximum_productivity().get());
+        let productivity_effect =
+            Finite::new(productivity_effect).map_err(|_| PlannerError::InvalidCalculatedValue {
+                quantity: "module productivity effect",
+                value: productivity_effect,
+            })?;
+        let consumption_multiplier = checked_positive(
+            (1.0_f64 + consumption_effect).max(0.2),
+            "module consumption multiplier",
+        )?;
+
+        Ok(ModuleConfiguration {
+            modules: module_ids.to_vec(),
+            speed_multiplier,
+            productivity_effect,
+            consumption_multiplier,
+        })
     }
 
     fn add_external_input(
@@ -690,6 +977,10 @@ struct ProductionStepAccumulator {
     required_output_rate: f64,
     craft_rate: f64,
     fractional_machine_count: f64,
+    modules: Vec<ModuleId>,
+    speed_multiplier: Positive,
+    productivity_effect: Finite,
+    consumption_multiplier: Positive,
     ingredients: BTreeMap<CommodityId, f64>,
     products: BTreeMap<CommodityId, f64>,
 }
@@ -730,6 +1021,10 @@ impl ProductionStepAccumulator {
             craft_rate: checked_positive(self.craft_rate, "aggregated craft rate per second")?,
             fractional_machine_count,
             installed_machine_count,
+            modules: self.modules,
+            speed_multiplier: self.speed_multiplier,
+            productivity_effect: self.productivity_effect,
+            consumption_multiplier: self.consumption_multiplier,
             ingredients,
             products,
         })
@@ -739,10 +1034,11 @@ impl ProductionStepAccumulator {
 fn aggregate_recipe_products(
     recipe: &Recipe,
     craft_rate: Positive,
+    productivity_effect: Finite,
 ) -> Result<Vec<CommodityRate>, PlannerError> {
     let mut rates = BTreeMap::<CommodityId, f64>::new();
     for product in recipe.products() {
-        let rate = craft_rate.get() * product.amount().get();
+        let rate = craft_rate.get() * effective_product_amount(product, productivity_effect)?;
         checked_positive(rate, "product rate per second")?;
         let total = rates.entry(product.commodity().clone()).or_default();
         *total += rate;
@@ -755,6 +1051,22 @@ fn aggregate_recipe_products(
                 .map(|rate| CommodityRate { commodity, rate })
         })
         .collect()
+}
+
+struct ModuleConfiguration {
+    modules: Vec<ModuleId>,
+    speed_multiplier: Positive,
+    productivity_effect: Finite,
+    consumption_multiplier: Positive,
+}
+
+fn effective_product_amount(
+    product: &crate::catalog::Product,
+    productivity_effect: Finite,
+) -> Result<f64, PlannerError> {
+    let amount =
+        product.amount().get() + productivity_effect.get() * product.productivity_amount().get();
+    checked_positive(amount, "effective product amount per craft").map(Positive::get)
 }
 
 fn aggregate_surplus(

@@ -1038,3 +1038,181 @@ fn reports_json_syntax_locations_separately() {
         }
     }
 }
+
+#[test]
+fn imports_recipe_module_policy_and_productivity_exclusions() {
+    let report = import(
+        r#"{
+            "item": {
+                "ore": {"type": "item", "name": "ore"},
+                "plate": {"type": "item", "name": "plate"},
+                "slag": {"type": "item", "name": "slag"}
+            },
+            "recipe": {
+                "smelt": {
+                    "type": "recipe",
+                    "name": "smelt",
+                    "allow_speed": false,
+                    "allow_productivity": true,
+                    "allow_consumption": true,
+                    "allowed_module_categories": ["productivity"],
+                    "maximum_productivity": 0.25,
+                    "ingredients": [
+                        {"type": "item", "name": "ore", "amount": 1}
+                    ],
+                    "results": [
+                        {
+                            "type": "item",
+                            "name": "plate",
+                            "amount_min": 2,
+                            "amount_max": 6,
+                            "probability": 0.5,
+                            "ignored_by_productivity": 1
+                        },
+                        {
+                            "type": "item",
+                            "name": "slag",
+                            "amount": 2,
+                            "ignored_by_stats": 2
+                        }
+                    ]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let recipe = report
+        .catalog()
+        .recipe(&RecipeId::new("smelt").unwrap())
+        .unwrap();
+
+    assert_eq!(
+        recipe.allowed_effects(),
+        &[ModuleEffect::Productivity, ModuleEffect::Consumption]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        recipe.allowed_module_categories(),
+        Some(
+            &[ModuleCategory::new("productivity").unwrap()]
+                .into_iter()
+                .collect()
+        )
+    );
+    assert_close(recipe.maximum_productivity().get(), 0.25);
+    let plate = recipe
+        .products()
+        .iter()
+        .find(|product| product.commodity() == &item("plate"))
+        .unwrap();
+    assert_close(plate.amount().get(), 2.0);
+    assert_close(plate.productivity_amount().get(), 1.5);
+    let slag = recipe
+        .products()
+        .iter()
+        .find(|product| product.commodity() == &item("slag"))
+        .unwrap();
+    assert_close(slag.productivity_amount().get(), 0.0);
+}
+
+#[test]
+fn applies_factorio_recipe_module_defaults() {
+    let report = import(
+        r#"{
+            "item": {"plate": {"type": "item", "name": "plate"}},
+            "recipe": {
+                "plate": {
+                    "type": "recipe",
+                    "name": "plate",
+                    "results": [{"type": "item", "name": "plate", "amount": 1}]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let recipe = report
+        .catalog()
+        .recipe(&RecipeId::new("plate").unwrap())
+        .unwrap();
+
+    assert!(recipe.allowed_effects().contains(&ModuleEffect::Speed));
+    assert!(
+        recipe
+            .allowed_effects()
+            .contains(&ModuleEffect::Consumption)
+    );
+    assert!(
+        !recipe
+            .allowed_effects()
+            .contains(&ModuleEffect::Productivity)
+    );
+    assert_eq!(recipe.allowed_module_categories(), None);
+    assert_close(recipe.maximum_productivity().get(), 3.0);
+    assert_close(recipe.products()[0].productivity_amount().get(), 1.0);
+}
+
+#[test]
+fn reports_malformed_recipe_module_policy_fields() {
+    let diagnostics = invalid_data(
+        r#"{
+            "item": {"plate": {"type": "item", "name": "plate"}},
+            "recipe": {
+                "plate": {
+                    "type": "recipe",
+                    "name": "plate",
+                    "allow_speed": "yes",
+                    "allow_productivity": 1,
+                    "allow_consumption": [],
+                    "allowed_module_categories": ["speed", ""],
+                    "maximum_productivity": -1,
+                    "results": [{"type": "item", "name": "plate", "amount": 1}]
+                }
+            }
+        }"#,
+    );
+
+    for path in [
+        "/recipe/plate/allow_speed",
+        "/recipe/plate/allow_productivity",
+        "/recipe/plate/allow_consumption",
+        "/recipe/plate/allowed_module_categories/1",
+        "/recipe/plate/maximum_productivity",
+    ] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.path == path),
+            "missing diagnostic for {path}"
+        );
+    }
+}
+
+#[test]
+fn reports_malformed_product_productivity_fields() {
+    let diagnostics = invalid_data(
+        r#"{
+            "item": {"plate": {"type": "item", "name": "plate"}},
+            "recipe": {
+                "plate": {
+                    "type": "recipe",
+                    "name": "plate",
+                    "results": [{
+                        "type": "item",
+                        "name": "plate",
+                        "amount": 1,
+                        "ignored_by_stats": -1,
+                        "ignored_by_productivity": "all"
+                    }]
+                }
+            }
+        }"#,
+    );
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.path == "/recipe/plate/results/0/ignored_by_stats" })
+    );
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "/recipe/plate/results/0/ignored_by_productivity"
+    }));
+}

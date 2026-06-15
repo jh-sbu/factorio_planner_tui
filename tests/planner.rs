@@ -1,6 +1,7 @@
 use factorio_planner_tui::catalog::{
-    Catalog, CatalogParts, Commodity, CommodityId, ItemId, Machine, MachineEnergySource, MachineId,
-    NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId,
+    Catalog, CatalogParts, Commodity, CommodityId, Finite, ItemId, Machine, MachineEnergySource,
+    MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive, Product,
+    Recipe, RecipeCategory, RecipeId,
 };
 use factorio_planner_tui::planner::{
     FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit, Target, calculate,
@@ -19,8 +20,16 @@ fn machine_id(name: &str) -> MachineId {
     MachineId::new(name).expect("test machine ID should be valid")
 }
 
+fn module_id(name: &str) -> ModuleId {
+    ModuleId::new(name).expect("test module ID should be valid")
+}
+
 fn positive(value: f64) -> Positive {
     Positive::new(value).expect("test value should be positive")
+}
+
+fn finite(value: f64) -> Finite {
+    Finite::new(value).expect("test value should be finite")
 }
 
 fn machine(
@@ -136,6 +145,25 @@ fn catalog(
     .unwrap()
 }
 
+fn catalog_with_modules(
+    commodities: impl IntoIterator<Item = CommodityId>,
+    recipes: Vec<Recipe>,
+    machines: Vec<Machine>,
+    modules: Vec<Module>,
+) -> Catalog {
+    Catalog::try_from_parts(CatalogParts {
+        commodities: commodities
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        recipes,
+        machines,
+        modules,
+        ..CatalogParts::default()
+    })
+    .unwrap()
+}
+
 fn target(commodity: CommodityId, rate_per_second: f64) -> Target {
     Target::new(commodity, rate_per_second).expect("test target should be valid")
 }
@@ -207,6 +235,45 @@ fn rate_for(
         .expect("expected commodity rate")
         .rate()
         .get()
+}
+
+fn configured_machine(
+    name: &str,
+    category: RecipeCategory,
+    crafting_speed: f64,
+    module_slots: u16,
+    allowed_effects: impl IntoIterator<Item = ModuleEffect>,
+    allowed_module_categories: Option<std::collections::BTreeSet<ModuleCategory>>,
+) -> Machine {
+    Machine::new(
+        machine_id(name),
+        [category],
+        positive(crafting_speed),
+        module_slots,
+        allowed_effects,
+        allowed_module_categories,
+        positive(90_000.0),
+        MachineEnergySource::Electric {
+            drain: NonNegative::new(0.0).unwrap(),
+        },
+    )
+    .unwrap()
+}
+
+fn test_module(
+    name: &str,
+    category: &str,
+    speed: f64,
+    productivity: f64,
+    consumption: f64,
+) -> Module {
+    Module::new(
+        module_id(name),
+        ModuleCategory::new(category).unwrap(),
+        finite(speed),
+        finite(productivity),
+        finite(consumption),
+    )
 }
 
 #[test]
@@ -867,7 +934,7 @@ fn treats_a_commodity_with_only_unsupported_recipes_as_external() {
 }
 
 #[test]
-fn rejects_missing_and_ambiguous_compatible_machines() {
+fn rejects_recipes_without_compatible_machines() {
     let plate = item("iron-plate");
     let crafting = RecipeCategory::new("crafting").unwrap();
     let plate_recipe = recipe("iron-plate", &crafting, 1.0, vec![], plate.clone(), 1.0);
@@ -882,22 +949,378 @@ fn rejects_missing_and_ambiguous_compatible_machines() {
             category: crafting.clone(),
         })
     );
+}
 
-    let ambiguous = catalog(
+#[test]
+fn chooses_fastest_machine_with_lexical_tie_breaking_and_allows_overrides() {
+    let plate = item("iron-plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let recipe = recipe("iron-plate", &crafting, 1.0, vec![], plate.clone(), 1.0);
+    let catalog = catalog(
         [plate.clone()],
-        vec![plate_recipe],
+        vec![recipe],
         vec![
-            machine("a-assembler", [crafting.clone()], 1.0),
-            machine("b-assembler", [crafting], 2.0),
+            machine("slow", [crafting.clone()], 1.0),
+            machine("z-fast", [crafting.clone()], 2.0),
+            machine("a-fast", [crafting], 2.0),
         ],
     );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 4.0));
+
+    let defaulted = calculate(&catalog, &plan).unwrap();
     assert_eq!(
-        calculate(&ambiguous, &FactoryPlan::new(target(plate, 1.0))),
-        Err(PlannerError::AmbiguousMachines {
+        step_for(&defaulted, &plate).machine(),
+        &machine_id("a-fast")
+    );
+    assert_close(
+        step_for(&defaulted, &plate)
+            .fractional_machine_count()
+            .get(),
+        2.0,
+    );
+
+    assert_eq!(
+        plan.set_machine_choice(recipe_id("iron-plate"), machine_id("slow")),
+        None
+    );
+    let overridden = calculate(&catalog, &plan).unwrap();
+    assert_eq!(step_for(&overridden, &plate).machine(), &machine_id("slow"));
+    assert_close(
+        step_for(&overridden, &plate)
+            .fractional_machine_count()
+            .get(),
+        4.0,
+    );
+    assert_eq!(
+        plan.clear_machine_choice(&recipe_id("iron-plate")),
+        Some(machine_id("slow"))
+    );
+}
+
+#[test]
+fn rejects_stale_and_incompatible_machine_choices() {
+    let plate = item("iron-plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let smelting = RecipeCategory::new("smelting").unwrap();
+    let catalog = catalog(
+        [plate.clone()],
+        vec![recipe(
+            "iron-plate",
+            &crafting,
+            1.0,
+            vec![],
+            plate.clone(),
+            1.0,
+        )],
+        vec![
+            machine("assembler", [crafting.clone()], 1.0),
+            machine("furnace", [smelting], 1.0),
+        ],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+
+    plan.set_machine_choice(recipe_id("iron-plate"), machine_id("missing"));
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::MissingMachineChoice {
             recipe: recipe_id("iron-plate"),
-            machines: vec![machine_id("a-assembler"), machine_id("b-assembler")],
+            machine: machine_id("missing"),
         })
     );
+
+    plan.set_machine_choice(recipe_id("iron-plate"), machine_id("furnace"));
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::IncompatibleMachineChoice {
+            recipe: recipe_id("iron-plate"),
+            machine: machine_id("furnace"),
+            category: crafting,
+        })
+    );
+}
+
+#[test]
+fn applies_machine_module_speed_productivity_and_consumption_effects() {
+    let ore = item("ore");
+    let plate = item("plate");
+    let slag = item("slag");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let productivity_category = ModuleCategory::new("productivity").unwrap();
+    let recipe = Recipe::new(
+        recipe_id("plate"),
+        crafting.clone(),
+        positive(1.0),
+        vec![factorio_planner_tui::catalog::Ingredient::new(
+            ore.clone(),
+            positive(2.0),
+        )],
+        vec![
+            Product::new(plate.clone(), positive(1.0)),
+            Product::new(slag.clone(), positive(2.0))
+                .with_productivity_amount(NonNegative::new(0.0).unwrap())
+                .unwrap(),
+        ],
+        Some(plate.clone()),
+        true,
+    )
+    .unwrap()
+    .with_module_policy(
+        [
+            ModuleEffect::Speed,
+            ModuleEffect::Productivity,
+            ModuleEffect::Consumption,
+        ],
+        Some([productivity_category.clone()].into_iter().collect()),
+        NonNegative::new(0.1).unwrap(),
+    );
+    let catalog = catalog_with_modules(
+        [ore.clone(), plate.clone(), slag.clone()],
+        vec![recipe],
+        vec![configured_machine(
+            "assembler",
+            crafting,
+            1.0,
+            2,
+            [
+                ModuleEffect::Speed,
+                ModuleEffect::Productivity,
+                ModuleEffect::Consumption,
+            ],
+            Some([productivity_category].into_iter().collect()),
+        )],
+        vec![test_module("combined", "productivity", 0.5, 0.2, -0.9)],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 11.0));
+    plan.set_modules(plate.clone(), [module_id("combined")]);
+
+    let result = calculate(&catalog, &plan).unwrap();
+    let step = step_for(&result, &plate);
+
+    assert_eq!(step.modules(), &[module_id("combined")]);
+    assert_close(step.speed_multiplier().get(), 1.5);
+    assert_close(step.productivity_effect().get(), 0.1);
+    assert_close(step.consumption_multiplier().get(), 0.2);
+    assert_close(step.craft_rate().get(), 10.0);
+    assert_close(step.fractional_machine_count().get(), 10.0 / 1.5);
+    assert_close(rate_for(step.ingredients(), &ore), 20.0);
+    assert_close(rate_for(step.products(), &plate), 11.0);
+    assert_close(rate_for(step.products(), &slag), 20.0);
+    assert_close(rate_for(result.surplus(), &slag), 20.0);
+}
+
+#[test]
+fn rejects_invalid_module_configurations() {
+    let plate = item("plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let speed_category = ModuleCategory::new("speed").unwrap();
+    let productivity_category = ModuleCategory::new("productivity").unwrap();
+    let recipe = recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0).with_module_policy(
+        [ModuleEffect::Speed],
+        Some([speed_category.clone()].into_iter().collect()),
+        NonNegative::new(3.0).unwrap(),
+    );
+    let catalog = catalog_with_modules(
+        [plate.clone()],
+        vec![recipe],
+        vec![configured_machine(
+            "assembler",
+            crafting,
+            1.0,
+            1,
+            [ModuleEffect::Speed],
+            Some([speed_category].into_iter().collect()),
+        )],
+        vec![
+            test_module("speed", "speed", 0.2, 0.0, 0.0),
+            test_module("productivity", "productivity", 0.0, 0.1, 0.0),
+        ],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+
+    plan.set_modules(plate.clone(), [module_id("speed"), module_id("speed")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::TooManyModules {
+            commodity: plate.clone(),
+            machine: machine_id("assembler"),
+            selected: 2,
+            slots: 1,
+        })
+    );
+
+    plan.set_modules(plate.clone(), [module_id("missing")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::MissingModuleChoice {
+            commodity: plate.clone(),
+            module: module_id("missing"),
+        })
+    );
+
+    plan.set_modules(plate.clone(), [module_id("productivity")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::MachineDisallowsModuleCategory {
+            commodity: plate,
+            machine: machine_id("assembler"),
+            module: module_id("productivity"),
+            category: productivity_category,
+        })
+    );
+}
+
+#[test]
+fn validates_machine_and_recipe_module_effect_restrictions() {
+    let plate = item("plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let speed_category = ModuleCategory::new("speed").unwrap();
+    let speed_module = test_module("speed", "speed", 0.2, 0.0, 0.0);
+
+    let machine_restricted = catalog_with_modules(
+        [plate.clone()],
+        vec![
+            recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0).with_module_policy(
+                [ModuleEffect::Speed],
+                None,
+                NonNegative::new(3.0).unwrap(),
+            ),
+        ],
+        vec![configured_machine(
+            "assembler",
+            crafting.clone(),
+            1.0,
+            1,
+            [],
+            Some([speed_category.clone()].into_iter().collect()),
+        )],
+        vec![speed_module.clone()],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+    plan.set_modules(plate.clone(), [module_id("speed")]);
+    assert_eq!(
+        calculate(&machine_restricted, &plan),
+        Err(PlannerError::MachineDisallowsModuleEffect {
+            commodity: plate.clone(),
+            machine: machine_id("assembler"),
+            module: module_id("speed"),
+            effect: ModuleEffect::Speed,
+        })
+    );
+
+    let recipe_restricted = catalog_with_modules(
+        [plate.clone()],
+        vec![
+            recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0).with_module_policy(
+                [],
+                None,
+                NonNegative::new(3.0).unwrap(),
+            ),
+        ],
+        vec![configured_machine(
+            "assembler",
+            crafting,
+            1.0,
+            1,
+            [ModuleEffect::Speed],
+            Some([speed_category].into_iter().collect()),
+        )],
+        vec![speed_module],
+    );
+    assert_eq!(
+        calculate(&recipe_restricted, &plan),
+        Err(PlannerError::RecipeDisallowsModuleEffect {
+            commodity: plate,
+            recipe: recipe_id("plate"),
+            module: module_id("speed"),
+            effect: ModuleEffect::Speed,
+        })
+    );
+}
+
+#[test]
+fn rejects_recipe_category_and_unsupported_module_choices() {
+    let plate = item("plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let speed_category = ModuleCategory::new("speed").unwrap();
+    let productivity_category = ModuleCategory::new("productivity").unwrap();
+    let recipe = recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0).with_module_policy(
+        [ModuleEffect::Speed],
+        Some([productivity_category.clone()].into_iter().collect()),
+        NonNegative::new(3.0).unwrap(),
+    );
+    let catalog = catalog_with_modules(
+        [plate.clone()],
+        vec![recipe],
+        vec![configured_machine(
+            "assembler",
+            crafting,
+            1.0,
+            1,
+            [ModuleEffect::Speed],
+            None,
+        )],
+        vec![
+            test_module("speed", "speed", 0.2, 0.0, 0.0),
+            test_module("future", "productivity", 0.2, 0.0, 0.0)
+                .with_unsupported_effects(["future-effect".into()]),
+        ],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+
+    plan.set_modules(plate.clone(), [module_id("speed")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::RecipeDisallowsModuleCategory {
+            commodity: plate.clone(),
+            recipe: recipe_id("plate"),
+            module: module_id("speed"),
+            category: speed_category,
+        })
+    );
+
+    plan.set_modules(plate.clone(), [module_id("future")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::UnsupportedModuleChoice {
+            commodity: plate,
+            module: module_id("future"),
+        })
+    );
+}
+
+#[test]
+fn module_loadouts_are_canonicalized_without_losing_duplicate_slots() {
+    let plate = item("plate");
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+
+    assert_eq!(
+        plan.set_modules(
+            plate.clone(),
+            [
+                module_id("z-speed"),
+                module_id("a-speed"),
+                module_id("z-speed")
+            ],
+        ),
+        None
+    );
+    assert_eq!(
+        plan.modules_for(&plate),
+        &[
+            module_id("a-speed"),
+            module_id("z-speed"),
+            module_id("z-speed")
+        ]
+    );
+    assert_eq!(
+        plan.clear_modules(&plate),
+        Some(vec![
+            module_id("a-speed"),
+            module_id("z-speed"),
+            module_id("z-speed")
+        ])
+    );
+    assert!(plan.modules_for(&plate).is_empty());
 }
 
 #[test]
