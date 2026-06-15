@@ -1287,6 +1287,12 @@ struct RecipeDto {
     products: Vec<ProductDto>,
     main_product: Option<CommodityIdDto>,
     visible: bool,
+    #[serde(default = "default_recipe_supported")]
+    supported: bool,
+}
+
+const fn default_recipe_supported() -> bool {
+    true
 }
 
 impl From<&Recipe> for RecipeDto {
@@ -1304,6 +1310,7 @@ impl From<&Recipe> for RecipeDto {
             products: recipe.products().iter().map(ProductDto::from).collect(),
             main_product: recipe.main_product().map(CommodityIdDto::from),
             visible: recipe.visible(),
+            supported: recipe.supported(),
         }
     }
 }
@@ -1325,7 +1332,11 @@ impl RecipeDto {
             self.main_product.map(CommodityIdDto::into_id).transpose()?,
             self.visible,
         )
-        .map(|recipe| recipe.with_localized_name(self.localized_name))
+        .map(|recipe| {
+            recipe
+                .with_supported(self.supported)
+                .with_localized_name(self.localized_name)
+        })
         .map_err(|error| invalid_catalog(error.to_string()))
     }
 }

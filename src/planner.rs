@@ -61,6 +61,7 @@ impl Target {
 pub struct FactoryPlan {
     targets: Vec<Target>,
     external_inputs: BTreeSet<CommodityId>,
+    recipe_choices: BTreeMap<CommodityId, RecipeId>,
     display_rate_unit: RateUnit,
 }
 
@@ -70,6 +71,7 @@ impl FactoryPlan {
         Self {
             targets: vec![target],
             external_inputs: BTreeSet::new(),
+            recipe_choices: BTreeMap::new(),
             display_rate_unit: RateUnit::default(),
         }
     }
@@ -140,6 +142,28 @@ impl FactoryPlan {
     #[must_use]
     pub const fn external_inputs(&self) -> &BTreeSet<CommodityId> {
         &self.external_inputs
+    }
+
+    pub fn set_recipe_choice(
+        &mut self,
+        commodity: CommodityId,
+        recipe: RecipeId,
+    ) -> Option<RecipeId> {
+        self.recipe_choices.insert(commodity, recipe)
+    }
+
+    pub fn clear_recipe_choice(&mut self, commodity: &CommodityId) -> Option<RecipeId> {
+        self.recipe_choices.remove(commodity)
+    }
+
+    #[must_use]
+    pub fn recipe_choice(&self, commodity: &CommodityId) -> Option<&RecipeId> {
+        self.recipe_choices.get(commodity)
+    }
+
+    #[must_use]
+    pub const fn recipe_choices(&self) -> &BTreeMap<CommodityId, RecipeId> {
+        &self.recipe_choices
     }
 
     #[must_use]
@@ -256,10 +280,20 @@ impl CalculationResult {
 pub enum PlannerError {
     #[error("target commodity {commodity} is not present in the catalog")]
     UnknownTarget { commodity: CommodityId },
-    #[error("commodity {commodity} has multiple recipes and requires an explicit choice")]
-    AmbiguousRecipes {
+    #[error("selected recipe {recipe} for {commodity} is not present in the catalog")]
+    MissingRecipeChoice {
         commodity: CommodityId,
-        recipes: Vec<RecipeId>,
+        recipe: RecipeId,
+    },
+    #[error("selected recipe {recipe} for {commodity} uses unsupported behavior")]
+    UnsupportedRecipeChoice {
+        commodity: CommodityId,
+        recipe: RecipeId,
+    },
+    #[error("selected recipe {recipe} does not produce {commodity}")]
+    RecipeDoesNotProduceCommodity {
+        commodity: CommodityId,
+        recipe: RecipeId,
     },
     #[error("recipe {recipe} has no compatible machine for category {category}")]
     NoCompatibleMachine {
@@ -284,9 +318,9 @@ pub enum PlannerError {
 ///
 /// # Errors
 ///
-/// Returns [`PlannerError`] when the target is unknown, a recipe or machine
-/// choice is ambiguous, no compatible machine exists, dependencies contain a
-/// cycle, or arithmetic produces an invalid value.
+/// Returns [`PlannerError`] when a target or explicit recipe choice is invalid,
+/// no compatible machine exists, a machine choice is ambiguous, dependencies
+/// contain a cycle, or arithmetic produces an invalid value.
 pub fn calculate(catalog: &Catalog, plan: &FactoryPlan) -> Result<CalculationResult, PlannerError> {
     let target_rates = aggregate_target_rates(plan.targets())?;
     for (commodity, _) in &target_rates {
@@ -297,7 +331,8 @@ pub fn calculate(catalog: &Catalog, plan: &FactoryPlan) -> Result<CalculationRes
         }
     }
 
-    let mut calculation = Calculation::new(catalog, plan);
+    let selected_recipes = resolve_selected_recipes(catalog, plan, &target_rates)?;
+    let mut calculation = Calculation::new(catalog, plan, selected_recipes);
     for (commodity, rate) in target_rates {
         calculation.expand(&commodity, rate)?;
     }
@@ -307,19 +342,23 @@ pub fn calculate(catalog: &Catalog, plan: &FactoryPlan) -> Result<CalculationRes
 struct Calculation<'a> {
     catalog: &'a Catalog,
     plan: &'a FactoryPlan,
+    selected_recipes: BTreeMap<CommodityId, RecipeId>,
     production_steps: BTreeMap<CommodityId, ProductionStepAccumulator>,
     external_inputs: BTreeMap<CommodityId, f64>,
-    active_path: Vec<CommodityId>,
 }
 
 impl<'a> Calculation<'a> {
-    fn new(catalog: &'a Catalog, plan: &'a FactoryPlan) -> Self {
+    fn new(
+        catalog: &'a Catalog,
+        plan: &'a FactoryPlan,
+        selected_recipes: BTreeMap<CommodityId, RecipeId>,
+    ) -> Self {
         Self {
             catalog,
             plan,
+            selected_recipes,
             production_steps: BTreeMap::new(),
             external_inputs: BTreeMap::new(),
-            active_path: Vec::new(),
         }
     }
 
@@ -328,24 +367,18 @@ impl<'a> Calculation<'a> {
         commodity: &CommodityId,
         required_rate: Positive,
     ) -> Result<(), PlannerError> {
-        if self.plan.external_inputs().contains(commodity)
-            || self.catalog.recipes_for_product(commodity).is_empty()
-        {
+        if self.plan.external_inputs().contains(commodity) {
             return self.add_external_input(commodity, required_rate);
         }
 
-        if let Some(cycle_start) = self
-            .active_path
-            .iter()
-            .position(|active| active == commodity)
-        {
-            let mut path = self.active_path[cycle_start..].to_vec();
-            path.push(commodity.clone());
-            return Err(PlannerError::Cycle { path });
-        }
-
-        let recipe = self.select_recipe(commodity)?;
-        let recipe_id = recipe.id().clone();
+        let Some(recipe_id) = self.selected_recipes.get(commodity) else {
+            return self.add_external_input(commodity, required_rate);
+        };
+        let recipe_id = recipe_id.clone();
+        let recipe = self
+            .catalog
+            .recipe(&recipe_id)
+            .expect("resolved recipe IDs must remain present in the catalog");
         let machine_id = self.select_machine(recipe)?;
         let product_amount = recipe
             .products()
@@ -395,11 +428,9 @@ impl<'a> Calculation<'a> {
             &ingredients,
         )?;
 
-        self.active_path.push(commodity.clone());
         for ingredient in ingredients {
             self.expand(ingredient.commodity(), ingredient.rate())?;
         }
-        self.active_path.pop();
         Ok(())
     }
 
@@ -453,20 +484,6 @@ impl<'a> Calculation<'a> {
         Ok(())
     }
 
-    fn select_recipe(&self, commodity: &CommodityId) -> Result<&Recipe, PlannerError> {
-        let recipe_ids = self.catalog.recipes_for_product(commodity);
-        if recipe_ids.len() > 1 {
-            return Err(PlannerError::AmbiguousRecipes {
-                commodity: commodity.clone(),
-                recipes: recipe_ids.to_vec(),
-            });
-        }
-        Ok(self
-            .catalog
-            .recipe(&recipe_ids[0])
-            .expect("recipe IDs in the product index must resolve"))
-    }
-
     fn select_machine(&self, recipe: &Recipe) -> Result<MachineId, PlannerError> {
         let machine_ids = self.catalog.machines_for_category(recipe.category());
         match machine_ids {
@@ -514,6 +531,130 @@ impl<'a> Calculation<'a> {
             display_rate_unit: self.plan.display_rate_unit(),
         })
     }
+}
+
+fn resolve_selected_recipes(
+    catalog: &Catalog,
+    plan: &FactoryPlan,
+    targets: &[(CommodityId, Positive)],
+) -> Result<BTreeMap<CommodityId, RecipeId>, PlannerError> {
+    let mut resolver = RecipeResolver::new(catalog, plan);
+    for (commodity, _) in targets {
+        resolver.visit(commodity)?;
+    }
+    Ok(resolver.selected_recipes)
+}
+
+struct RecipeResolver<'a> {
+    catalog: &'a Catalog,
+    plan: &'a FactoryPlan,
+    selected_recipes: BTreeMap<CommodityId, RecipeId>,
+    resolved: BTreeSet<CommodityId>,
+    active_path: Vec<CommodityId>,
+}
+
+impl<'a> RecipeResolver<'a> {
+    fn new(catalog: &'a Catalog, plan: &'a FactoryPlan) -> Self {
+        Self {
+            catalog,
+            plan,
+            selected_recipes: BTreeMap::new(),
+            resolved: BTreeSet::new(),
+            active_path: Vec::new(),
+        }
+    }
+
+    fn visit(&mut self, commodity: &CommodityId) -> Result<(), PlannerError> {
+        if self.plan.external_inputs().contains(commodity) || self.resolved.contains(commodity) {
+            return Ok(());
+        }
+
+        if let Some(cycle_start) = self
+            .active_path
+            .iter()
+            .position(|active| active == commodity)
+        {
+            let mut path = self.active_path[cycle_start..].to_vec();
+            path.push(commodity.clone());
+            return Err(PlannerError::Cycle { path });
+        }
+
+        let Some(recipe) = self.select_recipe(commodity)? else {
+            self.resolved.insert(commodity.clone());
+            return Ok(());
+        };
+        let recipe_id = recipe.id().clone();
+        let ingredients = recipe
+            .ingredients()
+            .iter()
+            .map(|ingredient| ingredient.commodity().clone())
+            .collect::<Vec<_>>();
+        self.selected_recipes.insert(commodity.clone(), recipe_id);
+
+        self.active_path.push(commodity.clone());
+        for ingredient in ingredients {
+            self.visit(&ingredient)?;
+        }
+        self.active_path.pop();
+        self.resolved.insert(commodity.clone());
+        Ok(())
+    }
+
+    fn select_recipe(&self, commodity: &CommodityId) -> Result<Option<&Recipe>, PlannerError> {
+        if let Some(recipe_id) = self.plan.recipe_choice(commodity) {
+            let recipe = self.catalog.recipe(recipe_id).ok_or_else(|| {
+                PlannerError::MissingRecipeChoice {
+                    commodity: commodity.clone(),
+                    recipe: recipe_id.clone(),
+                }
+            })?;
+            if !recipe.supported() {
+                return Err(PlannerError::UnsupportedRecipeChoice {
+                    commodity: commodity.clone(),
+                    recipe: recipe_id.clone(),
+                });
+            }
+            if !recipe
+                .products()
+                .iter()
+                .any(|product| product.commodity() == commodity)
+            {
+                return Err(PlannerError::RecipeDoesNotProduceCommodity {
+                    commodity: commodity.clone(),
+                    recipe: recipe_id.clone(),
+                });
+            }
+            return Ok(Some(recipe));
+        }
+
+        Ok(self
+            .catalog
+            .recipes_for_product(commodity)
+            .iter()
+            .filter_map(|recipe_id| self.catalog.recipe(recipe_id))
+            .filter(|recipe| recipe.supported())
+            .min_by(|left, right| {
+                default_recipe_rank(left, commodity)
+                    .cmp(&default_recipe_rank(right, commodity))
+                    .then_with(|| left.id().cmp(right.id()))
+            }))
+    }
+}
+
+fn default_recipe_rank(recipe: &Recipe, commodity: &CommodityId) -> (u8, u8) {
+    let visibility_rank = u8::from(!recipe.visible());
+    let product_rank = if recipe.main_product() == Some(commodity) {
+        0
+    } else if recipe
+        .products()
+        .iter()
+        .all(|product| product.commodity() == commodity)
+    {
+        1
+    } else {
+        2
+    };
+    (visibility_rank, product_rank)
 }
 
 struct ProductionStepAccumulator {

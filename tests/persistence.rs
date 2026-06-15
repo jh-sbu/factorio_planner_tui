@@ -129,6 +129,41 @@ fn creates_lists_selects_replaces_deletes_and_reopens_profiles() {
 }
 
 #[test]
+fn recipe_support_status_round_trips_and_defaults_for_older_profiles() {
+    let directory = TempDir::new().unwrap();
+    let source_directory = TempDir::new().unwrap();
+    let store = ProfileStore::new(directory.path());
+    let data = write_data(&source_directory, "data.json", &minimal_data("iron-plate"));
+    let profile = store
+        .create(&ProfileImportRequest::new(profile_name("main"), data))
+        .unwrap();
+    let catalog_path = store.catalog_path(profile.fingerprint());
+    let mut catalog_file: Value =
+        serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+    let recipe = catalog_file["catalog"]["recipes"][0]
+        .as_object_mut()
+        .unwrap();
+
+    recipe.remove("supported");
+    fs::write(
+        &catalog_path,
+        serde_json::to_vec_pretty(&catalog_file).unwrap(),
+    )
+    .unwrap();
+    let reopened = store.open(&profile_name("main")).unwrap();
+    assert!(reopened.catalog().recipes().next().unwrap().supported());
+
+    catalog_file["catalog"]["recipes"][0]["supported"] = Value::Bool(false);
+    fs::write(
+        &catalog_path,
+        serde_json::to_vec_pretty(&catalog_file).unwrap(),
+    )
+    .unwrap();
+    let reopened = store.open(&profile_name("main")).unwrap();
+    assert!(!reopened.catalog().recipes().next().unwrap().supported());
+}
+
+#[test]
 fn rejects_invalid_lifecycle_operations_without_mutating_the_store() {
     let directory = TempDir::new().unwrap();
     let source_directory = TempDir::new().unwrap();

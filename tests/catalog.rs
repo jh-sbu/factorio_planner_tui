@@ -166,6 +166,24 @@ fn records_validate_intrinsic_invariants() {
 }
 
 #[test]
+fn recipes_are_supported_by_default_and_can_be_marked_unsupported() {
+    let product = CommodityId::Item(item("product"));
+    let recipe = Recipe::new(
+        recipe_id("recipe"),
+        RecipeCategory::new("crafting").unwrap(),
+        positive(1.0),
+        vec![],
+        vec![Product::new(product, positive(1.0))],
+        None,
+        true,
+    )
+    .unwrap();
+
+    assert!(recipe.supported());
+    assert!(!recipe.with_supported(false).supported());
+}
+
+#[test]
 fn machine_module_fuel_and_belt_records_expose_validated_data() {
     let crafting = RecipeCategory::new("crafting").unwrap();
     let speed_modules = ModuleCategory::new("speed").unwrap();

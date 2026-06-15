@@ -254,6 +254,7 @@ pub struct Recipe {
     products: Vec<Product>,
     main_product: Option<CommodityId>,
     visible: bool,
+    supported: bool,
 }
 
 impl Recipe {
@@ -295,6 +296,7 @@ impl Recipe {
             products,
             main_product,
             visible,
+            supported: true,
         })
     }
 
@@ -347,6 +349,17 @@ impl Recipe {
     #[must_use]
     pub const fn visible(&self) -> bool {
         self.visible
+    }
+
+    #[must_use]
+    pub const fn with_supported(mut self, supported: bool) -> Self {
+        self.supported = supported;
+        self
+    }
+
+    #[must_use]
+    pub const fn supported(&self) -> bool {
+        self.supported
     }
 }
 

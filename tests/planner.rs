@@ -68,6 +68,29 @@ fn recipe(
     .unwrap()
 }
 
+fn hidden_recipe(
+    name: &str,
+    category: &RecipeCategory,
+    ingredients: Vec<(CommodityId, f64)>,
+    product: CommodityId,
+) -> Recipe {
+    Recipe::new(
+        recipe_id(name),
+        category.clone(),
+        positive(1.0),
+        ingredients
+            .into_iter()
+            .map(|(commodity, amount)| {
+                factorio_planner_tui::catalog::Ingredient::new(commodity, positive(amount))
+            })
+            .collect(),
+        vec![Product::new(product.clone(), positive(1.0))],
+        Some(product),
+        false,
+    )
+    .unwrap()
+}
+
 fn catalog(
     commodities: impl IntoIterator<Item = CommodityId>,
     recipes: Vec<Recipe>,
@@ -426,9 +449,8 @@ fn converts_display_units_without_changing_base_rates() {
 }
 
 #[test]
-fn rejects_unknown_targets_and_ambiguous_recipes() {
+fn rejects_unknown_targets() {
     let plate = item("iron-plate");
-    let crafting = RecipeCategory::new("crafting").unwrap();
     let empty_catalog = catalog([], vec![], vec![]);
     assert_eq!(
         calculate(
@@ -439,22 +461,225 @@ fn rejects_unknown_targets_and_ambiguous_recipes() {
             commodity: plate.clone()
         })
     );
+}
 
-    let ambiguous = catalog(
-        [plate.clone()],
+#[test]
+fn chooses_recipes_by_main_product_visibility_single_product_and_lexical_id() {
+    let plate = item("iron-plate");
+    let slag = item("slag");
+    let stone = item("stone");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone(), slag.clone(), stone.clone()],
         vec![
-            recipe("a-iron-plate", &crafting, 1.0, vec![], plate.clone(), 1.0),
-            recipe("b-iron-plate", &crafting, 1.0, vec![], plate.clone(), 1.0),
+            Recipe::new(
+                recipe_id("a-visible-other-main"),
+                crafting.clone(),
+                positive(1.0),
+                vec![],
+                vec![
+                    Product::new(plate.clone(), positive(1.0)),
+                    Product::new(slag.clone(), positive(1.0)),
+                ],
+                Some(slag),
+                true,
+            )
+            .unwrap(),
+            Recipe::new(
+                recipe_id("b-visible-single"),
+                crafting.clone(),
+                positive(1.0),
+                vec![],
+                vec![Product::new(plate.clone(), positive(1.0))],
+                None,
+                true,
+            )
+            .unwrap(),
+            Recipe::new(
+                recipe_id("c-visible-main"),
+                crafting.clone(),
+                positive(1.0),
+                vec![],
+                vec![
+                    Product::new(plate.clone(), positive(1.0)),
+                    Product::new(stone, positive(1.0)),
+                ],
+                Some(plate.clone()),
+                true,
+            )
+            .unwrap(),
+            hidden_recipe("hidden-main", &crafting, vec![], plate.clone()),
         ],
         vec![machine("assembler", [crafting], 1.0)],
     );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(plate, 1.0))).unwrap();
+
     assert_eq!(
-        calculate(&ambiguous, &FactoryPlan::new(target(plate.clone(), 1.0))),
-        Err(PlannerError::AmbiguousRecipes {
-            commodity: plate,
-            recipes: vec![recipe_id("a-iron-plate"), recipe_id("b-iron-plate")],
+        result.production_steps()[0].recipe(),
+        &recipe_id("c-visible-main")
+    );
+}
+
+#[test]
+fn uses_lexical_recipe_id_for_equal_defaults_and_hidden_recipes_as_fallback() {
+    let visible_product = item("visible-product");
+    let hidden_product = item("hidden-product");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [visible_product.clone(), hidden_product.clone()],
+        vec![
+            recipe(
+                "z-visible",
+                &crafting,
+                1.0,
+                vec![],
+                visible_product.clone(),
+                1.0,
+            ),
+            recipe(
+                "a-visible",
+                &crafting,
+                1.0,
+                vec![],
+                visible_product.clone(),
+                1.0,
+            ),
+            hidden_recipe("z-hidden", &crafting, vec![], hidden_product.clone()),
+            hidden_recipe("a-hidden", &crafting, vec![], hidden_product.clone()),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+
+    let visible = calculate(&catalog, &FactoryPlan::new(target(visible_product, 1.0))).unwrap();
+    let hidden = calculate(&catalog, &FactoryPlan::new(target(hidden_product, 1.0))).unwrap();
+
+    assert_eq!(
+        visible.production_steps()[0].recipe(),
+        &recipe_id("a-visible")
+    );
+    assert_eq!(
+        hidden.production_steps()[0].recipe(),
+        &recipe_id("a-hidden")
+    );
+}
+
+#[test]
+fn explicit_recipe_choice_overrides_the_default_and_can_be_cleared() {
+    let plate = item("iron-plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone()],
+        vec![
+            recipe("a-iron-plate", &crafting, 1.0, vec![], plate.clone(), 1.0),
+            hidden_recipe("b-iron-plate", &crafting, vec![], plate.clone()),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+
+    let mut plan = FactoryPlan::new(target(plate.clone(), 1.0));
+    assert_eq!(
+        plan.set_recipe_choice(plate.clone(), recipe_id("b-iron-plate")),
+        None
+    );
+    assert_eq!(plan.recipe_choice(&plate), Some(&recipe_id("b-iron-plate")));
+    let overridden = calculate(&catalog, &plan).unwrap();
+    assert_eq!(
+        overridden.production_steps()[0].recipe(),
+        &recipe_id("b-iron-plate")
+    );
+
+    assert_eq!(
+        plan.clear_recipe_choice(&plate),
+        Some(recipe_id("b-iron-plate"))
+    );
+    assert_eq!(plan.recipe_choice(&plate), None);
+    let defaulted = calculate(&catalog, &plan).unwrap();
+    assert_eq!(
+        defaulted.production_steps()[0].recipe(),
+        &recipe_id("a-iron-plate")
+    );
+}
+
+#[test]
+fn rejects_missing_unsupported_and_wrong_product_recipe_choices() {
+    let plate = item("iron-plate");
+    let gear = item("iron-gear-wheel");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone(), gear.clone()],
+        vec![
+            recipe("iron-plate", &crafting, 1.0, vec![], plate.clone(), 1.0),
+            recipe(
+                "unsupported-plate",
+                &crafting,
+                1.0,
+                vec![],
+                plate.clone(),
+                1.0,
+            )
+            .with_supported(false),
+            recipe("iron-gear-wheel", &crafting, 1.0, vec![], gear, 1.0),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+
+    let mut missing = FactoryPlan::new(target(plate.clone(), 1.0));
+    missing.set_recipe_choice(plate.clone(), recipe_id("missing"));
+    assert_eq!(
+        calculate(&catalog, &missing),
+        Err(PlannerError::MissingRecipeChoice {
+            commodity: plate.clone(),
+            recipe: recipe_id("missing"),
         })
     );
+
+    let mut unsupported = FactoryPlan::new(target(plate.clone(), 1.0));
+    unsupported.set_recipe_choice(plate.clone(), recipe_id("unsupported-plate"));
+    assert_eq!(
+        calculate(&catalog, &unsupported),
+        Err(PlannerError::UnsupportedRecipeChoice {
+            commodity: plate.clone(),
+            recipe: recipe_id("unsupported-plate"),
+        })
+    );
+
+    let mut wrong_product = FactoryPlan::new(target(plate.clone(), 1.0));
+    wrong_product.set_recipe_choice(plate.clone(), recipe_id("iron-gear-wheel"));
+    assert_eq!(
+        calculate(&catalog, &wrong_product),
+        Err(PlannerError::RecipeDoesNotProduceCommodity {
+            commodity: plate,
+            recipe: recipe_id("iron-gear-wheel"),
+        })
+    );
+}
+
+#[test]
+fn treats_a_commodity_with_only_unsupported_recipes_as_external() {
+    let plate = item("iron-plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone()],
+        vec![
+            recipe(
+                "unsupported-plate",
+                &crafting,
+                1.0,
+                vec![],
+                plate.clone(),
+                1.0,
+            )
+            .with_supported(false),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(plate.clone(), 2.0))).unwrap();
+
+    assert!(result.production_steps().is_empty());
+    assert_eq!(result.external_inputs()[0].commodity(), &plate);
+    assert_close(result.external_inputs()[0].rate().get(), 2.0);
 }
 
 #[test]
@@ -525,6 +750,110 @@ fn rejects_dependency_cycles_with_the_complete_path() {
             path: vec![a.clone(), b, a]
         })
     );
+}
+
+#[test]
+fn rejects_direct_dependency_cycles_with_the_complete_path() {
+    let a = item("a");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [a.clone()],
+        vec![recipe(
+            "make-a",
+            &crafting,
+            1.0,
+            vec![(a.clone(), 1.0)],
+            a.clone(),
+            1.0,
+        )],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+
+    assert_eq!(
+        calculate(&catalog, &FactoryPlan::new(target(a.clone(), 1.0))),
+        Err(PlannerError::Cycle {
+            path: vec![a.clone(), a]
+        })
+    );
+}
+
+#[test]
+fn resolves_a_cycle_with_an_alternate_recipe_choice() {
+    let a = item("a");
+    let b = item("b");
+    let ore = item("ore");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [a.clone(), b.clone(), ore.clone()],
+        vec![
+            recipe(
+                "a-cyclic",
+                &crafting,
+                1.0,
+                vec![(b.clone(), 1.0)],
+                a.clone(),
+                1.0,
+            ),
+            recipe(
+                "z-safe",
+                &crafting,
+                1.0,
+                vec![(ore.clone(), 1.0)],
+                a.clone(),
+                1.0,
+            ),
+            recipe("make-b", &crafting, 1.0, vec![(a.clone(), 1.0)], b, 1.0),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+    let mut plan = FactoryPlan::new(target(a.clone(), 1.0));
+
+    assert!(matches!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::Cycle { .. })
+    ));
+
+    plan.set_recipe_choice(a.clone(), recipe_id("z-safe"));
+    let result = calculate(&catalog, &plan).unwrap();
+
+    assert_eq!(step_for(&result, &a).recipe(), &recipe_id("z-safe"));
+    assert_eq!(result.external_inputs()[0].commodity(), &ore);
+}
+
+#[test]
+fn resolves_a_cycle_with_an_external_boundary_even_when_a_recipe_is_selected() {
+    let a = item("a");
+    let b = item("b");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [a.clone(), b.clone()],
+        vec![
+            recipe(
+                "make-a",
+                &crafting,
+                1.0,
+                vec![(b.clone(), 1.0)],
+                a.clone(),
+                1.0,
+            ),
+            recipe(
+                "make-b",
+                &crafting,
+                1.0,
+                vec![(a.clone(), 1.0)],
+                b.clone(),
+                1.0,
+            ),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+    let mut plan = FactoryPlan::new(target(a.clone(), 1.0)).with_external_inputs([b.clone()]);
+    plan.set_recipe_choice(b.clone(), recipe_id("make-b"));
+
+    let result = calculate(&catalog, &plan).unwrap();
+
+    assert_eq!(result.production_steps().len(), 1);
+    assert_eq!(result.external_inputs()[0].commodity(), &b);
 }
 
 proptest! {
