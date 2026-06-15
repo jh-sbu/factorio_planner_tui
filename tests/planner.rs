@@ -68,6 +68,34 @@ fn recipe(
     .unwrap()
 }
 
+fn recipe_with_products(
+    name: &str,
+    category: &RecipeCategory,
+    duration: f64,
+    ingredients: Vec<(CommodityId, f64)>,
+    products: Vec<(CommodityId, f64)>,
+    main_product: Option<CommodityId>,
+) -> Recipe {
+    Recipe::new(
+        recipe_id(name),
+        category.clone(),
+        positive(duration),
+        ingredients
+            .into_iter()
+            .map(|(commodity, amount)| {
+                factorio_planner_tui::catalog::Ingredient::new(commodity, positive(amount))
+            })
+            .collect(),
+        products
+            .into_iter()
+            .map(|(commodity, amount)| Product::new(commodity, positive(amount)))
+            .collect(),
+        main_product,
+        true,
+    )
+    .unwrap()
+}
+
 fn hidden_recipe(
     name: &str,
     category: &RecipeCategory,
@@ -169,6 +197,18 @@ fn step_for<'a>(
         .expect("expected production step")
 }
 
+fn rate_for(
+    rates: &[factorio_planner_tui::planner::CommodityRate],
+    commodity: &CommodityId,
+) -> f64 {
+    rates
+        .iter()
+        .find(|rate| rate.commodity() == commodity)
+        .expect("expected commodity rate")
+        .rate()
+        .get()
+}
+
 #[test]
 fn calculates_one_target_with_one_recipe_and_machine_without_mutating_inputs() {
     let gear = item("iron-gear-wheel");
@@ -255,6 +295,150 @@ fn recursively_expands_ingredients_and_accumulates_raw_inputs() {
     assert_eq!(result.external_inputs().len(), 1);
     assert_eq!(result.external_inputs()[0].commodity(), &ore);
     assert_close(result.external_inputs()[0].rate().get(), 6.0);
+}
+
+#[test]
+fn reports_all_multi_product_outputs_and_secondary_surplus() {
+    let plate = item("iron-plate");
+    let slag = item("slag");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone(), slag.clone()],
+        vec![recipe_with_products(
+            "smelt-iron",
+            &crafting,
+            4.0,
+            vec![],
+            vec![(plate.clone(), 2.0), (slag.clone(), 3.0)],
+            Some(plate.clone()),
+        )],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(plate.clone(), 5.0))).unwrap();
+    let step = step_for(&result, &plate);
+
+    assert_close(step.craft_rate().get(), 2.5);
+    assert_close(step.fractional_machine_count().get(), 10.0);
+    assert_close(rate_for(step.products(), &plate), 5.0);
+    assert_close(rate_for(step.products(), &slag), 7.5);
+    assert_eq!(result.surplus().len(), 1);
+    assert_close(rate_for(result.surplus(), &slag), 7.5);
+}
+
+#[test]
+fn surplus_does_not_reduce_target_or_ingredient_demand() {
+    let plate = item("iron-plate");
+    let slag = item("slag");
+    let brick = item("slag-brick");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone(), slag.clone(), brick.clone()],
+        vec![
+            recipe_with_products(
+                "smelt-iron",
+                &crafting,
+                1.0,
+                vec![],
+                vec![(plate.clone(), 1.0), (slag.clone(), 2.0)],
+                Some(plate.clone()),
+            ),
+            recipe(
+                "slag-brick",
+                &crafting,
+                1.0,
+                vec![(slag.clone(), 1.0)],
+                brick.clone(),
+                1.0,
+            ),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+    let mut plan = FactoryPlan::new(target(plate, 2.0)).with_external_inputs([slag.clone()]);
+    plan.add_target(target(brick, 3.0));
+
+    let result = calculate(&catalog, &plan).unwrap();
+
+    assert_close(rate_for(result.surplus(), &slag), 4.0);
+    assert_close(rate_for(result.external_inputs(), &slag), 3.0);
+}
+
+#[test]
+fn choosing_another_planning_product_changes_multi_product_sizing() {
+    let plate = item("iron-plate");
+    let slag = item("slag");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let shared_recipe = recipe_with_products(
+        "separate-ore",
+        &crafting,
+        1.0,
+        vec![],
+        vec![(plate.clone(), 2.0), (slag.clone(), 4.0)],
+        None,
+    );
+    let catalog = catalog(
+        [plate.clone(), slag.clone()],
+        vec![shared_recipe],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+
+    let plate_result = calculate(&catalog, &FactoryPlan::new(target(plate.clone(), 6.0))).unwrap();
+    let slag_result = calculate(&catalog, &FactoryPlan::new(target(slag.clone(), 6.0))).unwrap();
+
+    assert_close(step_for(&plate_result, &plate).craft_rate().get(), 3.0);
+    assert_close(rate_for(plate_result.surplus(), &slag), 12.0);
+    assert_close(step_for(&slag_result, &slag).craft_rate().get(), 1.5);
+    assert_close(rate_for(slag_result.surplus(), &plate), 3.0);
+}
+
+#[test]
+fn aggregates_secondary_surplus_deterministically() {
+    let a = item("a");
+    let b = item("b");
+    let ash = item("ash");
+    let slag = item("slag");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [a.clone(), b.clone(), ash.clone(), slag.clone()],
+        vec![
+            recipe_with_products(
+                "make-a",
+                &crafting,
+                1.0,
+                vec![],
+                vec![(a.clone(), 1.0), (slag.clone(), 2.0), (ash.clone(), 1.0)],
+                Some(a.clone()),
+            ),
+            recipe_with_products(
+                "make-b",
+                &crafting,
+                1.0,
+                vec![],
+                vec![(b.clone(), 1.0), (slag.clone(), 3.0)],
+                Some(b.clone()),
+            ),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+    let mut forward = FactoryPlan::new(target(a.clone(), 2.0));
+    forward.add_target(target(b.clone(), 4.0));
+    let mut reverse = FactoryPlan::new(target(b, 4.0));
+    reverse.add_target(target(a, 2.0));
+
+    let forward = calculate(&catalog, &forward).unwrap();
+    let reverse = calculate(&catalog, &reverse).unwrap();
+
+    assert_eq!(forward.surplus(), reverse.surplus());
+    assert_eq!(
+        forward
+            .surplus()
+            .iter()
+            .map(factorio_planner_tui::planner::CommodityRate::commodity)
+            .collect::<Vec<_>>(),
+        [&ash, &slag]
+    );
+    assert_close(rate_for(forward.surplus(), &ash), 2.0);
+    assert_close(rate_for(forward.surplus(), &slag), 16.0);
 }
 
 #[test]

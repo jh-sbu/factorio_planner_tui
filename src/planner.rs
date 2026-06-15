@@ -208,6 +208,7 @@ pub struct ProductionStep {
     fractional_machine_count: Positive,
     installed_machine_count: u64,
     ingredients: Vec<CommodityRate>,
+    products: Vec<CommodityRate>,
 }
 
 impl ProductionStep {
@@ -250,12 +251,18 @@ impl ProductionStep {
     pub fn ingredients(&self) -> &[CommodityRate] {
         &self.ingredients
     }
+
+    #[must_use]
+    pub fn products(&self) -> &[CommodityRate] {
+        &self.products
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalculationResult {
     production_steps: Vec<ProductionStep>,
     external_inputs: Vec<CommodityRate>,
+    surplus: Vec<CommodityRate>,
     display_rate_unit: RateUnit,
 }
 
@@ -268,6 +275,11 @@ impl CalculationResult {
     #[must_use]
     pub fn external_inputs(&self) -> &[CommodityRate] {
         &self.external_inputs
+    }
+
+    #[must_use]
+    pub fn surplus(&self) -> &[CommodityRate] {
+        &self.surplus
     }
 
     #[must_use]
@@ -417,6 +429,7 @@ impl<'a> Calculation<'a> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let products = aggregate_recipe_products(recipe, craft_rate)?;
 
         self.add_production_step(
             commodity,
@@ -426,6 +439,7 @@ impl<'a> Calculation<'a> {
             craft_rate,
             fractional_machine_count,
             &ingredients,
+            &products,
         )?;
 
         for ingredient in ingredients {
@@ -444,6 +458,7 @@ impl<'a> Calculation<'a> {
         craft_rate: Positive,
         fractional_machine_count: Positive,
         ingredients: &[CommodityRate],
+        products: &[CommodityRate],
     ) -> Result<(), PlannerError> {
         let step = self
             .production_steps
@@ -456,6 +471,7 @@ impl<'a> Calculation<'a> {
                 craft_rate: 0.0,
                 fractional_machine_count: 0.0,
                 ingredients: BTreeMap::new(),
+                products: BTreeMap::new(),
             });
         debug_assert_eq!(&step.recipe, recipe);
         debug_assert_eq!(&step.machine, machine);
@@ -480,6 +496,14 @@ impl<'a> Calculation<'a> {
                 .or_default();
             *total += ingredient.rate().get();
             checked_positive(*total, "aggregated ingredient rate per second")?;
+        }
+        for product in products {
+            let total = step
+                .products
+                .entry(product.commodity().clone())
+                .or_default();
+            *total += product.rate().get();
+            checked_positive(*total, "aggregated product rate per second")?;
         }
         Ok(())
     }
@@ -524,10 +548,12 @@ impl<'a> Calculation<'a> {
                     .map(|rate| CommodityRate { commodity, rate })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let surplus = aggregate_surplus(&production_steps)?;
 
         Ok(CalculationResult {
             production_steps,
             external_inputs,
+            surplus,
             display_rate_unit: self.plan.display_rate_unit(),
         })
     }
@@ -665,6 +691,7 @@ struct ProductionStepAccumulator {
     craft_rate: f64,
     fractional_machine_count: f64,
     ingredients: BTreeMap<CommodityId, f64>,
+    products: BTreeMap<CommodityId, f64>,
 }
 
 impl ProductionStepAccumulator {
@@ -683,6 +710,14 @@ impl ProductionStepAccumulator {
                     .map(|rate| CommodityRate { commodity, rate })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let products = self
+            .products
+            .into_iter()
+            .map(|(commodity, rate)| {
+                checked_positive(rate, "aggregated product rate per second")
+                    .map(|rate| CommodityRate { commodity, rate })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(ProductionStep {
             planning_product: self.planning_product,
@@ -696,8 +731,53 @@ impl ProductionStepAccumulator {
             fractional_machine_count,
             installed_machine_count,
             ingredients,
+            products,
         })
     }
+}
+
+fn aggregate_recipe_products(
+    recipe: &Recipe,
+    craft_rate: Positive,
+) -> Result<Vec<CommodityRate>, PlannerError> {
+    let mut rates = BTreeMap::<CommodityId, f64>::new();
+    for product in recipe.products() {
+        let rate = craft_rate.get() * product.amount().get();
+        checked_positive(rate, "product rate per second")?;
+        let total = rates.entry(product.commodity().clone()).or_default();
+        *total += rate;
+        checked_positive(*total, "aggregated product rate per second")?;
+    }
+    rates
+        .into_iter()
+        .map(|(commodity, rate)| {
+            checked_positive(rate, "aggregated product rate per second")
+                .map(|rate| CommodityRate { commodity, rate })
+        })
+        .collect()
+}
+
+fn aggregate_surplus(
+    production_steps: &[ProductionStep],
+) -> Result<Vec<CommodityRate>, PlannerError> {
+    let mut surplus = BTreeMap::<CommodityId, f64>::new();
+    for step in production_steps {
+        for product in step.products() {
+            if product.commodity() == step.planning_product() {
+                continue;
+            }
+            let total = surplus.entry(product.commodity().clone()).or_default();
+            *total += product.rate().get();
+            checked_positive(*total, "aggregated surplus rate per second")?;
+        }
+    }
+    surplus
+        .into_iter()
+        .map(|(commodity, rate)| {
+            checked_positive(rate, "aggregated surplus rate per second")
+                .map(|rate| CommodityRate { commodity, rate })
+        })
+        .collect()
 }
 
 fn aggregate_target_rates(
