@@ -3,8 +3,9 @@ use factorio_planner_tui::catalog::{
     NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId,
 };
 use factorio_planner_tui::planner::{
-    FactoryPlan, PlannerError, ProductionStep, RateUnit, Target, calculate,
+    FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit, Target, calculate,
 };
+use proptest::prelude::*;
 
 fn item(name: &str) -> CommodityId {
     CommodityId::Item(ItemId::new(name).expect("test item ID should be valid"))
@@ -95,6 +96,56 @@ fn assert_close(actual: f64, expected: f64) {
     );
 }
 
+fn shared_intermediate_catalog() -> (Catalog, CommodityId, CommodityId, CommodityId, CommodityId) {
+    let ore = item("iron-ore");
+    let plate = item("iron-plate");
+    let gear = item("iron-gear-wheel");
+    let pipe = item("pipe");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [ore.clone(), plate.clone(), gear.clone(), pipe.clone()],
+        vec![
+            recipe(
+                "iron-plate",
+                &crafting,
+                1.0,
+                vec![(ore.clone(), 1.0)],
+                plate.clone(),
+                1.0,
+            ),
+            recipe(
+                "iron-gear-wheel",
+                &crafting,
+                0.5,
+                vec![(plate.clone(), 2.0)],
+                gear.clone(),
+                1.0,
+            ),
+            recipe(
+                "pipe",
+                &crafting,
+                0.5,
+                vec![(plate.clone(), 1.0)],
+                pipe.clone(),
+                1.0,
+            ),
+        ],
+        vec![machine("assembling-machine-1", [crafting], 1.0)],
+    );
+    (catalog, ore, plate, gear, pipe)
+}
+
+fn step_for<'a>(
+    result: &'a factorio_planner_tui::planner::CalculationResult,
+    commodity: &CommodityId,
+) -> &'a ProductionStep {
+    result
+        .production_steps()
+        .iter()
+        .find(|step| step.planning_product() == commodity)
+        .expect("expected production step")
+}
+
 #[test]
 fn calculates_one_target_with_one_recipe_and_machine_without_mutating_inputs() {
     let gear = item("iron-gear-wheel");
@@ -181,6 +232,108 @@ fn recursively_expands_ingredients_and_accumulates_raw_inputs() {
     assert_eq!(result.external_inputs().len(), 1);
     assert_eq!(result.external_inputs()[0].commodity(), &ore);
     assert_close(result.external_inputs()[0].rate().get(), 6.0);
+}
+
+#[test]
+fn combines_multiple_targets_and_shared_intermediates_once() {
+    let (catalog, ore, plate, gear, pipe) = shared_intermediate_catalog();
+    let mut plan = FactoryPlan::new(target(gear.clone(), 3.0));
+    plan.add_target(target(pipe.clone(), 4.0));
+
+    let result = calculate(&catalog, &plan).unwrap();
+
+    assert_eq!(plan.targets().len(), 2);
+    assert_eq!(result.production_steps().len(), 3);
+    assert_close(step_for(&result, &gear).required_output_rate().get(), 3.0);
+    assert_close(step_for(&result, &pipe).required_output_rate().get(), 4.0);
+    let plate_step = step_for(&result, &plate);
+    assert_close(plate_step.required_output_rate().get(), 10.0);
+    assert_close(plate_step.fractional_machine_count().get(), 10.0);
+    assert_eq!(plate_step.installed_machine_count(), 10);
+    assert_eq!(result.external_inputs().len(), 1);
+    assert_eq!(result.external_inputs()[0].commodity(), &ore);
+    assert_close(result.external_inputs()[0].rate().get(), 10.0);
+}
+
+#[test]
+fn sums_duplicate_targets_before_rounding_machine_counts() {
+    let plate = item("iron-plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone()],
+        vec![recipe(
+            "iron-plate",
+            &crafting,
+            1.0,
+            vec![],
+            plate.clone(),
+            1.0,
+        )],
+        vec![machine("assembler", [crafting], 3.0)],
+    );
+    let mut duplicate_plan = FactoryPlan::new(target(plate.clone(), 1.0));
+    duplicate_plan.add_target(target(plate.clone(), 1.0));
+    let summed_plan = FactoryPlan::new(target(plate, 2.0));
+
+    let duplicate_result = calculate(&catalog, &duplicate_plan).unwrap();
+    let summed_result = calculate(&catalog, &summed_plan).unwrap();
+
+    assert_eq!(duplicate_result, summed_result);
+    assert_eq!(
+        duplicate_result.production_steps()[0].installed_machine_count(),
+        1
+    );
+}
+
+#[test]
+fn target_order_does_not_change_aggregate_results() {
+    let (catalog, _, _, gear, pipe) = shared_intermediate_catalog();
+    let mut forward = FactoryPlan::new(target(gear.clone(), 1.25));
+    forward.add_target(target(pipe.clone(), 2.75));
+    let mut reverse = FactoryPlan::new(target(pipe, 2.75));
+    reverse.add_target(target(gear, 1.25));
+
+    assert_eq!(
+        calculate(&catalog, &forward).unwrap(),
+        calculate(&catalog, &reverse).unwrap()
+    );
+}
+
+#[test]
+fn adds_replaces_and_removes_targets_without_invalid_partial_edits() {
+    let gear = item("iron-gear-wheel");
+    let pipe = item("pipe");
+    let plate = item("iron-plate");
+    let mut plan = FactoryPlan::new(target(gear.clone(), 1.0));
+
+    plan.add_target(target(pipe.clone(), 2.0));
+    assert_eq!(
+        plan.targets()
+            .iter()
+            .map(Target::commodity)
+            .collect::<Vec<_>>(),
+        [&gear, &pipe]
+    );
+
+    let replaced = plan.replace_target(0, target(plate.clone(), 3.0)).unwrap();
+    assert_eq!(replaced.commodity(), &gear);
+    assert_eq!(plan.targets()[0].commodity(), &plate);
+
+    let before_invalid_replace = plan.clone();
+    assert_eq!(
+        plan.replace_target(2, target(gear, 4.0)),
+        Err(PlanEditError::TargetIndexOutOfBounds { index: 2, len: 2 })
+    );
+    assert_eq!(plan, before_invalid_replace);
+
+    let removed = plan.remove_target(1).unwrap();
+    assert_eq!(removed.commodity(), &pipe);
+    let before_final_remove = plan.clone();
+    assert_eq!(
+        plan.remove_target(0),
+        Err(PlanEditError::CannotRemoveLastTarget)
+    );
+    assert_eq!(plan, before_final_remove);
 }
 
 #[test]
@@ -372,4 +525,87 @@ fn rejects_dependency_cycles_with_the_complete_path() {
             path: vec![a.clone(), b, a]
         })
     );
+}
+
+proptest! {
+    #[test]
+    fn calculation_scales_linearly(
+        gear_rate in 0.01_f64..1_000.0,
+        pipe_rate in 0.01_f64..1_000.0,
+        scale in 0.01_f64..100.0,
+    ) {
+        let (catalog, _, _, gear, pipe) = shared_intermediate_catalog();
+        let mut base_plan = FactoryPlan::new(target(gear.clone(), gear_rate));
+        base_plan.add_target(target(pipe.clone(), pipe_rate));
+        let mut scaled_plan = FactoryPlan::new(target(gear, gear_rate * scale));
+        scaled_plan.add_target(target(pipe, pipe_rate * scale));
+
+        let base = calculate(&catalog, &base_plan).unwrap();
+        let scaled = calculate(&catalog, &scaled_plan).unwrap();
+
+        for (base_step, scaled_step) in base
+            .production_steps()
+            .iter()
+            .zip(scaled.production_steps())
+        {
+            prop_assert_eq!(
+                base_step.planning_product(),
+                scaled_step.planning_product()
+            );
+            prop_assert!(
+                (scaled_step.required_output_rate().get()
+                    - base_step.required_output_rate().get() * scale)
+                    .abs()
+                    < 1.0e-8
+            );
+            prop_assert!(
+                (scaled_step.craft_rate().get() - base_step.craft_rate().get() * scale).abs()
+                    < 1.0e-8
+            );
+            prop_assert!(
+                (scaled_step.fractional_machine_count().get()
+                    - base_step.fractional_machine_count().get() * scale)
+                    .abs()
+                    < 1.0e-8
+            );
+        }
+        for (base_input, scaled_input) in
+            base.external_inputs().iter().zip(scaled.external_inputs())
+        {
+            prop_assert_eq!(base_input.commodity(), scaled_input.commodity());
+            prop_assert!(
+                (scaled_input.rate().get() - base_input.rate().get() * scale).abs() < 1.0e-8
+            );
+        }
+    }
+
+    #[test]
+    fn calculated_rates_are_finite_and_positive(
+        gear_rate in 0.01_f64..1_000_000.0,
+        pipe_rate in 0.01_f64..1_000_000.0,
+    ) {
+        let (catalog, _, _, gear, pipe) = shared_intermediate_catalog();
+        let mut plan = FactoryPlan::new(target(gear, gear_rate));
+        plan.add_target(target(pipe, pipe_rate));
+
+        let result = calculate(&catalog, &plan).unwrap();
+
+        for step in result.production_steps() {
+            prop_assert!(step.required_output_rate().get().is_finite());
+            prop_assert!(step.required_output_rate().get() > 0.0);
+            prop_assert!(step.craft_rate().get().is_finite());
+            prop_assert!(step.craft_rate().get() > 0.0);
+            prop_assert!(step.fractional_machine_count().get().is_finite());
+            prop_assert!(step.fractional_machine_count().get() > 0.0);
+            prop_assert!(step.installed_machine_count() > 0);
+            for ingredient in step.ingredients() {
+                prop_assert!(ingredient.rate().get().is_finite());
+                prop_assert!(ingredient.rate().get() > 0.0);
+            }
+        }
+        for input in result.external_inputs() {
+            prop_assert!(input.rate().get().is_finite());
+            prop_assert!(input.rate().get() > 0.0);
+        }
+    }
 }

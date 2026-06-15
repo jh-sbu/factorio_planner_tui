@@ -59,7 +59,7 @@ impl Target {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FactoryPlan {
-    target: Target,
+    targets: Vec<Target>,
     external_inputs: BTreeSet<CommodityId>,
     display_rate_unit: RateUnit,
 }
@@ -68,10 +68,53 @@ impl FactoryPlan {
     #[must_use]
     pub fn new(target: Target) -> Self {
         Self {
-            target,
+            targets: vec![target],
             external_inputs: BTreeSet::new(),
             display_rate_unit: RateUnit::default(),
         }
+    }
+
+    pub fn add_target(&mut self, target: Target) {
+        self.targets.push(target);
+    }
+
+    /// Replaces a target by its stable position in the plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanEditError::TargetIndexOutOfBounds`] when `index` does not
+    /// identify an existing target.
+    pub fn replace_target(
+        &mut self,
+        index: usize,
+        target: Target,
+    ) -> Result<Target, PlanEditError> {
+        let len = self.targets.len();
+        let existing = self
+            .targets
+            .get_mut(index)
+            .ok_or(PlanEditError::TargetIndexOutOfBounds { index, len })?;
+        Ok(std::mem::replace(existing, target))
+    }
+
+    /// Removes a target by its stable position in the plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanEditError::TargetIndexOutOfBounds`] when `index` does not
+    /// identify an existing target, or [`PlanEditError::CannotRemoveLastTarget`]
+    /// when removal would leave the plan without a target.
+    pub fn remove_target(&mut self, index: usize) -> Result<Target, PlanEditError> {
+        if index >= self.targets.len() {
+            return Err(PlanEditError::TargetIndexOutOfBounds {
+                index,
+                len: self.targets.len(),
+            });
+        }
+        if self.targets.len() == 1 {
+            return Err(PlanEditError::CannotRemoveLastTarget);
+        }
+        Ok(self.targets.remove(index))
     }
 
     #[must_use]
@@ -90,8 +133,8 @@ impl FactoryPlan {
     }
 
     #[must_use]
-    pub const fn target(&self) -> &Target {
-        &self.target
+    pub fn targets(&self) -> &[Target] {
+        &self.targets
     }
 
     #[must_use]
@@ -103,6 +146,14 @@ impl FactoryPlan {
     pub const fn display_rate_unit(&self) -> RateUnit {
         self.display_rate_unit
     }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum PlanEditError {
+    #[error("target index {index} is out of bounds for {len} targets")]
+    TargetIndexOutOfBounds { index: usize, len: usize },
+    #[error("a factory plan must contain at least one target")]
+    CannotRemoveLastTarget,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -226,7 +277,7 @@ pub enum PlannerError {
     InvalidCalculatedValue { quantity: &'static str, value: f64 },
 }
 
-/// Calculates a single deterministic production chain.
+/// Calculates deterministic production chains for all targets in a plan.
 ///
 /// The planner has no filesystem, terminal, or application-state access. All
 /// rates in the returned result remain in units per second.
@@ -237,21 +288,26 @@ pub enum PlannerError {
 /// choice is ambiguous, no compatible machine exists, dependencies contain a
 /// cycle, or arithmetic produces an invalid value.
 pub fn calculate(catalog: &Catalog, plan: &FactoryPlan) -> Result<CalculationResult, PlannerError> {
-    if catalog.commodity(plan.target().commodity()).is_none() {
-        return Err(PlannerError::UnknownTarget {
-            commodity: plan.target().commodity().clone(),
-        });
+    let target_rates = aggregate_target_rates(plan.targets())?;
+    for (commodity, _) in &target_rates {
+        if catalog.commodity(commodity).is_none() {
+            return Err(PlannerError::UnknownTarget {
+                commodity: commodity.clone(),
+            });
+        }
     }
 
     let mut calculation = Calculation::new(catalog, plan);
-    calculation.expand(plan.target().commodity(), plan.target().rate_per_second())?;
+    for (commodity, rate) in target_rates {
+        calculation.expand(&commodity, rate)?;
+    }
     calculation.finish()
 }
 
 struct Calculation<'a> {
     catalog: &'a Catalog,
     plan: &'a FactoryPlan,
-    production_steps: Vec<ProductionStep>,
+    production_steps: BTreeMap<CommodityId, ProductionStepAccumulator>,
     external_inputs: BTreeMap<CommodityId, f64>,
     active_path: Vec<CommodityId>,
 }
@@ -261,7 +317,7 @@ impl<'a> Calculation<'a> {
         Self {
             catalog,
             plan,
-            production_steps: Vec::new(),
+            production_steps: BTreeMap::new(),
             external_inputs: BTreeMap::new(),
             active_path: Vec::new(),
         }
@@ -289,6 +345,7 @@ impl<'a> Calculation<'a> {
         }
 
         let recipe = self.select_recipe(commodity)?;
+        let recipe_id = recipe.id().clone();
         let machine_id = self.select_machine(recipe)?;
         let product_amount = recipe
             .products()
@@ -312,8 +369,6 @@ impl<'a> Calculation<'a> {
             craft_rate.get() / crafts_per_second_per_machine.get(),
             "fractional machine count",
         )?;
-        let installed_machine_count =
-            checked_installed_machine_count(fractional_machine_count.get())?;
 
         let ingredients = recipe
             .ingredients()
@@ -330,22 +385,71 @@ impl<'a> Calculation<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        self.production_steps.push(ProductionStep {
-            planning_product: commodity.clone(),
-            recipe: recipe.id().clone(),
-            machine: machine_id,
-            required_output_rate: required_rate,
+        self.add_production_step(
+            commodity,
+            &recipe_id,
+            &machine_id,
+            required_rate,
             craft_rate,
             fractional_machine_count,
-            installed_machine_count,
-            ingredients: ingredients.clone(),
-        });
+            &ingredients,
+        )?;
 
         self.active_path.push(commodity.clone());
         for ingredient in ingredients {
             self.expand(ingredient.commodity(), ingredient.rate())?;
         }
         self.active_path.pop();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_production_step(
+        &mut self,
+        commodity: &CommodityId,
+        recipe: &RecipeId,
+        machine: &MachineId,
+        required_output_rate: Positive,
+        craft_rate: Positive,
+        fractional_machine_count: Positive,
+        ingredients: &[CommodityRate],
+    ) -> Result<(), PlannerError> {
+        let step = self
+            .production_steps
+            .entry(commodity.clone())
+            .or_insert_with(|| ProductionStepAccumulator {
+                planning_product: commodity.clone(),
+                recipe: recipe.clone(),
+                machine: machine.clone(),
+                required_output_rate: 0.0,
+                craft_rate: 0.0,
+                fractional_machine_count: 0.0,
+                ingredients: BTreeMap::new(),
+            });
+        debug_assert_eq!(&step.recipe, recipe);
+        debug_assert_eq!(&step.machine, machine);
+
+        step.required_output_rate += required_output_rate.get();
+        checked_positive(
+            step.required_output_rate,
+            "aggregated required output rate per second",
+        )?;
+        step.craft_rate += craft_rate.get();
+        checked_positive(step.craft_rate, "aggregated craft rate per second")?;
+        step.fractional_machine_count += fractional_machine_count.get();
+        checked_positive(
+            step.fractional_machine_count,
+            "aggregated fractional machine count",
+        )?;
+
+        for ingredient in ingredients {
+            let total = step
+                .ingredients
+                .entry(ingredient.commodity().clone())
+                .or_default();
+            *total += ingredient.rate().get();
+            checked_positive(*total, "aggregated ingredient rate per second")?;
+        }
         Ok(())
     }
 
@@ -389,9 +493,12 @@ impl<'a> Calculation<'a> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<CalculationResult, PlannerError> {
-        self.production_steps
-            .sort_by(|left, right| left.planning_product.cmp(&right.planning_product));
+    fn finish(self) -> Result<CalculationResult, PlannerError> {
+        let production_steps = self
+            .production_steps
+            .into_values()
+            .map(ProductionStepAccumulator::finish)
+            .collect::<Result<Vec<_>, _>>()?;
         let external_inputs = self
             .external_inputs
             .into_iter()
@@ -402,11 +509,75 @@ impl<'a> Calculation<'a> {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(CalculationResult {
-            production_steps: self.production_steps,
+            production_steps,
             external_inputs,
             display_rate_unit: self.plan.display_rate_unit(),
         })
     }
+}
+
+struct ProductionStepAccumulator {
+    planning_product: CommodityId,
+    recipe: RecipeId,
+    machine: MachineId,
+    required_output_rate: f64,
+    craft_rate: f64,
+    fractional_machine_count: f64,
+    ingredients: BTreeMap<CommodityId, f64>,
+}
+
+impl ProductionStepAccumulator {
+    fn finish(self) -> Result<ProductionStep, PlannerError> {
+        let fractional_machine_count = checked_positive(
+            self.fractional_machine_count,
+            "aggregated fractional machine count",
+        )?;
+        let installed_machine_count =
+            checked_installed_machine_count(fractional_machine_count.get())?;
+        let ingredients = self
+            .ingredients
+            .into_iter()
+            .map(|(commodity, rate)| {
+                checked_positive(rate, "aggregated ingredient rate per second")
+                    .map(|rate| CommodityRate { commodity, rate })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ProductionStep {
+            planning_product: self.planning_product,
+            recipe: self.recipe,
+            machine: self.machine,
+            required_output_rate: checked_positive(
+                self.required_output_rate,
+                "aggregated required output rate per second",
+            )?,
+            craft_rate: checked_positive(self.craft_rate, "aggregated craft rate per second")?,
+            fractional_machine_count,
+            installed_machine_count,
+            ingredients,
+        })
+    }
+}
+
+fn aggregate_target_rates(
+    targets: &[Target],
+) -> Result<Vec<(CommodityId, Positive)>, PlannerError> {
+    let mut rates_by_commodity = BTreeMap::<CommodityId, Vec<f64>>::new();
+    for target in targets {
+        rates_by_commodity
+            .entry(target.commodity().clone())
+            .or_default()
+            .push(target.rate_per_second().get());
+    }
+
+    rates_by_commodity
+        .into_iter()
+        .map(|(commodity, mut rates)| {
+            rates.sort_by(f64::total_cmp);
+            checked_positive(rates.into_iter().sum(), "aggregated target rate per second")
+                .map(|rate| (commodity, rate))
+        })
+        .collect()
 }
 
 fn checked_positive(value: f64, quantity: &'static str) -> Result<Positive, PlannerError> {
