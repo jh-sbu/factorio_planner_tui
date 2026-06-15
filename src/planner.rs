@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::catalog::{
-    Catalog, CommodityId, Finite, Fuel, FuelCategory, FuelId, ItemId, Machine, MachineEnergySource,
-    MachineId, ModuleEffect, ModuleId, NonNegative, NumericError, Positive, Recipe, RecipeCategory,
-    RecipeId, UnsupportedEnergySource,
+    BeltId, Catalog, CommodityId, Finite, Fuel, FuelCategory, FuelId, ItemId, Machine,
+    MachineEnergySource, MachineId, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
+    Recipe, RecipeCategory, RecipeId, UnsupportedEnergySource,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -67,6 +67,7 @@ pub struct FactoryPlan {
     machine_choices: BTreeMap<RecipeId, MachineId>,
     module_choices: BTreeMap<CommodityId, Vec<ModuleId>>,
     fuel_choices: BTreeMap<CommodityId, FuelId>,
+    selected_belt: Option<BeltId>,
     display_rate_unit: RateUnit,
 }
 
@@ -80,6 +81,7 @@ impl FactoryPlan {
             machine_choices: BTreeMap::new(),
             module_choices: BTreeMap::new(),
             fuel_choices: BTreeMap::new(),
+            selected_belt: None,
             display_rate_unit: RateUnit::default(),
         }
     }
@@ -139,6 +141,12 @@ impl FactoryPlan {
     #[must_use]
     pub const fn with_display_rate_unit(mut self, display_rate_unit: RateUnit) -> Self {
         self.display_rate_unit = display_rate_unit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_selected_belt(mut self, belt: BeltId) -> Self {
+        self.selected_belt = Some(belt);
         self
     }
 
@@ -244,6 +252,19 @@ impl FactoryPlan {
         &self.fuel_choices
     }
 
+    pub fn set_selected_belt(&mut self, belt: BeltId) -> Option<BeltId> {
+        self.selected_belt.replace(belt)
+    }
+
+    pub fn clear_selected_belt(&mut self) -> Option<BeltId> {
+        self.selected_belt.take()
+    }
+
+    #[must_use]
+    pub const fn selected_belt(&self) -> Option<&BeltId> {
+        self.selected_belt.as_ref()
+    }
+
     #[must_use]
     pub const fn display_rate_unit(&self) -> RateUnit {
         self.display_rate_unit
@@ -273,6 +294,42 @@ impl CommodityRate {
     #[must_use]
     pub const fn rate(&self) -> Positive {
         self.rate
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BeltEquivalent {
+    commodity: CommodityId,
+    rate: Positive,
+    belt: BeltId,
+    exact_belts: Positive,
+    installed_belts: u64,
+}
+
+impl BeltEquivalent {
+    #[must_use]
+    pub const fn commodity(&self) -> &CommodityId {
+        &self.commodity
+    }
+
+    #[must_use]
+    pub const fn rate(&self) -> Positive {
+        self.rate
+    }
+
+    #[must_use]
+    pub const fn belt(&self) -> &BeltId {
+        &self.belt
+    }
+
+    #[must_use]
+    pub const fn exact_belts(&self) -> Positive {
+        self.exact_belts
+    }
+
+    #[must_use]
+    pub const fn installed_belts(&self) -> u64 {
+        self.installed_belts
     }
 }
 
@@ -424,6 +481,9 @@ impl ProductionStep {
 pub struct CalculationResult {
     production_steps: Vec<ProductionStep>,
     external_inputs: Vec<CommodityRate>,
+    item_flows: Vec<CommodityRate>,
+    fluid_flows: Vec<CommodityRate>,
+    belt_equivalents: Vec<BeltEquivalent>,
     surplus: Vec<CommodityRate>,
     electric_power: Option<ElectricPower>,
     burner_fuel_demand: Vec<FuelUsage>,
@@ -439,6 +499,21 @@ impl CalculationResult {
     #[must_use]
     pub fn external_inputs(&self) -> &[CommodityRate] {
         &self.external_inputs
+    }
+
+    #[must_use]
+    pub fn item_flows(&self) -> &[CommodityRate] {
+        &self.item_flows
+    }
+
+    #[must_use]
+    pub fn fluid_flows(&self) -> &[CommodityRate] {
+        &self.fluid_flows
+    }
+
+    #[must_use]
+    pub fn belt_equivalents(&self) -> &[BeltEquivalent] {
+        &self.belt_equivalents
     }
 
     #[must_use]
@@ -579,6 +654,8 @@ pub enum PlannerError {
         machine: MachineId,
         fuel: FuelId,
     },
+    #[error("selected belt {belt} is not present in the catalog")]
+    MissingBeltChoice { belt: BeltId },
     #[error("selected production dependencies contain a cycle: {path:?}")]
     Cycle { path: Vec<CommodityId> },
     #[error("calculated {quantity} is invalid: {value}")]
@@ -994,10 +1071,17 @@ impl<'a> Calculation<'a> {
         let surplus = aggregate_surplus(&production_steps)?;
         let electric_power = aggregate_electric_power(&production_steps)?;
         let burner_fuel_demand = aggregate_burner_fuel_demand(&production_steps)?;
+        let (item_flows, fluid_flows) =
+            aggregate_logistics_flows(&production_steps, &external_inputs)?;
+        let belt_equivalents =
+            calculate_belt_equivalents(self.catalog, self.plan.selected_belt(), &item_flows)?;
 
         Ok(CalculationResult {
             production_steps,
             external_inputs,
+            item_flows,
+            fluid_flows,
+            belt_equivalents,
             surplus,
             electric_power,
             burner_fuel_demand,
@@ -1587,6 +1671,94 @@ fn aggregate_burner_fuel_demand(
         .collect()
 }
 
+fn aggregate_logistics_flows(
+    production_steps: &[ProductionStep],
+    external_inputs: &[CommodityRate],
+) -> Result<(Vec<CommodityRate>, Vec<CommodityRate>), PlannerError> {
+    let mut flows = BTreeMap::<CommodityId, f64>::new();
+    for step in production_steps {
+        for product in step.products() {
+            add_rate(
+                &mut flows,
+                product,
+                "aggregated logistics flow rate per second",
+            )?;
+        }
+        if let StepEnergy::Burner(fuel_usage) = step.energy()
+            && let Some(burnt_result) = fuel_usage.burnt_result()
+        {
+            add_rate(
+                &mut flows,
+                burnt_result,
+                "aggregated burnt-result logistics flow rate per second",
+            )?;
+        }
+    }
+    for external_input in external_inputs {
+        add_rate(
+            &mut flows,
+            external_input,
+            "aggregated external logistics flow rate per second",
+        )?;
+    }
+
+    let mut item_flows = Vec::new();
+    let mut fluid_flows = Vec::new();
+    for (commodity, rate) in flows {
+        let rate = checked_positive(rate, "aggregated logistics flow rate per second")?;
+        let flow = CommodityRate { commodity, rate };
+        match flow.commodity() {
+            CommodityId::Item(_) => item_flows.push(flow),
+            CommodityId::Fluid(_) => fluid_flows.push(flow),
+        }
+    }
+    Ok((item_flows, fluid_flows))
+}
+
+fn add_rate(
+    rates: &mut BTreeMap<CommodityId, f64>,
+    rate: &CommodityRate,
+    quantity: &'static str,
+) -> Result<(), PlannerError> {
+    let total = rates.entry(rate.commodity().clone()).or_default();
+    *total += rate.rate().get();
+    checked_positive(*total, quantity)?;
+    Ok(())
+}
+
+fn calculate_belt_equivalents(
+    catalog: &Catalog,
+    selected_belt: Option<&BeltId>,
+    item_flows: &[CommodityRate],
+) -> Result<Vec<BeltEquivalent>, PlannerError> {
+    let Some(selected_belt) = selected_belt else {
+        return Ok(Vec::new());
+    };
+    let belt = catalog
+        .belt(selected_belt)
+        .ok_or_else(|| PlannerError::MissingBeltChoice {
+            belt: selected_belt.clone(),
+        })?;
+
+    item_flows
+        .iter()
+        .map(|flow| {
+            let exact_belts = checked_positive(
+                flow.rate().get() / belt.throughput().get(),
+                "exact belt capacity equivalent",
+            )?;
+            let installed_belts = checked_installed_belt_count(exact_belts.get())?;
+            Ok(BeltEquivalent {
+                commodity: flow.commodity().clone(),
+                rate: flow.rate(),
+                belt: belt.id().clone(),
+                exact_belts,
+                installed_belts,
+            })
+        })
+        .collect()
+}
+
 struct FuelUsageAccumulator {
     fuel: FuelId,
     fuel_item: ItemId,
@@ -1637,12 +1809,20 @@ fn checked_positive(value: f64, quantity: &'static str) -> Result<Positive, Plan
     Positive::new(value).map_err(|_| PlannerError::InvalidCalculatedValue { quantity, value })
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn checked_installed_machine_count(value: f64) -> Result<u64, PlannerError> {
+    checked_ceiled_count(value, "installed machine count")
+}
+
+fn checked_installed_belt_count(value: f64) -> Result<u64, PlannerError> {
+    checked_ceiled_count(value, "installed belt count")
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn checked_ceiled_count(value: f64, quantity: &'static str) -> Result<u64, PlannerError> {
     let installed = value.ceil();
     if installed >= 2_f64.powi(64) {
         return Err(PlannerError::InvalidCalculatedValue {
-            quantity: "installed machine count",
+            quantity,
             value: installed,
         });
     }

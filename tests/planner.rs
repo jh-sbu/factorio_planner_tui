@@ -1,7 +1,8 @@
 use factorio_planner_tui::catalog::{
-    Catalog, CatalogParts, Commodity, CommodityId, Finite, Fuel, FuelCategory, FuelId, ItemId,
-    Machine, MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId,
-    NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId, UnsupportedEnergySource,
+    Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, Fuel,
+    FuelCategory, FuelId, ItemId, Machine, MachineEnergySource, MachineId, Module, ModuleCategory,
+    ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId,
+    UnsupportedEnergySource,
 };
 use factorio_planner_tui::planner::{
     FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit, StepEnergy, Target,
@@ -11,6 +12,10 @@ use proptest::prelude::*;
 
 fn item(name: &str) -> CommodityId {
     CommodityId::Item(ItemId::new(name).expect("test item ID should be valid"))
+}
+
+fn fluid(name: &str) -> CommodityId {
+    CommodityId::Fluid(FluidId::new(name).expect("test fluid ID should be valid"))
 }
 
 fn item_id(name: &str) -> ItemId {
@@ -31,6 +36,10 @@ fn module_id(name: &str) -> ModuleId {
 
 fn fuel_id(name: &str) -> FuelId {
     FuelId::new(name).expect("test fuel ID should be valid")
+}
+
+fn belt_id(name: &str) -> BeltId {
+    BeltId::new(name).expect("test belt ID should be valid")
 }
 
 fn positive(value: f64) -> Positive {
@@ -314,6 +323,39 @@ fn test_fuel(name: &str, category: &str, value: f64, burnt_result: Option<&str>)
         positive(value),
         burnt_result.map(item_id),
     )
+}
+
+fn belt(name: &str, throughput: f64) -> Belt {
+    Belt::new(belt_id(name), positive(throughput))
+}
+
+fn catalog_with_belts(
+    commodities: impl IntoIterator<Item = CommodityId>,
+    recipes: Vec<Recipe>,
+    machines: Vec<Machine>,
+    belts: Vec<Belt>,
+) -> Catalog {
+    Catalog::try_from_parts(CatalogParts {
+        commodities: commodities
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        recipes,
+        machines,
+        belts,
+        ..CatalogParts::default()
+    })
+    .unwrap()
+}
+
+fn belt_equivalent_for<'a>(
+    equivalents: &'a [factorio_planner_tui::planner::BeltEquivalent],
+    commodity: &CommodityId,
+) -> &'a factorio_planner_tui::planner::BeltEquivalent {
+    equivalents
+        .iter()
+        .find(|equivalent| equivalent.commodity() == commodity)
+        .expect("expected belt equivalent")
 }
 
 #[test]
@@ -1763,6 +1805,153 @@ fn skips_unsupported_default_energy_sources_and_rejects_explicit_ones() {
             energy_source: UnsupportedEnergySource::Fluid,
         })
     );
+}
+
+#[test]
+fn summarizes_item_and_fluid_flows_without_belt_equivalents_when_no_belt_is_selected() {
+    let plate = item("plate");
+    let water = fluid("water");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone(), water.clone()],
+        vec![recipe(
+            "plate",
+            &crafting,
+            1.0,
+            vec![(water.clone(), 2.0)],
+            plate.clone(),
+            1.0,
+        )],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(plate.clone(), 3.0))).unwrap();
+
+    assert_eq!(result.item_flows().len(), 1);
+    assert_eq!(result.item_flows()[0].commodity(), &plate);
+    assert_close(rate_for(result.item_flows(), &plate), 3.0);
+    assert_eq!(result.fluid_flows().len(), 1);
+    assert_eq!(result.fluid_flows()[0].commodity(), &water);
+    assert_close(rate_for(result.fluid_flows(), &water), 6.0);
+    assert!(result.belt_equivalents().is_empty());
+}
+
+#[test]
+fn selected_belt_reports_exact_and_rounded_equivalents_for_multiple_item_flows() {
+    let ore = item("ore");
+    let plate = item("plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog_with_belts(
+        [ore.clone(), plate.clone()],
+        vec![recipe(
+            "plate",
+            &crafting,
+            1.0,
+            vec![(ore.clone(), 1.0)],
+            plate.clone(),
+            1.0,
+        )],
+        vec![machine("assembler", [crafting], 1.0)],
+        vec![belt("transport-belt", 15.0)],
+    );
+    let plan =
+        FactoryPlan::new(target(plate.clone(), 22.5)).with_selected_belt(belt_id("transport-belt"));
+
+    let result = calculate(&catalog, &plan).unwrap();
+
+    assert_eq!(
+        result
+            .belt_equivalents()
+            .iter()
+            .map(factorio_planner_tui::planner::BeltEquivalent::commodity)
+            .collect::<Vec<_>>(),
+        [&ore, &plate]
+    );
+    for commodity in [&ore, &plate] {
+        let equivalent = belt_equivalent_for(result.belt_equivalents(), commodity);
+        assert_eq!(equivalent.belt(), &belt_id("transport-belt"));
+        assert_close(equivalent.rate().get(), 22.5);
+        assert_close(equivalent.exact_belts().get(), 1.5);
+        assert_eq!(equivalent.installed_belts(), 2);
+    }
+}
+
+#[test]
+fn rejects_missing_selected_belt() {
+    let plate = item("plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog(
+        [plate.clone()],
+        vec![recipe("plate", &crafting, 1.0, vec![], plate.clone(), 1.0)],
+        vec![machine("assembler", [crafting], 1.0)],
+    );
+    let plan = FactoryPlan::new(target(plate, 1.0)).with_selected_belt(belt_id("missing"));
+
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::MissingBeltChoice {
+            belt: belt_id("missing"),
+        })
+    );
+}
+
+#[test]
+fn selected_belt_does_not_create_fluid_capacity_equivalents() {
+    let water = fluid("water");
+    let pumping = RecipeCategory::new("pumping").unwrap();
+    let catalog = catalog_with_belts(
+        [water.clone()],
+        vec![recipe("water", &pumping, 1.0, vec![], water.clone(), 30.0)],
+        vec![machine("pump", [pumping], 1.0)],
+        vec![belt("transport-belt", 15.0)],
+    );
+    let plan =
+        FactoryPlan::new(target(water.clone(), 30.0)).with_selected_belt(belt_id("transport-belt"));
+
+    let result = calculate(&catalog, &plan).unwrap();
+
+    assert!(result.item_flows().is_empty());
+    assert_eq!(result.fluid_flows().len(), 1);
+    assert_close(rate_for(result.fluid_flows(), &water), 30.0);
+    assert!(result.belt_equivalents().is_empty());
+}
+
+#[test]
+fn burnt_results_are_included_once_in_item_flows() {
+    let coal = item("coal");
+    let ash = item("ash");
+    let plate = item("plate");
+    let smelting = RecipeCategory::new("smelting").unwrap();
+    let burner = Machine::new(
+        machine_id("furnace"),
+        [smelting.clone()],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(100.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(1.0),
+        },
+    )
+    .unwrap();
+    let catalog = catalog_with_energy(
+        [coal.clone(), ash.clone(), plate.clone()],
+        vec![recipe("plate", &smelting, 1.0, vec![], plate.clone(), 1.0)],
+        vec![burner],
+        vec![],
+        vec![test_fuel("coal", "chemical", 1_000.0, Some("ash"))],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(plate.clone(), 2.0))).unwrap();
+
+    assert_eq!(result.item_flows().len(), 3);
+    assert_close(rate_for(result.item_flows(), &plate), 2.0);
+    assert_close(rate_for(result.item_flows(), &coal), 0.2);
+    assert_close(rate_for(result.item_flows(), &ash), 0.2);
 }
 
 #[test]
