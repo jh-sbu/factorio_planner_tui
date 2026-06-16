@@ -19,10 +19,13 @@ use crate::import::{
     DiagnosticSeverity, ImportDiagnostic, ImportError, LocaleError, LocalePrototypeKind,
     PrototypeDisposition, parse_data_raw, parse_data_raw_with_locale, parse_prototype_locale,
 };
+use crate::planner::{FactoryPlan, RateUnit, Target};
 
 pub const PROFILE_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const CATALOG_SCHEMA_VERSION: u32 = 2;
 pub const IMPORTER_SCHEMA_VERSION: u32 = 2;
+pub const PLAN_SCHEMA_VERSION: u32 = 1;
+pub const PLAN_FILE_SUFFIX: &str = ".fptplan.json";
 
 const INDEX_FILE_NAME: &str = "profiles.json";
 const CATALOG_DIRECTORY_NAME: &str = "catalogs";
@@ -66,6 +69,48 @@ pub enum ProfileNameError {
     #[error("profile name must not be empty")]
     Empty,
     #[error("profile name must not contain control characters")]
+    ControlCharacter,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PlanName(String);
+
+impl PlanName {
+    /// Creates a case-sensitive plan name after trimming outer whitespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanNameError`] for empty names or names containing control
+    /// characters.
+    pub fn new(value: impl Into<String>) -> Result<Self, PlanNameError> {
+        let value = value.into();
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(PlanNameError::Empty);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(PlanNameError::ControlCharacter);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PlanName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PlanNameError {
+    #[error("plan name must not be empty")]
+    Empty,
+    #[error("plan name must not contain control characters")]
     ControlCharacter,
 }
 
@@ -374,6 +419,25 @@ impl ProfileStore {
         stored.to_profile(name.clone(), fingerprint, catalog)
     }
 
+    /// Finds the first profile in lexical name order with an exact dataset
+    /// fingerprint match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the profile index or matching cached catalog
+    /// cannot be read.
+    pub fn find_by_fingerprint(
+        &self,
+        fingerprint: &DatasetFingerprint,
+    ) -> Result<Option<DatasetProfile>, ProfileError> {
+        for summary in self.list()? {
+            if summary.fingerprint() == fingerprint {
+                return self.open(summary.name()).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     /// Selects the active profile.
     ///
     /// # Errors
@@ -501,6 +565,313 @@ impl ProfileStore {
         }
         file.catalog.try_into()
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanDocument {
+    name: PlanName,
+    dataset_profile: ProfileName,
+    dataset_fingerprint: DatasetFingerprint,
+    plan: FactoryPlan,
+    dirty: bool,
+}
+
+impl PlanDocument {
+    #[must_use]
+    pub const fn new(
+        name: PlanName,
+        dataset_profile: ProfileName,
+        dataset_fingerprint: DatasetFingerprint,
+        plan: FactoryPlan,
+    ) -> Self {
+        Self {
+            name,
+            dataset_profile,
+            dataset_fingerprint,
+            plan,
+            dirty: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &PlanName {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn dataset_profile(&self) -> &ProfileName {
+        &self.dataset_profile
+    }
+
+    #[must_use]
+    pub const fn dataset_fingerprint(&self) -> &DatasetFingerprint {
+        &self.dataset_fingerprint
+    }
+
+    #[must_use]
+    pub const fn plan(&self) -> &FactoryPlan {
+        &self.plan
+    }
+
+    #[must_use]
+    pub const fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn edit_plan<R>(&mut self, edit: impl FnOnce(&mut FactoryPlan) -> R) -> R {
+        let result = edit(&mut self.plan);
+        self.dirty = true;
+        result
+    }
+
+    /// Applies a fallible edit and marks the document dirty only after success.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closure's error and leaves the dirty flag unchanged when the
+    /// edit fails.
+    pub fn try_edit_plan<R, E>(
+        &mut self,
+        edit: impl FnOnce(&mut FactoryPlan) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let result = edit(&mut self.plan)?;
+        self.dirty = true;
+        Ok(result)
+    }
+
+    fn loaded(
+        name: PlanName,
+        dataset_profile: ProfileName,
+        dataset_fingerprint: DatasetFingerprint,
+        plan: FactoryPlan,
+    ) -> Self {
+        Self {
+            name,
+            dataset_profile,
+            dataset_fingerprint,
+            plan,
+            dirty: false,
+        }
+    }
+
+    fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    fn bind_dataset(&mut self, profile: &DatasetProfile) {
+        self.dataset_profile = profile.name().clone();
+        self.dataset_fingerprint = profile.fingerprint().clone();
+        self.dirty = true;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlanOpenResult {
+    Ready(PlanDocument),
+    Blocked(BlockedPlanDocument),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockedPlanDocument {
+    document: PlanDocument,
+    reason: PlanOpenBlockReason,
+}
+
+impl BlockedPlanDocument {
+    #[must_use]
+    pub const fn document(&self) -> &PlanDocument {
+        &self.document
+    }
+
+    #[must_use]
+    pub const fn reason(&self) -> &PlanOpenBlockReason {
+        &self.reason
+    }
+
+    #[must_use]
+    pub fn into_document(self) -> PlanDocument {
+        self.document
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanOpenBlockReason {
+    NamedProfileFingerprintMismatch {
+        profile: ProfileName,
+        expected: DatasetFingerprint,
+        found: DatasetFingerprint,
+    },
+    DatasetProfileNotFound {
+        profile: ProfileName,
+        fingerprint: DatasetFingerprint,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum MissingPlanReference {
+    TargetCommodity(CommodityId),
+    ExternalInput(CommodityId),
+    RecipeChoiceCommodity(CommodityId),
+    RecipeChoiceRecipe {
+        commodity: CommodityId,
+        recipe: RecipeId,
+    },
+    MachineChoiceRecipe(RecipeId),
+    MachineChoiceMachine {
+        recipe: RecipeId,
+        machine: MachineId,
+    },
+    ModuleChoiceCommodity(CommodityId),
+    ModuleChoiceModule {
+        commodity: CommodityId,
+        module: ModuleId,
+    },
+    FuelChoiceCommodity(CommodityId),
+    FuelChoiceFuel {
+        commodity: CommodityId,
+        fuel: FuelId,
+    },
+    SelectedBelt(BeltId),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PlanFileStore;
+
+impl PlanFileStore {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Saves a versioned factory plan atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for invalid suffixes or filesystem failures.
+    pub fn save(&self, path: &Path, document: &mut PlanDocument) -> Result<(), PlanFileError> {
+        ensure_plan_suffix(path)?;
+        let file = PlanFile::from(&*document);
+        atomic_write_plan_json(path, &file)?;
+        document.mark_clean();
+        Ok(())
+    }
+
+    /// Loads a factory plan file without checking dataset availability.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for invalid suffixes, unsupported schema
+    /// versions, invalid JSON, invalid domain values, or filesystem failures.
+    pub fn load(&self, path: &Path) -> Result<PlanDocument, PlanFileError> {
+        ensure_plan_suffix(path)?;
+        let bytes = read_plan_file(path, "read plan file")?;
+        let version = parse_plan_version(&bytes, path)?;
+        if version != PLAN_SCHEMA_VERSION {
+            return Err(PlanFileError::UnsupportedPlanSchema {
+                found: version,
+                supported: PLAN_SCHEMA_VERSION,
+            });
+        }
+        serde_json::from_slice::<PlanFile>(&bytes)
+            .map_err(|error| PlanFileError::InvalidJson {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?
+            .into_document()
+    }
+
+    /// Opens a factory plan and validates its dataset binding against stored
+    /// profiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for unreadable plan files or profile-store
+    /// failures.
+    pub fn open(
+        &self,
+        path: &Path,
+        profiles: &ProfileStore,
+    ) -> Result<PlanOpenResult, PlanFileError> {
+        let mut document = self.load(path)?;
+        match profiles.open(document.dataset_profile()) {
+            Ok(profile) if profile.fingerprint() == document.dataset_fingerprint() => {
+                Ok(PlanOpenResult::Ready(document))
+            }
+            Ok(profile) => Ok(PlanOpenResult::Blocked(BlockedPlanDocument {
+                reason: PlanOpenBlockReason::NamedProfileFingerprintMismatch {
+                    profile: document.dataset_profile().clone(),
+                    expected: document.dataset_fingerprint().clone(),
+                    found: profile.fingerprint().clone(),
+                },
+                document,
+            })),
+            Err(ProfileError::ProfileNotFound { .. }) => {
+                if let Some(profile) =
+                    profiles.find_by_fingerprint(document.dataset_fingerprint())?
+                {
+                    document.bind_dataset(&profile);
+                    return Ok(PlanOpenResult::Ready(document));
+                }
+                Ok(PlanOpenResult::Blocked(BlockedPlanDocument {
+                    reason: PlanOpenBlockReason::DatasetProfileNotFound {
+                        profile: document.dataset_profile().clone(),
+                        fingerprint: document.dataset_fingerprint().clone(),
+                    },
+                    document,
+                }))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Explicitly binds a blocked plan to a different dataset profile after
+    /// validating that persisted references still exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlanFileError::MissingReferences`] when persisted IDs cannot
+    /// be found in the candidate profile catalog.
+    pub fn rebind(
+        &self,
+        blocked: BlockedPlanDocument,
+        profile: &DatasetProfile,
+    ) -> Result<PlanDocument, PlanFileError> {
+        let mut document = blocked.into_document();
+        let references = missing_plan_references(document.plan(), profile.catalog());
+        if !references.is_empty() {
+            return Err(PlanFileError::MissingReferences { references });
+        }
+        document.bind_dataset(profile);
+        Ok(document)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum PlanFileError {
+    #[error("plan file path must end with {expected_suffix}: {path}")]
+    InvalidPlanSuffix {
+        path: PathBuf,
+        expected_suffix: &'static str,
+    },
+    #[error("plan schema version {found} is unsupported; current version is {supported}")]
+    UnsupportedPlanSchema { found: u32, supported: u32 },
+    #[error("invalid JSON in {path}: {message}")]
+    InvalidJson { path: PathBuf, message: String },
+    #[error("invalid plan file: {message}")]
+    InvalidPlan { message: String },
+    #[error("plan references are missing from the selected dataset: {references:?}")]
+    MissingReferences {
+        references: Vec<MissingPlanReference>,
+    },
+    #[error("{operation} at {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Profile(#[from] ProfileError),
 }
 
 #[derive(Debug, Error)]
@@ -1209,6 +1580,244 @@ impl CommodityIdDto {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct PlanFile {
+    schema_version: u32,
+    name: String,
+    dataset_profile: String,
+    dataset_fingerprint: String,
+    plan: FactoryPlanDto,
+}
+
+impl From<&PlanDocument> for PlanFile {
+    fn from(document: &PlanDocument) -> Self {
+        Self {
+            schema_version: PLAN_SCHEMA_VERSION,
+            name: document.name().as_str().to_owned(),
+            dataset_profile: document.dataset_profile().as_str().to_owned(),
+            dataset_fingerprint: document.dataset_fingerprint().as_str().to_owned(),
+            plan: FactoryPlanDto::from(document.plan()),
+        }
+    }
+}
+
+impl PlanFile {
+    fn into_document(self) -> Result<PlanDocument, PlanFileError> {
+        let name = PlanName::new(self.name).map_err(|error| invalid_plan(error.to_string()))?;
+        let dataset_profile = ProfileName::new(self.dataset_profile)
+            .map_err(|error| invalid_plan(error.to_string()))?;
+        let dataset_fingerprint = plan_dataset_fingerprint(self.dataset_fingerprint)?;
+        Ok(PlanDocument::loaded(
+            name,
+            dataset_profile,
+            dataset_fingerprint,
+            self.plan.into_plan()?,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FactoryPlanDto {
+    targets: Vec<TargetDto>,
+    external_inputs: Vec<CommodityIdDto>,
+    recipe_choices: Vec<RecipeChoiceDto>,
+    machine_choices: Vec<MachineChoiceDto>,
+    module_choices: Vec<ModuleChoiceDto>,
+    fuel_choices: Vec<FuelChoiceDto>,
+    selected_belt: Option<String>,
+    display_rate_unit: RateUnitDto,
+}
+
+impl From<&FactoryPlan> for FactoryPlanDto {
+    fn from(plan: &FactoryPlan) -> Self {
+        Self {
+            targets: plan.targets().iter().map(TargetDto::from).collect(),
+            external_inputs: plan
+                .external_inputs()
+                .iter()
+                .map(CommodityIdDto::from)
+                .collect(),
+            recipe_choices: plan
+                .recipe_choices()
+                .iter()
+                .map(|(commodity, recipe)| RecipeChoiceDto {
+                    commodity: commodity.into(),
+                    recipe: recipe.as_str().to_owned(),
+                })
+                .collect(),
+            machine_choices: plan
+                .machine_choices()
+                .iter()
+                .map(|(recipe, machine)| MachineChoiceDto {
+                    recipe: recipe.as_str().to_owned(),
+                    machine: machine.as_str().to_owned(),
+                })
+                .collect(),
+            module_choices: plan
+                .module_choices()
+                .iter()
+                .map(|(commodity, modules)| ModuleChoiceDto {
+                    commodity: commodity.into(),
+                    modules: modules
+                        .iter()
+                        .map(|module| module.as_str().to_owned())
+                        .collect(),
+                })
+                .collect(),
+            fuel_choices: plan
+                .fuel_choices()
+                .iter()
+                .map(|(commodity, fuel)| FuelChoiceDto {
+                    commodity: commodity.into(),
+                    fuel: fuel.as_str().to_owned(),
+                })
+                .collect(),
+            selected_belt: plan.selected_belt().map(|belt| belt.as_str().to_owned()),
+            display_rate_unit: plan.display_rate_unit().into(),
+        }
+    }
+}
+
+impl FactoryPlanDto {
+    fn into_plan(self) -> Result<FactoryPlan, PlanFileError> {
+        let mut targets = self.targets.into_iter();
+        let first_target = targets
+            .next()
+            .ok_or_else(|| invalid_plan("plan must contain at least one target"))?
+            .into_target()?;
+        let mut plan = FactoryPlan::new(first_target);
+        for target in targets {
+            plan.add_target(target.into_target()?);
+        }
+
+        plan = plan
+            .with_external_inputs(collect_unique_plan_commodities(
+                self.external_inputs,
+                "external input",
+            )?)
+            .with_display_rate_unit(self.display_rate_unit.into());
+        if let Some(selected_belt) = self.selected_belt {
+            plan.set_selected_belt(plan_belt_id(selected_belt)?);
+        }
+
+        for choice in self.recipe_choices {
+            let commodity = plan_commodity_id(choice.commodity)?;
+            let recipe = plan_recipe_id(choice.recipe)?;
+            if plan.set_recipe_choice(commodity.clone(), recipe).is_some() {
+                return Err(invalid_plan(format!(
+                    "duplicate recipe choice for commodity {commodity}"
+                )));
+            }
+        }
+        for choice in self.machine_choices {
+            let recipe = plan_recipe_id(choice.recipe)?;
+            let machine = plan_machine_id(choice.machine)?;
+            if plan.set_machine_choice(recipe.clone(), machine).is_some() {
+                return Err(invalid_plan(format!(
+                    "duplicate machine choice for recipe {recipe}"
+                )));
+            }
+        }
+        for choice in self.module_choices {
+            let commodity = plan_commodity_id(choice.commodity)?;
+            let modules = choice
+                .modules
+                .into_iter()
+                .map(plan_module_id)
+                .collect::<Result<Vec<_>, _>>()?;
+            if plan.set_modules(commodity.clone(), modules).is_some() {
+                return Err(invalid_plan(format!(
+                    "duplicate module choice for commodity {commodity}"
+                )));
+            }
+        }
+        for choice in self.fuel_choices {
+            let commodity = plan_commodity_id(choice.commodity)?;
+            let fuel = plan_fuel_id(choice.fuel)?;
+            if plan.set_fuel_choice(commodity.clone(), fuel).is_some() {
+                return Err(invalid_plan(format!(
+                    "duplicate fuel choice for commodity {commodity}"
+                )));
+            }
+        }
+        Ok(plan)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TargetDto {
+    commodity: CommodityIdDto,
+    rate_per_second: f64,
+}
+
+impl From<&Target> for TargetDto {
+    fn from(target: &Target) -> Self {
+        Self {
+            commodity: target.commodity().into(),
+            rate_per_second: target.rate_per_second().get(),
+        }
+    }
+}
+
+impl TargetDto {
+    fn into_target(self) -> Result<Target, PlanFileError> {
+        Target::new(plan_commodity_id(self.commodity)?, self.rate_per_second)
+            .map_err(|error| invalid_plan(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RecipeChoiceDto {
+    commodity: CommodityIdDto,
+    recipe: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct MachineChoiceDto {
+    recipe: String,
+    machine: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ModuleChoiceDto {
+    commodity: CommodityIdDto,
+    modules: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FuelChoiceDto {
+    commodity: CommodityIdDto,
+    fuel: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RateUnitDto {
+    Second,
+    Minute,
+    Hour,
+}
+
+impl From<RateUnit> for RateUnitDto {
+    fn from(unit: RateUnit) -> Self {
+        match unit {
+            RateUnit::Second => Self::Second,
+            RateUnit::Minute => Self::Minute,
+            RateUnit::Hour => Self::Hour,
+        }
+    }
+}
+
+impl From<RateUnitDto> for RateUnit {
+    fn from(unit: RateUnitDto) -> Self {
+        match unit {
+            RateUnitDto::Second => Self::Second,
+            RateUnitDto::Minute => Self::Minute,
+            RateUnitDto::Hour => Self::Hour,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct CommodityDto {
     id: CommodityIdDto,
     localized_name: Option<String>,
@@ -1660,6 +2269,222 @@ impl BeltDto {
         Ok(Belt::new(belt_id(self.id)?, positive(self.throughput)?)
             .with_localized_name(self.localized_name))
     }
+}
+
+fn missing_plan_references(plan: &FactoryPlan, catalog: &Catalog) -> Vec<MissingPlanReference> {
+    let mut references = BTreeSet::new();
+    for target in plan.targets() {
+        if catalog.commodity(target.commodity()).is_none() {
+            references.insert(MissingPlanReference::TargetCommodity(
+                target.commodity().clone(),
+            ));
+        }
+    }
+    for commodity in plan.external_inputs() {
+        if catalog.commodity(commodity).is_none() {
+            references.insert(MissingPlanReference::ExternalInput(commodity.clone()));
+        }
+    }
+    for (commodity, recipe) in plan.recipe_choices() {
+        if catalog.commodity(commodity).is_none() {
+            references.insert(MissingPlanReference::RecipeChoiceCommodity(
+                commodity.clone(),
+            ));
+        }
+        if catalog.recipe(recipe).is_none() {
+            references.insert(MissingPlanReference::RecipeChoiceRecipe {
+                commodity: commodity.clone(),
+                recipe: recipe.clone(),
+            });
+        }
+    }
+    for (recipe, machine) in plan.machine_choices() {
+        if catalog.recipe(recipe).is_none() {
+            references.insert(MissingPlanReference::MachineChoiceRecipe(recipe.clone()));
+        }
+        if catalog.machine(machine).is_none() {
+            references.insert(MissingPlanReference::MachineChoiceMachine {
+                recipe: recipe.clone(),
+                machine: machine.clone(),
+            });
+        }
+    }
+    for (commodity, modules) in plan.module_choices() {
+        if catalog.commodity(commodity).is_none() {
+            references.insert(MissingPlanReference::ModuleChoiceCommodity(
+                commodity.clone(),
+            ));
+        }
+        for module in modules {
+            if catalog.module(module).is_none() {
+                references.insert(MissingPlanReference::ModuleChoiceModule {
+                    commodity: commodity.clone(),
+                    module: module.clone(),
+                });
+            }
+        }
+    }
+    for (commodity, fuel) in plan.fuel_choices() {
+        if catalog.commodity(commodity).is_none() {
+            references.insert(MissingPlanReference::FuelChoiceCommodity(commodity.clone()));
+        }
+        if catalog.fuel(fuel).is_none() {
+            references.insert(MissingPlanReference::FuelChoiceFuel {
+                commodity: commodity.clone(),
+                fuel: fuel.clone(),
+            });
+        }
+    }
+    if let Some(belt) = plan.selected_belt()
+        && catalog.belt(belt).is_none()
+    {
+        references.insert(MissingPlanReference::SelectedBelt(belt.clone()));
+    }
+    references.into_iter().collect()
+}
+
+fn collect_unique_plan_commodities(
+    commodities: impl IntoIterator<Item = CommodityIdDto>,
+    label: &'static str,
+) -> Result<BTreeSet<CommodityId>, PlanFileError> {
+    let mut unique = BTreeSet::new();
+    for commodity in commodities {
+        let commodity = plan_commodity_id(commodity)?;
+        if !unique.insert(commodity.clone()) {
+            return Err(invalid_plan(format!("duplicate {label} {commodity}")));
+        }
+    }
+    Ok(unique)
+}
+
+fn ensure_plan_suffix(path: &Path) -> Result<(), PlanFileError> {
+    if path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.ends_with(PLAN_FILE_SUFFIX))
+    {
+        return Ok(());
+    }
+    Err(PlanFileError::InvalidPlanSuffix {
+        path: path.to_path_buf(),
+        expected_suffix: PLAN_FILE_SUFFIX,
+    })
+}
+
+fn read_plan_file(path: &Path, operation: &'static str) -> Result<Vec<u8>, PlanFileError> {
+    fs::read(path).map_err(|error| plan_io_error(operation, path, error))
+}
+
+fn parse_plan_version(bytes: &[u8], path: &Path) -> Result<u32, PlanFileError> {
+    #[derive(Deserialize)]
+    struct VersionProbe {
+        schema_version: u32,
+    }
+
+    serde_json::from_slice::<VersionProbe>(bytes)
+        .map(|probe| probe.schema_version)
+        .map_err(|error| PlanFileError::InvalidJson {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })
+}
+
+fn atomic_write_plan_json(path: &Path, value: &impl Serialize) -> Result<(), PlanFileError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|error| PlanFileError::InvalidJson {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let parent = path.parent().ok_or_else(|| PlanFileError::Io {
+        operation: "resolve atomic-write parent",
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"),
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| plan_io_error("create atomic-write directory", parent, error))?;
+    let file_name = path.file_name().ok_or_else(|| PlanFileError::Io {
+        operation: "resolve atomic-write filename",
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "path has no filename"),
+    })?;
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(".tmp");
+    let temporary_path = path.with_file_name(temporary_name);
+
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary_path)
+            .map_err(|error| plan_io_error("create temporary file", &temporary_path, error))?;
+        file.write_all(&bytes)
+            .map_err(|error| plan_io_error("write temporary file", &temporary_path, error))?;
+        file.flush()
+            .map_err(|error| plan_io_error("flush temporary file", &temporary_path, error))?;
+        file.sync_all()
+            .map_err(|error| plan_io_error("sync temporary file", &temporary_path, error))?;
+        drop(file);
+        fs::rename(&temporary_path, path)
+            .map_err(|error| plan_io_error("replace destination file", path, error))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn plan_io_error(operation: &'static str, path: &Path, source: io::Error) -> PlanFileError {
+    PlanFileError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn invalid_plan(message: impl Into<String>) -> PlanFileError {
+    PlanFileError::InvalidPlan {
+        message: message.into(),
+    }
+}
+
+fn plan_commodity_id(value: CommodityIdDto) -> Result<CommodityId, PlanFileError> {
+    match value {
+        CommodityIdDto::Item(id) => plan_item_id(id).map(CommodityId::Item),
+        CommodityIdDto::Fluid(id) => plan_fluid_id(id).map(CommodityId::Fluid),
+    }
+}
+
+fn plan_item_id(value: String) -> Result<ItemId, PlanFileError> {
+    ItemId::new(value).map_err(|error| invalid_plan(error.to_string()))
+}
+
+fn plan_fluid_id(value: String) -> Result<FluidId, PlanFileError> {
+    FluidId::new(value).map_err(|error| invalid_plan(error.to_string()))
+}
+
+fn plan_recipe_id(value: String) -> Result<RecipeId, PlanFileError> {
+    RecipeId::new(value).map_err(|error| invalid_plan(error.to_string()))
+}
+
+fn plan_machine_id(value: String) -> Result<MachineId, PlanFileError> {
+    MachineId::new(value).map_err(|error| invalid_plan(error.to_string()))
+}
+
+fn plan_module_id(value: String) -> Result<ModuleId, PlanFileError> {
+    ModuleId::new(value).map_err(|error| invalid_plan(error.to_string()))
+}
+
+fn plan_fuel_id(value: String) -> Result<FuelId, PlanFileError> {
+    FuelId::new(value).map_err(|error| invalid_plan(error.to_string()))
+}
+
+fn plan_belt_id(value: String) -> Result<BeltId, PlanFileError> {
+    BeltId::new(value).map_err(|error| invalid_plan(error.to_string()))
+}
+
+fn plan_dataset_fingerprint(value: String) -> Result<DatasetFingerprint, PlanFileError> {
+    DatasetFingerprint::new(value).map_err(|error| invalid_plan(error.to_string()))
 }
 
 fn invalid_catalog(message: String) -> ProfileError {
