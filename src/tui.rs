@@ -12,16 +12,19 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use thiserror::Error;
 use tracing_appender::non_blocking::WorkerGuard;
 
-use crate::app::{Action, App, AppError, ExitState, Overlay, WorkspaceView};
+use crate::app::{Action, App, AppError, ExitState, Overlay, Screen, WorkspaceView};
 use crate::persistence::{PlanFileStore, ProfileStore};
+
+const MIN_TERMINAL_WIDTH: u16 = 60;
+const MIN_TERMINAL_HEIGHT: u16 = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventContext {
@@ -372,38 +375,262 @@ pub fn run_app(
 }
 
 pub fn render(app: &App, frame: &mut Frame<'_>) {
+    let area = frame.area();
+    if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        render_too_small(frame, area);
+        return;
+    }
+
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
 
     let title = Line::from(vec![
         Span::styled("Factorio Planner", Style::default().fg(Color::Green)),
-        Span::raw(format!(" - {:?}", app.screen())),
+        Span::raw(format!(" - {}", screen_title(app.screen()))),
     ]);
     frame.render_widget(
         Paragraph::new(title).block(Block::default().borders(Borders::BOTTOM)),
         header,
     );
 
-    let body_lines = [
-        Line::from(format!("Profiles: {}", app.profiles().len())),
-        Line::from(format!("Workspace view: {:?}", app.workspace_view())),
-        Line::from(app.status_message().map_or_else(
-            || "Status: ready".to_owned(),
-            |message| format!("Status: {message}"),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(body_lines.as_slice()), body);
+    match app.screen() {
+        Screen::Start => render_start_screen(app, frame, body),
+        Screen::Import => render_import_screen(app, frame, body),
+        Screen::Profiles => render_profile_screen(app, frame, body),
+        Screen::PlanningWorkspace => render_workspace_placeholder(app, frame, body),
+        Screen::BlockedPlan => render_blocked_plan(app, frame, body),
+    }
 
     let footer_text = if app.overlay().is_some() {
-        "Esc close | q quit"
+        "Enter confirm | Esc cancel | q quit"
     } else {
-        "? help | t table/tree | q quit"
+        "Import data | Open plan | ? help | q quit"
     };
     frame.render_widget(Paragraph::new(footer_text), footer);
+
+    if let Some(overlay) = app.overlay() {
+        render_overlay(overlay, frame, area);
+    }
+}
+
+fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
+    let lines = vec![
+        Line::from("Terminal too small"),
+        Line::from(format!("Current: {}x{}", area.width, area.height)),
+        Line::from(format!(
+            "Minimum: {MIN_TERMINAL_WIDTH}x{MIN_TERMINAL_HEIGHT}"
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Factorio Planner"),
+        ),
+        area,
+    );
+}
+
+fn render_start_screen(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(area);
+
+    let commands = vec![
+        Line::from("Start"),
+        Line::from(""),
+        Line::from("Import data"),
+        Line::from("Create plan"),
+        Line::from("Open plan"),
+        Line::from("Manage profiles"),
+    ];
+    frame.render_widget(
+        Paragraph::new(commands).block(Block::default().borders(Borders::ALL).title("Actions")),
+        left,
+    );
+
+    render_profile_list(app, frame, right, "Profiles");
+}
+
+fn render_profile_screen(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    render_profile_list(app, frame, area, "Profile Workflows");
+}
+
+fn render_profile_list(app: &App, frame: &mut Frame<'_>, area: Rect, title: &'static str) {
+    let mut lines = vec![Line::from(format!("Profiles ({})", app.profiles().len()))];
+    if app.profiles().is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from("No dataset profiles"));
+        lines.push(Line::from("Import data to create the first profile."));
+    } else {
+        for summary in app.profiles() {
+            let active_marker = if app
+                .active_profile()
+                .is_some_and(|profile| profile.name() == summary.name())
+            {
+                " active"
+            } else {
+                ""
+            };
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!(
+                "{}{} - {}",
+                summary.name(),
+                active_marker,
+                pluralize(summary.warning_count(), "warning")
+            )));
+            lines.push(Line::from(format!(
+                "Fingerprint: {}",
+                summary.fingerprint().as_str()
+            )));
+            lines.push(Line::from(format!(
+                "Data source: {}",
+                summary.metadata().data_source().path().display()
+            )));
+            lines.push(Line::from(format!(
+                "Imported at: {}",
+                summary.metadata().imported_at_unix_seconds()
+            )));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+fn render_import_screen(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let mut lines = vec![Line::from("Import Dataset"), Line::from("")];
+    if let Some(pending) = app.pending_import() {
+        lines.push(Line::from(format!(
+            "Data: {}",
+            pending.data_path().display()
+        )));
+        let locale = pending
+            .locale_path()
+            .map_or_else(|| "none".to_owned(), |path| path.display().to_string());
+        lines.push(Line::from(format!("Locale: {locale}")));
+        let profile = pending
+            .profile()
+            .map_or_else(|| "prompt required".to_owned(), ToString::to_string);
+        lines.push(Line::from(format!("Profile: {profile}")));
+        lines.push(Line::from(""));
+        lines.push(Line::from("Ready to import"));
+    } else if let Some(status) = app.status_message() {
+        lines.push(Line::from(status.to_owned()));
+    } else {
+        lines.push(Line::from("No import is pending"));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("Import")),
+        area,
+    );
+}
+
+fn render_workspace_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let plan_name = app
+        .plan()
+        .map_or_else(|| "No plan".to_owned(), |plan| plan.name().to_string());
+    let lines = vec![
+        Line::from("Planning Workspace"),
+        Line::from(format!("Plan: {plan_name}")),
+        Line::from(format!("Workspace view: {:?}", app.workspace_view())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Workspace")),
+        area,
+    );
+}
+
+fn render_blocked_plan(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let mut lines = vec![Line::from("Plan blocked")];
+    if let Some(blocked) = app.blocked_plan() {
+        lines.push(Line::from(format!("Plan: {}", blocked.document().name())));
+        lines.push(Line::from(format!("Reason: {:?}", blocked.reason())));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Dataset Mismatch"),
+        ),
+        area,
+    );
+}
+
+fn render_overlay(overlay: &Overlay, frame: &mut Frame<'_>, area: Rect) {
+    let overlay_area = centered_rect(area, 52, 7);
+    let lines = match overlay {
+        Overlay::ConfirmExit => vec![
+            Line::from("Discard unsaved changes and exit?"),
+            Line::from("Enter confirm"),
+            Line::from("Esc cancel"),
+        ],
+        Overlay::ConfirmProfileReplace { profile } => vec![
+            Line::from(format!("Replace profile {profile}?")),
+            Line::from("The existing profile mapping will be replaced."),
+            Line::from("Enter confirm"),
+            Line::from("Esc cancel"),
+        ],
+        Overlay::ConfirmProfileDelete { profile } => vec![
+            Line::from(format!("Delete profile {profile}?")),
+            Line::from("Plans bound to this dataset may need rebinding."),
+            Line::from("Enter confirm"),
+            Line::from("Esc cancel"),
+        ],
+        Overlay::Help => vec![
+            Line::from("Help"),
+            Line::from("Use the listed commands to manage profiles and plans."),
+            Line::from("Esc close"),
+        ],
+        Overlay::Diagnostics => vec![Line::from("Diagnostics"), Line::from("Esc close")],
+        Overlay::Selection(_) => vec![Line::from("Selection"), Line::from("Esc close")],
+    };
+    frame.render_widget(Clear, overlay_area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("Confirm")),
+        overlay_area,
+    );
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn screen_title(screen: Screen) -> &'static str {
+    match screen {
+        Screen::Start => "Start",
+        Screen::Import => "Import",
+        Screen::Profiles => "Profiles",
+        Screen::PlanningWorkspace => "Planning",
+        Screen::BlockedPlan => "Blocked Plan",
+    }
+}
+
+fn pluralize(count: usize, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
+    }
 }
 
 #[derive(Debug, Error)]

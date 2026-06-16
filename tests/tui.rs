@@ -1,6 +1,17 @@
+use std::fs;
+use std::path::PathBuf;
+
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use factorio_planner_tui::app::{Action, ExitState, Overlay, WorkspaceView};
-use factorio_planner_tui::tui::{EventContext, TranslatedEvent, translate_event};
+use factorio_planner_tui::app::{Action, App, ExitState, Overlay, WorkspaceView};
+use factorio_planner_tui::cli::StartupMode;
+use factorio_planner_tui::persistence::{
+    PlanFileStore, ProfileImportRequest, ProfileName, ProfileStore,
+};
+use factorio_planner_tui::tui::{EventContext, TranslatedEvent, render, translate_event};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use tempfile::TempDir;
 
 fn key(code: KeyCode, kind: KeyEventKind) -> Event {
     Event::Key(KeyEvent {
@@ -18,6 +29,91 @@ fn ctrl_key(code: KeyCode) -> Event {
         kind: KeyEventKind::Press,
         state: KeyEventState::NONE,
     })
+}
+
+fn profile_name(name: &str) -> ProfileName {
+    ProfileName::new(name).expect("test profile name should be valid")
+}
+
+fn write_data(directory: &TempDir, name: &str, contents: &str) -> PathBuf {
+    let path = directory.path().join(name);
+    fs::write(&path, contents).unwrap();
+    path
+}
+
+fn full_data() -> &'static str {
+    r#"{
+        "item": {
+            "iron-ore": {"type": "item", "name": "iron-ore"},
+            "iron-plate": {"type": "item", "name": "iron-plate"}
+        },
+        "recipe": {
+            "iron-plate": {
+                "type": "recipe",
+                "name": "iron-plate",
+                "category": "crafting",
+                "energy_required": 1,
+                "ingredients": [{"type": "item", "name": "iron-ore", "amount": 1}],
+                "results": [{"type": "item", "name": "iron-plate", "amount": 1}]
+            }
+        },
+        "assembling-machine": {
+            "assembler": {
+                "type": "assembling-machine",
+                "name": "assembler",
+                "crafting_categories": ["crafting"],
+                "crafting_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        }
+    }"#
+}
+
+fn warning_data() -> &'static str {
+    r#"{
+        "item": {
+            "iron-ore": {"type": "item", "name": "iron-ore"}
+        },
+        "assembling-machine": {
+            "solar-assembler": {
+                "type": "assembling-machine",
+                "name": "solar-assembler",
+                "crafting_categories": ["crafting"],
+                "crafting_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "solar"}
+            }
+        }
+    }"#
+}
+
+fn render_to_string(app: &App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| render(app, frame)).unwrap();
+    buffer_to_string(terminal.backend().buffer())
+}
+
+fn buffer_to_string(buffer: &Buffer) -> String {
+    let area = buffer.area;
+    let mut lines = Vec::new();
+    for y in area.y..area.y + area.height {
+        let mut line = String::new();
+        for x in area.x..area.x + area.width {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        lines.push(line.trim_end().to_owned());
+    }
+    lines.join("\n")
+}
+
+fn create_profile(root: &TempDir, sources: &TempDir, name: &str, data_name: &str, data: &str) {
+    let store = ProfileStore::new(root.path());
+    let data_path = write_data(sources, data_name, data);
+    store
+        .create(&ProfileImportRequest::new(profile_name(name), &data_path))
+        .unwrap();
 }
 
 #[test]
@@ -111,4 +207,134 @@ fn resize_events_request_redraw_without_mutating_app_state() {
         translate_event(&Event::Resize(100, 40), EventContext::default()),
         TranslatedEvent::Redraw
     );
+}
+
+#[test]
+fn renders_empty_start_screen() {
+    let app = App::new();
+
+    let screen = render_to_string(&app, 80, 20);
+
+    assert!(screen.contains("Factorio Planner"));
+    assert!(screen.contains("Start"));
+    assert!(screen.contains("No dataset profiles"));
+    assert!(screen.contains("Import data"));
+    assert!(screen.contains("Open plan"));
+}
+
+#[test]
+fn renders_start_screen_with_profile_metadata() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    create_profile(&root, &sources, "warnings", "warnings.json", warning_data());
+    let app = App::start(
+        StartupMode::StartScreen,
+        &ProfileStore::new(root.path()),
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 100, 24);
+
+    assert!(screen.contains("Profiles (2)"));
+    assert!(screen.contains("main"));
+    assert!(screen.contains("active"));
+    assert!(screen.contains("warnings"));
+    assert!(screen.contains("1 warning"));
+    assert!(screen.contains("Data source:"));
+    assert!(screen.contains("full.json"));
+}
+
+#[test]
+fn renders_pending_import_paths_and_profile_name() {
+    let app = App::start(
+        StartupMode::ImportData {
+            data_path: PathBuf::from("/tmp/data.raw.json"),
+            locale_path: Some(PathBuf::from("/tmp/locale.json")),
+            profile: Some(profile_name("modded")),
+        },
+        &ProfileStore::new(TempDir::new().unwrap().path()),
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 100, 20);
+
+    assert!(screen.contains("Import Dataset"));
+    assert!(screen.contains("/tmp/data.raw.json"));
+    assert!(screen.contains("/tmp/locale.json"));
+    assert!(screen.contains("Profile: modded"));
+    assert!(screen.contains("Ready to import"));
+}
+
+#[test]
+fn renders_import_success_and_failure_statuses() {
+    let mut app = App::new();
+
+    app.dispatch(
+        Action::ReportImportSuccess {
+            profile: profile_name("main"),
+            warning_count: 2,
+        },
+        &ProfileStore::new(TempDir::new().unwrap().path()),
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+    let success = render_to_string(&app, 100, 20);
+    assert!(success.contains("Imported profile main"));
+    assert!(success.contains("2 warnings"));
+
+    app.dispatch(
+        Action::ReportImportFailure {
+            message: "invalid JSON at line 4".to_owned(),
+        },
+        &ProfileStore::new(TempDir::new().unwrap().path()),
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+    let failure = render_to_string(&app, 100, 20);
+    assert!(failure.contains("Import failed"));
+    assert!(failure.contains("invalid JSON at line 4"));
+}
+
+#[test]
+fn renders_profile_confirmation_overlays() {
+    let mut app = App::new();
+    app.dispatch(
+        Action::OpenOverlay(Overlay::ConfirmProfileReplace {
+            profile: profile_name("main"),
+        }),
+        &ProfileStore::new(TempDir::new().unwrap().path()),
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+
+    let replace = render_to_string(&app, 80, 20);
+    assert!(replace.contains("Replace profile main?"));
+    assert!(replace.contains("Enter confirm"));
+
+    app.dispatch(
+        Action::OpenOverlay(Overlay::ConfirmProfileDelete {
+            profile: profile_name("main"),
+        }),
+        &ProfileStore::new(TempDir::new().unwrap().path()),
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+
+    let delete = render_to_string(&app, 80, 20);
+    assert!(delete.contains("Delete profile main?"));
+    assert!(delete.contains("Esc cancel"));
+}
+
+#[test]
+fn renders_narrow_terminal_fallback() {
+    let app = App::new();
+
+    let screen = render_to_string(&app, 30, 6);
+
+    assert!(screen.contains("Terminal too small"));
+    assert!(screen.contains("Current: 30x6"));
+    assert!(screen.contains("Minimum:"));
 }

@@ -42,6 +42,8 @@ pub enum Overlay {
     Diagnostics,
     Help,
     ConfirmExit,
+    ConfirmProfileReplace { profile: ProfileName },
+    ConfirmProfileDelete { profile: ProfileName },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +201,21 @@ impl App {
             Action::SavePlan { path } => self.save_plan(path, plans)?,
             Action::RebindBlockedPlan { profile } => {
                 self.rebind_blocked_plan(profile, profiles, plans)?;
+            }
+            Action::ReportImportSuccess {
+                profile,
+                warning_count,
+            } => {
+                self.screen = Screen::Import;
+                self.pending_import = None;
+                self.status_message = Some(format!(
+                    "Imported profile {profile} with {}",
+                    pluralize(*warning_count, "warning")
+                ));
+            }
+            Action::ReportImportFailure { message } => {
+                self.screen = Screen::Import;
+                self.status_message = Some(format!("Import failed: {message}"));
             }
             Action::SetWorkspaceView(view) => self.workspace_view = *view,
             Action::MoveFocus(focus) => self.focus = *focus,
@@ -568,6 +585,13 @@ pub enum Action {
     RebindBlockedPlan {
         profile: ProfileName,
     },
+    ReportImportSuccess {
+        profile: ProfileName,
+        warning_count: usize,
+    },
+    ReportImportFailure {
+        message: String,
+    },
     AddTarget(Target),
     ReplaceTarget {
         index: usize,
@@ -621,6 +645,14 @@ pub enum Action {
     ConfirmExit,
     CancelExit,
     DismissStatus,
+}
+
+fn pluralize(count: usize, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
+    }
 }
 
 #[derive(Debug, Error)]
