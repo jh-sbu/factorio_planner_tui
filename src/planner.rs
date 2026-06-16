@@ -138,10 +138,34 @@ impl FactoryPlan {
         self
     }
 
+    pub fn add_external_input(&mut self, commodity: CommodityId) -> bool {
+        self.external_inputs.insert(commodity)
+    }
+
+    pub fn remove_external_input(&mut self, commodity: &CommodityId) -> bool {
+        self.external_inputs.remove(commodity)
+    }
+
+    pub fn toggle_external_input(&mut self, commodity: CommodityId) -> bool {
+        if self.external_inputs.contains(&commodity) {
+            self.external_inputs.remove(&commodity);
+            false
+        } else {
+            self.external_inputs.insert(commodity);
+            true
+        }
+    }
+
     #[must_use]
     pub const fn with_display_rate_unit(mut self, display_rate_unit: RateUnit) -> Self {
         self.display_rate_unit = display_rate_unit;
         self
+    }
+
+    pub fn set_display_rate_unit(&mut self, display_rate_unit: RateUnit) -> RateUnit {
+        let previous = self.display_rate_unit;
+        self.display_rate_unit = display_rate_unit;
+        previous
     }
 
     #[must_use]

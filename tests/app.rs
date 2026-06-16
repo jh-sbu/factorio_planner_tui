@@ -1,0 +1,388 @@
+use std::fs;
+use std::path::PathBuf;
+
+use factorio_planner_tui::app::{Action, App, ExitState, Overlay, Screen, WorkspaceView};
+use factorio_planner_tui::catalog::{CommodityId, ItemId, MachineId, RecipeId};
+use factorio_planner_tui::cli::{StartupInputError, StartupMode, StartupRequest};
+use factorio_planner_tui::persistence::{
+    PlanDocument, PlanFileStore, PlanName, ProfileImportRequest, ProfileName, ProfileStore,
+};
+use factorio_planner_tui::planner::{FactoryPlan, PlannerError, Target};
+use tempfile::TempDir;
+
+fn profile_name(name: &str) -> ProfileName {
+    ProfileName::new(name).expect("test profile name should be valid")
+}
+
+fn plan_name(name: &str) -> PlanName {
+    PlanName::new(name).expect("test plan name should be valid")
+}
+
+fn item(name: &str) -> CommodityId {
+    CommodityId::Item(ItemId::new(name).expect("test item ID should be valid"))
+}
+
+fn recipe_id(name: &str) -> RecipeId {
+    RecipeId::new(name).expect("test recipe ID should be valid")
+}
+
+fn machine_id(name: &str) -> MachineId {
+    MachineId::new(name).expect("test machine ID should be valid")
+}
+
+fn target(commodity: CommodityId, rate_per_second: f64) -> Target {
+    Target::new(commodity, rate_per_second).expect("test target should be valid")
+}
+
+fn write_data(directory: &TempDir, name: &str, contents: &str) -> PathBuf {
+    let path = directory.path().join(name);
+    fs::write(&path, contents).unwrap();
+    path
+}
+
+fn full_data() -> &'static str {
+    r#"{
+        "item": {
+            "iron-ore": {"type": "item", "name": "iron-ore"},
+            "iron-plate": {"type": "item", "name": "iron-plate"}
+        },
+        "recipe": {
+            "iron-plate": {
+                "type": "recipe",
+                "name": "iron-plate",
+                "category": "crafting",
+                "energy_required": 1,
+                "ingredients": [{"type": "item", "name": "iron-ore", "amount": 1}],
+                "results": [{"type": "item", "name": "iron-plate", "amount": 1}]
+            }
+        },
+        "assembling-machine": {
+            "assembler": {
+                "type": "assembling-machine",
+                "name": "assembler",
+                "crafting_categories": ["crafting"],
+                "crafting_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        }
+    }"#
+}
+
+fn minimal_data(result_name: &str) -> String {
+    format!(
+        r#"{{
+            "item": {{
+                "iron-ore": {{"type": "item", "name": "iron-ore"}},
+                "{result_name}": {{"type": "item", "name": "{result_name}"}}
+            }},
+            "recipe": {{
+                "{result_name}": {{
+                    "type": "recipe",
+                    "name": "{result_name}",
+                    "ingredients": [{{"type": "item", "name": "iron-ore", "amount": 1}}],
+                    "results": [{{"type": "item", "name": "{result_name}", "amount": 1}}]
+                }}
+            }}
+        }}"#
+    )
+}
+
+fn create_profile(
+    root: &TempDir,
+    sources: &TempDir,
+    name: &str,
+    data_name: &str,
+    data: &str,
+) -> factorio_planner_tui::persistence::DatasetProfile {
+    let store = ProfileStore::new(root.path());
+    let data_path = write_data(sources, data_name, data);
+    store
+        .create(&ProfileImportRequest::new(profile_name(name), &data_path))
+        .unwrap()
+}
+
+fn sample_document(profile: &factorio_planner_tui::persistence::DatasetProfile) -> PlanDocument {
+    PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-plate"), 2.0)),
+    )
+}
+
+fn assert_close(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1.0e-10,
+        "expected {expected}, got {actual}"
+    );
+}
+
+#[test]
+fn startup_request_resolves_modes_and_rejects_conflicts() {
+    assert_eq!(
+        StartupRequest::default().resolve().unwrap(),
+        StartupMode::StartScreen
+    );
+
+    assert_eq!(
+        StartupRequest::default()
+            .with_dataset(profile_name("main"))
+            .resolve()
+            .unwrap(),
+        StartupMode::OpenDataset {
+            profile: profile_name("main"),
+        }
+    );
+
+    assert_eq!(
+        StartupRequest::default()
+            .with_import_data("data.raw.json")
+            .with_locale("locale.json")
+            .with_profile(profile_name("new-profile"))
+            .resolve()
+            .unwrap(),
+        StartupMode::ImportData {
+            data_path: PathBuf::from("data.raw.json"),
+            locale_path: Some(PathBuf::from("locale.json")),
+            profile: Some(profile_name("new-profile")),
+        }
+    );
+
+    assert_eq!(
+        StartupRequest::default()
+            .with_plan("starter.fptplan.json")
+            .resolve()
+            .unwrap(),
+        StartupMode::OpenPlan {
+            path: PathBuf::from("starter.fptplan.json"),
+        }
+    );
+
+    assert_eq!(
+        StartupRequest::default()
+            .with_locale("locale.json")
+            .resolve(),
+        Err(StartupInputError::LocaleRequiresImportData)
+    );
+    assert_eq!(
+        StartupRequest::default()
+            .with_profile(profile_name("main"))
+            .resolve(),
+        Err(StartupInputError::ProfileRequiresImportData)
+    );
+    assert_eq!(
+        StartupRequest::default()
+            .with_plan("starter.fptplan.json")
+            .with_dataset(profile_name("main"))
+            .resolve(),
+        Err(StartupInputError::PlanConflictsWithDatasetSelection)
+    );
+}
+
+#[test]
+fn startup_can_select_a_dataset_without_opening_a_workspace() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+
+    let app = App::start(
+        StartupMode::OpenDataset {
+            profile: profile_name("main"),
+        },
+        &profile_store,
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+
+    assert_eq!(app.screen(), Screen::Start);
+    assert_eq!(
+        profile_store.active_profile_name().unwrap(),
+        Some(profile_name("main"))
+    );
+    assert_eq!(app.active_profile().unwrap().name(), &profile_name("main"));
+    assert!(app.plan().is_none());
+    assert!(app.calculation().is_none());
+}
+
+#[test]
+fn opens_a_ready_plan_and_recalculates_after_action_edits() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    plan_store.save(&path, &mut document).unwrap();
+
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    assert_eq!(app.screen(), Screen::PlanningWorkspace);
+    assert!(!app.plan().unwrap().is_dirty());
+    assert_eq!(app.workspace_view(), WorkspaceView::AggregatedTable);
+    assert_close(
+        app.calculation().unwrap().production_steps()[0]
+            .required_output_rate()
+            .get(),
+        2.0,
+    );
+
+    app.dispatch(
+        Action::AddTarget(target(item("iron-plate"), 1.0)),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert!(app.plan().unwrap().is_dirty());
+    assert_close(
+        app.calculation().unwrap().production_steps()[0]
+            .required_output_rate()
+            .get(),
+        3.0,
+    );
+
+    app.dispatch(
+        Action::SetWorkspaceView(WorkspaceView::DependencyTree),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(app.workspace_view(), WorkspaceView::DependencyTree);
+}
+
+#[test]
+fn calculation_errors_are_state_not_terminal_failures() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::SetMachineChoice {
+            recipe: recipe_id("iron-plate"),
+            machine: machine_id("missing"),
+        },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert!(app.plan().unwrap().is_dirty());
+    assert!(app.calculation().is_none());
+    assert_eq!(
+        app.calculation_error(),
+        Some(&PlannerError::MissingMachineChoice {
+            recipe: recipe_id("iron-plate"),
+            machine: machine_id("missing"),
+        })
+    );
+
+    app.dispatch(
+        Action::ClearMachineChoice {
+            recipe: recipe_id("iron-plate"),
+        },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert!(app.calculation().is_some());
+    assert!(app.calculation_error().is_none());
+}
+
+#[test]
+fn blocked_plan_can_be_rebound_explicitly_to_a_compatible_profile() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let main = create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let compatible_path = write_data(&sources, "compatible.json", full_data());
+    let compatible = profile_store
+        .create(&ProfileImportRequest::new(
+            profile_name("compatible"),
+            compatible_path,
+        ))
+        .unwrap();
+    assert_eq!(compatible.fingerprint(), main.fingerprint());
+
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&main);
+    plan_store.save(&path, &mut document).unwrap();
+
+    let minimal_path = write_data(&sources, "minimal.json", &minimal_data("steel-plate"));
+    profile_store
+        .replace(&ProfileImportRequest::new(
+            profile_name("main"),
+            minimal_path,
+        ))
+        .unwrap();
+
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    assert_eq!(app.screen(), Screen::BlockedPlan);
+    assert!(app.blocked_plan().is_some());
+    assert!(app.plan().is_none());
+
+    app.dispatch(
+        Action::RebindBlockedPlan {
+            profile: profile_name("compatible"),
+        },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert_eq!(app.screen(), Screen::PlanningWorkspace);
+    assert_eq!(
+        app.active_profile().unwrap().name(),
+        &profile_name("compatible")
+    );
+    assert!(app.blocked_plan().is_none());
+    assert!(app.plan().unwrap().is_dirty());
+    assert!(app.calculation().is_some());
+}
+
+#[test]
+fn dirty_exit_requires_confirmation_and_can_be_cancelled() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::AddTarget(target(item("iron-plate"), 1.0)),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::RequestExit, &profile_store, &plan_store)
+        .unwrap();
+
+    assert_eq!(app.exit_state(), ExitState::WaitingForConfirmation);
+    assert_eq!(app.overlay(), Some(&Overlay::ConfirmExit));
+
+    app.dispatch(Action::CancelExit, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(app.exit_state(), ExitState::Running);
+    assert!(app.overlay().is_none());
+
+    app.dispatch(Action::RequestExit, &profile_store, &plan_store)
+        .unwrap();
+    app.dispatch(Action::ConfirmExit, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(app.exit_state(), ExitState::Confirmed);
+}
