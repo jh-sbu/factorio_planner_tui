@@ -1,8 +1,44 @@
 use std::path::PathBuf;
 
+use clap::Parser;
 use thiserror::Error;
 
 use crate::persistence::ProfileName;
+
+#[derive(Clone, Debug, Eq, Parser, PartialEq)]
+#[command(
+    name = "factorio_planner_tui",
+    about = "Plan Factorio factory production rates in a terminal UI"
+)]
+pub struct CliArgs {
+    #[arg(long = "import-data", value_name = "PATH")]
+    import_data: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    locale: Option<PathBuf>,
+    #[arg(long, value_name = "NAME", value_parser = parse_profile_name)]
+    profile: Option<ProfileName>,
+    #[arg(long, value_name = "NAME", value_parser = parse_profile_name)]
+    dataset: Option<ProfileName>,
+    #[arg(long, value_name = "PATH")]
+    plan: Option<PathBuf>,
+}
+
+impl CliArgs {
+    #[must_use]
+    pub fn into_startup_request(self) -> StartupRequest {
+        StartupRequest {
+            import_data: self.import_data,
+            locale: self.locale,
+            profile: self.profile,
+            dataset: self.dataset,
+            plan: self.plan,
+        }
+    }
+}
+
+fn parse_profile_name(value: &str) -> Result<ProfileName, String> {
+    ProfileName::new(value).map_err(|error| error.to_string())
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StartupRequest {
