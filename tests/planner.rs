@@ -5,8 +5,8 @@ use factorio_planner_tui::catalog::{
     UnsupportedEnergySource,
 };
 use factorio_planner_tui::planner::{
-    FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit, StepEnergy, Target,
-    calculate,
+    DependencyNodeKind, FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit,
+    StepEnergy, Target, calculate,
 };
 use proptest::prelude::*;
 
@@ -1874,6 +1874,89 @@ fn selected_belt_reports_exact_and_rounded_equivalents_for_multiple_item_flows()
         assert_close(equivalent.exact_belts().get(), 1.5);
         assert_eq!(equivalent.installed_belts(), 2);
     }
+}
+
+#[test]
+fn dependency_trees_show_targets_external_boundaries_and_shared_intermediates() {
+    let (catalog, ore, plate, gear, pipe) = shared_intermediate_catalog();
+    let mut plan = FactoryPlan::new(target(gear.clone(), 3.0));
+    plan.add_target(target(pipe.clone(), 4.0));
+
+    let result = calculate(&catalog, &plan).unwrap();
+
+    assert_eq!(result.dependency_trees().len(), 2);
+    assert_eq!(result.dependency_trees()[0].commodity(), &gear);
+    assert_eq!(
+        result.dependency_trees()[0].kind(),
+        DependencyNodeKind::Production
+    );
+    assert!(!result.dependency_trees()[0].is_shared());
+    let gear_plate = &result.dependency_trees()[0].children()[0];
+    assert_eq!(gear_plate.commodity(), &plate);
+    assert_eq!(gear_plate.kind(), DependencyNodeKind::Production);
+    assert!(gear_plate.is_shared());
+    assert_close(gear_plate.required_rate().get(), 6.0);
+    assert_eq!(gear_plate.children()[0].commodity(), &ore);
+    assert_eq!(
+        gear_plate.children()[0].kind(),
+        DependencyNodeKind::ExternalInput
+    );
+
+    assert_eq!(result.dependency_trees()[1].commodity(), &pipe);
+    let pipe_plate = &result.dependency_trees()[1].children()[0];
+    assert_eq!(pipe_plate.commodity(), &plate);
+    assert!(pipe_plate.is_shared());
+    assert_close(pipe_plate.required_rate().get(), 4.0);
+}
+
+#[test]
+fn dependency_tree_includes_recursive_burner_fuel_dependencies() {
+    let coal = item("coal");
+    let ash = item("ash");
+    let plate = item("iron-plate");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let burner = Machine::new(
+        machine_id("burner-assembler"),
+        [crafting.clone()],
+        positive(1.0),
+        0,
+        [],
+        None,
+        positive(8.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(0.5),
+        },
+    )
+    .unwrap();
+    let electric = machine("electric-assembler", [crafting.clone()], 1.0);
+    let catalog = catalog_with_energy(
+        [coal.clone(), ash, plate.clone()],
+        vec![
+            recipe("coal", &crafting, 1.0, vec![], coal.clone(), 1.0),
+            recipe("iron-plate", &crafting, 1.0, vec![], plate.clone(), 1.0),
+        ],
+        vec![burner, electric],
+        vec![],
+        vec![test_fuel("coal", "chemical", 4.0, None)],
+    );
+    let mut plan = FactoryPlan::new(target(plate.clone(), 2.0));
+    plan.set_machine_choice(recipe_id("iron-plate"), machine_id("burner-assembler"));
+    plan.set_machine_choice(recipe_id("coal"), machine_id("electric-assembler"));
+
+    let result = calculate(&catalog, &plan).unwrap();
+
+    let fuel_node = result.dependency_trees()[0]
+        .children()
+        .iter()
+        .find(|node| node.commodity() == &coal)
+        .expect("expected burner fuel dependency");
+    assert_eq!(fuel_node.kind(), DependencyNodeKind::FuelInput);
+    assert_eq!(fuel_node.recipe(), Some(&recipe_id("coal")));
+    assert_eq!(fuel_node.machine(), Some(&machine_id("electric-assembler")));
+    assert_close(fuel_node.required_rate().get(), 8.0);
 }
 
 #[test]

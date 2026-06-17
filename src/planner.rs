@@ -411,6 +411,73 @@ pub enum StepEnergy {
     Burner(FuelUsage),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyNodeKind {
+    Production,
+    ExternalInput,
+    FuelInput,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyNode {
+    commodity: CommodityId,
+    required_rate: Positive,
+    kind: DependencyNodeKind,
+    recipe: Option<RecipeId>,
+    machine: Option<MachineId>,
+    fractional_machine_count: Option<Positive>,
+    installed_machine_count: Option<u64>,
+    shared: bool,
+    children: Vec<DependencyNode>,
+}
+
+impl DependencyNode {
+    #[must_use]
+    pub const fn commodity(&self) -> &CommodityId {
+        &self.commodity
+    }
+
+    #[must_use]
+    pub const fn required_rate(&self) -> Positive {
+        self.required_rate
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> DependencyNodeKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn recipe(&self) -> Option<&RecipeId> {
+        self.recipe.as_ref()
+    }
+
+    #[must_use]
+    pub const fn machine(&self) -> Option<&MachineId> {
+        self.machine.as_ref()
+    }
+
+    #[must_use]
+    pub const fn fractional_machine_count(&self) -> Option<Positive> {
+        self.fractional_machine_count
+    }
+
+    #[must_use]
+    pub const fn installed_machine_count(&self) -> Option<u64> {
+        self.installed_machine_count
+    }
+
+    #[must_use]
+    pub const fn is_shared(&self) -> bool {
+        self.shared
+    }
+
+    #[must_use]
+    pub fn children(&self) -> &[DependencyNode] {
+        &self.children
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProductionStep {
     planning_product: CommodityId,
@@ -504,6 +571,7 @@ impl ProductionStep {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalculationResult {
     production_steps: Vec<ProductionStep>,
+    dependency_trees: Vec<DependencyNode>,
     external_inputs: Vec<CommodityRate>,
     item_flows: Vec<CommodityRate>,
     fluid_flows: Vec<CommodityRate>,
@@ -518,6 +586,11 @@ impl CalculationResult {
     #[must_use]
     pub fn production_steps(&self) -> &[ProductionStep] {
         &self.production_steps
+    }
+
+    #[must_use]
+    pub fn dependency_trees(&self) -> &[DependencyNode] {
+        &self.dependency_trees
     }
 
     #[must_use]
@@ -708,10 +781,10 @@ pub fn calculate(catalog: &Catalog, plan: &FactoryPlan) -> Result<CalculationRes
 
     let resolved_plan = resolve_plan(catalog, plan, &target_rates)?;
     let mut calculation = Calculation::new(catalog, plan, resolved_plan);
-    for (commodity, rate) in target_rates {
-        calculation.expand(&commodity, rate)?;
+    for (commodity, rate) in &target_rates {
+        calculation.expand(commodity, *rate)?;
     }
-    calculation.finish()
+    calculation.finish(&target_rates)
 }
 
 struct Calculation<'a> {
@@ -760,7 +833,8 @@ impl<'a> Calculation<'a> {
             .catalog
             .machine(&machine_id)
             .expect("selected machine IDs must remain present in the catalog");
-        let module_configuration = self.resolve_modules(commodity, recipe, machine)?;
+        let module_configuration =
+            resolve_modules(self.catalog, self.plan, commodity, recipe, machine)?;
         let product_amount = recipe
             .products()
             .iter()
@@ -957,116 +1031,6 @@ impl<'a> Calculation<'a> {
         }
     }
 
-    fn resolve_modules(
-        &self,
-        commodity: &CommodityId,
-        recipe: &Recipe,
-        machine: &Machine,
-    ) -> Result<ModuleConfiguration, PlannerError> {
-        let module_ids = self.plan.modules_for(commodity);
-        if module_ids.len() > usize::from(machine.module_slots()) {
-            return Err(PlannerError::TooManyModules {
-                commodity: commodity.clone(),
-                machine: machine.id().clone(),
-                selected: module_ids.len(),
-                slots: machine.module_slots(),
-            });
-        }
-
-        let mut speed_effect = 0.0;
-        let mut productivity_effect = 0.0;
-        let mut consumption_effect = 0.0;
-        for module_id in module_ids {
-            let module = self.catalog.module(module_id).ok_or_else(|| {
-                PlannerError::MissingModuleChoice {
-                    commodity: commodity.clone(),
-                    module: module_id.clone(),
-                }
-            })?;
-            if !module.is_selectable() {
-                return Err(PlannerError::UnsupportedModuleChoice {
-                    commodity: commodity.clone(),
-                    module: module_id.clone(),
-                });
-            }
-            if machine
-                .allowed_module_categories()
-                .is_some_and(|categories| !categories.contains(module.category()))
-            {
-                return Err(PlannerError::MachineDisallowsModuleCategory {
-                    commodity: commodity.clone(),
-                    machine: machine.id().clone(),
-                    module: module_id.clone(),
-                    category: module.category().clone(),
-                });
-            }
-            if recipe
-                .allowed_module_categories()
-                .is_some_and(|categories| !categories.contains(module.category()))
-            {
-                return Err(PlannerError::RecipeDisallowsModuleCategory {
-                    commodity: commodity.clone(),
-                    recipe: recipe.id().clone(),
-                    module: module_id.clone(),
-                    category: module.category().clone(),
-                });
-            }
-
-            for (effect, value) in [
-                (ModuleEffect::Speed, module.speed_effect().get()),
-                (
-                    ModuleEffect::Productivity,
-                    module.productivity_effect().get(),
-                ),
-                (ModuleEffect::Consumption, module.consumption_effect().get()),
-            ] {
-                if value == 0.0 {
-                    continue;
-                }
-                if !machine.allowed_effects().contains(&effect) {
-                    return Err(PlannerError::MachineDisallowsModuleEffect {
-                        commodity: commodity.clone(),
-                        machine: machine.id().clone(),
-                        module: module_id.clone(),
-                        effect,
-                    });
-                }
-                if !recipe.allowed_effects().contains(&effect) {
-                    return Err(PlannerError::RecipeDisallowsModuleEffect {
-                        commodity: commodity.clone(),
-                        recipe: recipe.id().clone(),
-                        module: module_id.clone(),
-                        effect,
-                    });
-                }
-            }
-
-            speed_effect += module.speed_effect().get();
-            productivity_effect += module.productivity_effect().get();
-            consumption_effect += module.consumption_effect().get();
-        }
-
-        let speed_multiplier =
-            checked_positive((1.0_f64 + speed_effect).max(0.2), "module speed multiplier")?;
-        let productivity_effect = productivity_effect.min(recipe.maximum_productivity().get());
-        let productivity_effect =
-            Finite::new(productivity_effect).map_err(|_| PlannerError::InvalidCalculatedValue {
-                quantity: "module productivity effect",
-                value: productivity_effect,
-            })?;
-        let consumption_multiplier = checked_positive(
-            (1.0_f64 + consumption_effect).max(0.2),
-            "module consumption multiplier",
-        )?;
-
-        Ok(ModuleConfiguration {
-            modules: module_ids.to_vec(),
-            speed_multiplier,
-            productivity_effect,
-            consumption_multiplier,
-        })
-    }
-
     fn add_external_input(
         &mut self,
         commodity: &CommodityId,
@@ -1078,7 +1042,12 @@ impl<'a> Calculation<'a> {
         Ok(())
     }
 
-    fn finish(self) -> Result<CalculationResult, PlannerError> {
+    fn finish(
+        self,
+        target_rates: &[(CommodityId, Positive)],
+    ) -> Result<CalculationResult, PlannerError> {
+        let dependency_trees =
+            build_dependency_trees(self.catalog, self.plan, &self.resolved_plan, target_rates)?;
         let production_steps = self
             .production_steps
             .into_values()
@@ -1102,6 +1071,7 @@ impl<'a> Calculation<'a> {
 
         Ok(CalculationResult {
             production_steps,
+            dependency_trees,
             external_inputs,
             item_flows,
             fluid_flows,
@@ -1578,6 +1548,318 @@ struct ModuleConfiguration {
     speed_multiplier: Positive,
     productivity_effect: Finite,
     consumption_multiplier: Positive,
+}
+
+fn resolve_modules(
+    catalog: &Catalog,
+    plan: &FactoryPlan,
+    commodity: &CommodityId,
+    recipe: &Recipe,
+    machine: &Machine,
+) -> Result<ModuleConfiguration, PlannerError> {
+    let module_ids = plan.modules_for(commodity);
+    if module_ids.len() > usize::from(machine.module_slots()) {
+        return Err(PlannerError::TooManyModules {
+            commodity: commodity.clone(),
+            machine: machine.id().clone(),
+            selected: module_ids.len(),
+            slots: machine.module_slots(),
+        });
+    }
+
+    let mut speed_effect = 0.0;
+    let mut productivity_effect = 0.0;
+    let mut consumption_effect = 0.0;
+    for module_id in module_ids {
+        let module =
+            catalog
+                .module(module_id)
+                .ok_or_else(|| PlannerError::MissingModuleChoice {
+                    commodity: commodity.clone(),
+                    module: module_id.clone(),
+                })?;
+        if !module.is_selectable() {
+            return Err(PlannerError::UnsupportedModuleChoice {
+                commodity: commodity.clone(),
+                module: module_id.clone(),
+            });
+        }
+        if machine
+            .allowed_module_categories()
+            .is_some_and(|categories| !categories.contains(module.category()))
+        {
+            return Err(PlannerError::MachineDisallowsModuleCategory {
+                commodity: commodity.clone(),
+                machine: machine.id().clone(),
+                module: module_id.clone(),
+                category: module.category().clone(),
+            });
+        }
+        if recipe
+            .allowed_module_categories()
+            .is_some_and(|categories| !categories.contains(module.category()))
+        {
+            return Err(PlannerError::RecipeDisallowsModuleCategory {
+                commodity: commodity.clone(),
+                recipe: recipe.id().clone(),
+                module: module_id.clone(),
+                category: module.category().clone(),
+            });
+        }
+
+        for (effect, value) in [
+            (ModuleEffect::Speed, module.speed_effect().get()),
+            (
+                ModuleEffect::Productivity,
+                module.productivity_effect().get(),
+            ),
+            (ModuleEffect::Consumption, module.consumption_effect().get()),
+        ] {
+            if value == 0.0 {
+                continue;
+            }
+            if !machine.allowed_effects().contains(&effect) {
+                return Err(PlannerError::MachineDisallowsModuleEffect {
+                    commodity: commodity.clone(),
+                    machine: machine.id().clone(),
+                    module: module_id.clone(),
+                    effect,
+                });
+            }
+            if !recipe.allowed_effects().contains(&effect) {
+                return Err(PlannerError::RecipeDisallowsModuleEffect {
+                    commodity: commodity.clone(),
+                    recipe: recipe.id().clone(),
+                    module: module_id.clone(),
+                    effect,
+                });
+            }
+        }
+
+        speed_effect += module.speed_effect().get();
+        productivity_effect += module.productivity_effect().get();
+        consumption_effect += module.consumption_effect().get();
+    }
+
+    let speed_multiplier =
+        checked_positive((1.0_f64 + speed_effect).max(0.2), "module speed multiplier")?;
+    let productivity_effect = productivity_effect.min(recipe.maximum_productivity().get());
+    let productivity_effect =
+        Finite::new(productivity_effect).map_err(|_| PlannerError::InvalidCalculatedValue {
+            quantity: "module productivity effect",
+            value: productivity_effect,
+        })?;
+    let consumption_multiplier = checked_positive(
+        (1.0_f64 + consumption_effect).max(0.2),
+        "module consumption multiplier",
+    )?;
+
+    Ok(ModuleConfiguration {
+        modules: module_ids.to_vec(),
+        speed_multiplier,
+        productivity_effect,
+        consumption_multiplier,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DependencyEdgeKind {
+    Normal,
+    Fuel,
+}
+
+fn build_dependency_trees(
+    catalog: &Catalog,
+    plan: &FactoryPlan,
+    resolved_plan: &ResolvedPlan,
+    target_rates: &[(CommodityId, Positive)],
+) -> Result<Vec<DependencyNode>, PlannerError> {
+    let context = DependencyBuildContext {
+        catalog,
+        plan,
+        resolved_plan,
+    };
+    let mut trees = target_rates
+        .iter()
+        .map(|(commodity, rate)| {
+            build_dependency_node(&context, commodity, *rate, DependencyEdgeKind::Normal)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut child_production_counts = BTreeMap::<CommodityId, usize>::new();
+    for tree in &trees {
+        count_child_production_nodes(tree, true, &mut child_production_counts);
+    }
+    for tree in &mut trees {
+        mark_shared_dependency_nodes(tree, &child_production_counts);
+    }
+
+    Ok(trees)
+}
+
+struct DependencyBuildContext<'a> {
+    catalog: &'a Catalog,
+    plan: &'a FactoryPlan,
+    resolved_plan: &'a ResolvedPlan,
+}
+
+fn build_dependency_node(
+    context: &DependencyBuildContext<'_>,
+    commodity: &CommodityId,
+    required_rate: Positive,
+    edge_kind: DependencyEdgeKind,
+) -> Result<DependencyNode, PlannerError> {
+    let external_kind = match edge_kind {
+        DependencyEdgeKind::Normal => DependencyNodeKind::ExternalInput,
+        DependencyEdgeKind::Fuel => DependencyNodeKind::FuelInput,
+    };
+    let Some(recipe_id) = context.resolved_plan.recipes.get(commodity) else {
+        return Ok(DependencyNode {
+            commodity: commodity.clone(),
+            required_rate,
+            kind: external_kind,
+            recipe: None,
+            machine: None,
+            fractional_machine_count: None,
+            installed_machine_count: None,
+            shared: false,
+            children: Vec::new(),
+        });
+    };
+    debug_assert!(!context.plan.external_inputs().contains(commodity));
+
+    let recipe = context
+        .catalog
+        .recipe(recipe_id)
+        .expect("resolved recipe IDs must remain present in the catalog");
+    let machine_id = context
+        .resolved_plan
+        .machines
+        .get(commodity)
+        .expect("resolved production recipes must have machines");
+    let machine = context
+        .catalog
+        .machine(machine_id)
+        .expect("selected machine IDs must remain present in the catalog");
+    let module_configuration =
+        resolve_modules(context.catalog, context.plan, commodity, recipe, machine)?;
+    let product_amount = recipe
+        .products()
+        .iter()
+        .filter(|product| product.commodity() == commodity)
+        .map(|product| effective_product_amount(product, module_configuration.productivity_effect))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<f64>();
+    let craft_rate = checked_positive(
+        required_rate.get() / product_amount,
+        "dependency tree craft rate per second",
+    )?;
+    let crafts_per_second_per_machine = checked_positive(
+        machine.crafting_speed().get() * module_configuration.speed_multiplier.get()
+            / recipe.duration().get(),
+        "dependency tree crafts per second per machine",
+    )?;
+    let fractional_machine_count = checked_positive(
+        craft_rate.get() / crafts_per_second_per_machine.get(),
+        "dependency tree fractional machine count",
+    )?;
+    let installed_machine_count = checked_installed_machine_count(fractional_machine_count.get())?;
+
+    let mut children = Vec::new();
+    for ingredient in recipe.ingredients() {
+        let rate = checked_positive(
+            craft_rate.get() * ingredient.amount().get(),
+            "dependency tree ingredient rate per second",
+        )?;
+        children.push(build_dependency_node(
+            context,
+            ingredient.commodity(),
+            rate,
+            DependencyEdgeKind::Normal,
+        )?);
+    }
+    append_fuel_dependency_child(
+        context,
+        commodity,
+        machine,
+        &module_configuration,
+        fractional_machine_count,
+        &mut children,
+    )?;
+
+    Ok(DependencyNode {
+        commodity: commodity.clone(),
+        required_rate,
+        kind: match edge_kind {
+            DependencyEdgeKind::Normal => DependencyNodeKind::Production,
+            DependencyEdgeKind::Fuel => DependencyNodeKind::FuelInput,
+        },
+        recipe: Some(recipe_id.clone()),
+        machine: Some(machine_id.clone()),
+        fractional_machine_count: Some(fractional_machine_count),
+        installed_machine_count: Some(installed_machine_count),
+        shared: false,
+        children,
+    })
+}
+
+fn append_fuel_dependency_child(
+    context: &DependencyBuildContext<'_>,
+    commodity: &CommodityId,
+    machine: &Machine,
+    module_configuration: &ModuleConfiguration,
+    fractional_machine_count: Positive,
+    children: &mut Vec<DependencyNode>,
+) -> Result<(), PlannerError> {
+    let MachineEnergySource::Burner { effectivity, .. } = machine.energy_source() else {
+        return Ok(());
+    };
+    let fuel_id = context
+        .resolved_plan
+        .fuels
+        .get(commodity)
+        .expect("resolved burner production steps must have fuels");
+    let fuel = context
+        .catalog
+        .fuel(fuel_id)
+        .expect("resolved fuel IDs must remain present in the catalog");
+    let fuel_rate = checked_positive(
+        machine.energy_usage().get()
+            * module_configuration.consumption_multiplier.get()
+            * fractional_machine_count.get()
+            / (effectivity.get() * fuel.fuel_value().get()),
+        "dependency tree burner fuel rate per second",
+    )?;
+    children.push(build_dependency_node(
+        context,
+        &CommodityId::Item(fuel.item().clone()),
+        fuel_rate,
+        DependencyEdgeKind::Fuel,
+    )?);
+    Ok(())
+}
+
+fn count_child_production_nodes(
+    node: &DependencyNode,
+    is_root: bool,
+    counts: &mut BTreeMap<CommodityId, usize>,
+) {
+    if !is_root && node.recipe().is_some() {
+        *counts.entry(node.commodity().clone()).or_default() += 1;
+    }
+    for child in node.children() {
+        count_child_production_nodes(child, false, counts);
+    }
+}
+
+fn mark_shared_dependency_nodes(node: &mut DependencyNode, counts: &BTreeMap<CommodityId, usize>) {
+    node.shared = node
+        .recipe()
+        .is_some_and(|_| counts.get(node.commodity()).copied().unwrap_or_default() > 1);
+    for child in &mut node.children {
+        mark_shared_dependency_nodes(child, counts);
+    }
 }
 
 fn effective_product_amount(

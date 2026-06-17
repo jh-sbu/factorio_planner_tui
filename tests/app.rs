@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use factorio_planner_tui::app::{Action, App, ExitState, Overlay, Screen, WorkspaceView};
+use factorio_planner_tui::app::{
+    Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, WorkspaceView,
+};
 use factorio_planner_tui::catalog::{CommodityId, ItemId, MachineId, RecipeId};
 use factorio_planner_tui::cli::{StartupInputError, StartupMode, StartupRequest};
 use factorio_planner_tui::persistence::{
@@ -47,6 +49,15 @@ fn full_data() -> &'static str {
             "iron-plate": {"type": "item", "name": "iron-plate"}
         },
         "recipe": {
+            "advanced-iron-plate": {
+                "type": "recipe",
+                "name": "advanced-iron-plate",
+                "category": "crafting",
+                "hidden": true,
+                "energy_required": 1,
+                "ingredients": [],
+                "results": [{"type": "item", "name": "iron-plate", "amount": 2}]
+            },
             "iron-plate": {
                 "type": "recipe",
                 "name": "iron-plate",
@@ -349,6 +360,91 @@ fn blocked_plan_can_be_rebound_explicitly_to_a_compatible_profile() {
     assert!(app.blocked_plan().is_none());
     assert!(app.plan().unwrap().is_dirty());
     assert!(app.calculation().is_some());
+}
+
+#[test]
+fn workspace_selection_and_selector_confirmation_drive_plan_edits() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    document.edit_plan(|plan| plan.add_target(target(item("iron-plate"), 1.0)));
+    plan_store.save(&path, &mut document).unwrap();
+
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    assert_eq!(app.selected_target_index(), 0);
+    assert_eq!(app.selected_result_index(), 0);
+    app.dispatch(
+        Action::MoveWorkspaceSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(app.selected_target_index(), 1);
+
+    app.dispatch(
+        Action::OpenOverlay(Overlay::Selection(SelectionKind::Recipe {
+            commodity: item("iron-plate"),
+        })),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("advanced".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(app.selection_query(), "advanced");
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+
+    assert!(app.overlay().is_none());
+    assert_eq!(
+        app.plan()
+            .unwrap()
+            .plan()
+            .recipe_choice(&item("iron-plate")),
+        Some(&recipe_id("advanced-iron-plate"))
+    );
+    assert!(app.plan().unwrap().is_dirty());
+}
+
+#[test]
+fn workspace_selection_clamps_after_target_removal() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    document.edit_plan(|plan| plan.add_target(target(item("iron-plate"), 1.0)));
+    plan_store.save(&path, &mut document).unwrap();
+
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+    app.dispatch(
+        Action::MoveWorkspaceSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(app.selected_target_index(), 1);
+
+    app.dispatch(
+        Action::RemoveTarget { index: 1 },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert_eq!(app.selected_target_index(), 0);
+    assert_eq!(app.selected_result_index(), 0);
 }
 
 #[test]

@@ -20,8 +20,16 @@ use ratatui::{Frame, Terminal};
 use thiserror::Error;
 use tracing_appender::non_blocking::WorkerGuard;
 
-use crate::app::{Action, App, AppError, ExitState, Overlay, Screen, WorkspaceView};
+use crate::app::{
+    Action, App, AppError, ExitState, FocusTarget, MoveDirection, Overlay, Screen, SelectionKind,
+    WorkspaceView,
+};
+use crate::catalog::{
+    BeltId, Catalog, CommodityId, FuelId, MachineId, ModuleId, Positive, RecipeId,
+};
+use crate::import::DiagnosticSeverity;
 use crate::persistence::{PlanFileStore, ProfileStore};
+use crate::planner::{CommodityRate, DependencyNode, DependencyNodeKind, RateUnit, StepEnergy};
 
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 12;
@@ -31,6 +39,7 @@ pub struct EventContext {
     pub overlay_open: bool,
     pub exit_state: ExitState,
     pub workspace_view: WorkspaceView,
+    pub focus: FocusTarget,
 }
 
 impl EventContext {
@@ -40,6 +49,7 @@ impl EventContext {
             overlay_open: app.overlay().is_some(),
             exit_state: app.exit_state(),
             workspace_view: app.workspace_view(),
+            focus: app.focus(),
         }
     }
 }
@@ -50,6 +60,7 @@ impl Default for EventContext {
             overlay_open: false,
             exit_state: ExitState::Running,
             workspace_view: WorkspaceView::AggregatedTable,
+            focus: FocusTarget::StartMenu,
         }
     }
 }
@@ -82,17 +93,47 @@ fn translate_key_event(key: KeyEvent, context: EventContext) -> TranslatedEvent 
         KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             TranslatedEvent::Action(Action::RequestExit)
         }
+        KeyCode::Enter if context.exit_state == ExitState::WaitingForConfirmation => {
+            TranslatedEvent::Action(Action::ConfirmExit)
+        }
+        KeyCode::Enter if context.overlay_open => TranslatedEvent::Action(Action::ConfirmSelection),
         KeyCode::Char('?') => TranslatedEvent::Action(Action::OpenOverlay(Overlay::Help)),
         KeyCode::Esc if context.exit_state == ExitState::WaitingForConfirmation => {
             TranslatedEvent::Action(Action::CancelExit)
         }
         KeyCode::Esc if context.overlay_open => TranslatedEvent::Action(Action::CloseOverlay),
+        KeyCode::Up | KeyCode::Char('k' | 'K') if context.overlay_open => {
+            TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Previous))
+        }
+        KeyCode::Down | KeyCode::Char('j' | 'J') if context.overlay_open => {
+            TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Next))
+        }
+        KeyCode::Up | KeyCode::Char('k' | 'K') => {
+            TranslatedEvent::Action(Action::MoveWorkspaceSelection(MoveDirection::Previous))
+        }
+        KeyCode::Down | KeyCode::Char('j' | 'J') => {
+            TranslatedEvent::Action(Action::MoveWorkspaceSelection(MoveDirection::Next))
+        }
+        KeyCode::Tab => TranslatedEvent::Action(Action::CycleFocus { reverse: false }),
+        KeyCode::BackTab => TranslatedEvent::Action(Action::CycleFocus { reverse: true }),
         KeyCode::Char('t' | 'T') => {
             TranslatedEvent::Action(Action::SetWorkspaceView(match context.workspace_view {
                 WorkspaceView::AggregatedTable => WorkspaceView::DependencyTree,
                 WorkspaceView::DependencyTree => WorkspaceView::AggregatedTable,
             }))
         }
+        KeyCode::Char('r' | 'R') => TranslatedEvent::Action(Action::OpenRecipeSelectionForSelected),
+        KeyCode::Char('m' | 'M') => {
+            TranslatedEvent::Action(Action::OpenMachineSelectionForSelected)
+        }
+        KeyCode::Char('u' | 'U') => {
+            TranslatedEvent::Action(Action::OpenModulesSelectionForSelected)
+        }
+        KeyCode::Char('f' | 'F') => TranslatedEvent::Action(Action::OpenFuelSelectionForSelected),
+        KeyCode::Char('b' | 'B') => {
+            TranslatedEvent::Action(Action::OpenOverlay(Overlay::Selection(SelectionKind::Belt)))
+        }
+        KeyCode::Char('x' | 'X') => TranslatedEvent::Action(Action::ToggleSelectedExternalInput),
         _ => TranslatedEvent::Ignored,
     }
 }
@@ -401,19 +442,21 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
         Screen::Start => render_start_screen(app, frame, body),
         Screen::Import => render_import_screen(app, frame, body),
         Screen::Profiles => render_profile_screen(app, frame, body),
-        Screen::PlanningWorkspace => render_workspace_placeholder(app, frame, body),
+        Screen::PlanningWorkspace => render_workspace(app, frame, body),
         Screen::BlockedPlan => render_blocked_plan(app, frame, body),
     }
 
     let footer_text = if app.overlay().is_some() {
         "Enter confirm | Esc cancel | q quit"
+    } else if app.screen() == Screen::PlanningWorkspace {
+        "j/k move | Tab focus | t table/tree | r recipe | m machine | u modules | f fuel | b belt | ? help | q quit"
     } else {
         "Import data | Open plan | ? help | q quit"
     };
     frame.render_widget(Paragraph::new(footer_text), footer);
 
     if let Some(overlay) = app.overlay() {
-        render_overlay(overlay, frame, area);
+        render_overlay(app, overlay, frame, area);
     }
 }
 
@@ -536,19 +579,333 @@ fn render_import_screen(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_workspace_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    let plan_name = app
-        .plan()
-        .map_or_else(|| "No plan".to_owned(), |plan| plan.name().to_string());
+fn render_workspace(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    if app.plan().is_none() {
+        frame.render_widget(
+            Paragraph::new("No plan is open")
+                .block(Block::default().borders(Borders::ALL).title("Workspace")),
+            area,
+        );
+        return;
+    }
+
+    let [summary, body] = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+    render_workspace_summary(app, frame, summary);
+
+    if body.width >= 100 {
+        let [targets, results, details] = Layout::horizontal([
+            Constraint::Percentage(28),
+            Constraint::Percentage(44),
+            Constraint::Percentage(28),
+        ])
+        .areas(body);
+        render_targets_pane(app, frame, targets);
+        render_results_pane(app, frame, results);
+        render_details_pane(app, frame, details);
+    } else {
+        match app.focus() {
+            FocusTarget::TargetList => render_targets_pane(app, frame, body),
+            FocusTarget::StepConfiguration => render_details_pane(app, frame, body),
+            FocusTarget::Results | FocusTarget::StartMenu | FocusTarget::ProfileList => {
+                render_results_pane(app, frame, body);
+            }
+        }
+    }
+}
+
+fn render_workspace_summary(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let Some(plan) = app.plan() else {
+        return;
+    };
+    let dirty = if plan.is_dirty() { "dirty" } else { "saved" };
+    let profile = app.active_profile().map_or_else(
+        || plan.dataset_profile().to_string(),
+        |profile| profile.name().to_string(),
+    );
     let lines = vec![
-        Line::from("Planning Workspace"),
-        Line::from(format!("Plan: {plan_name}")),
-        Line::from(format!("Workspace view: {:?}", app.workspace_view())),
+        Line::from(format!(
+            "Plan: {} | Dataset: {profile} | State: {dirty}",
+            plan.name()
+        )),
+        Line::from(format!(
+            "Fingerprint: {} | Focus: {:?} | View: {:?}",
+            plan.dataset_fingerprint().as_str(),
+            app.focus(),
+            app.workspace_view()
+        )),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Workspace")),
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Planning Workspace"),
+        ),
         area,
     );
+}
+
+fn render_targets_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let catalog = active_catalog(app);
+    let Some(plan) = app.plan() else {
+        return;
+    };
+    let factory_plan = plan.plan();
+    let mut lines = vec![Line::from("Targets")];
+    for (index, target) in factory_plan.targets().iter().enumerate() {
+        let marker = if index == app.selected_target_index() {
+            ">"
+        } else {
+            " "
+        };
+        lines.push(Line::from(format!(
+            "{marker} {} {}",
+            commodity_label(catalog, target.commodity()),
+            format_rate(target.rate_per_second(), factory_plan.display_rate_unit())
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("External Inputs"));
+    if factory_plan.external_inputs().is_empty() {
+        lines.push(Line::from(" none"));
+    } else {
+        for commodity in factory_plan.external_inputs() {
+            lines.push(Line::from(format!(
+                " x {}",
+                commodity_label(catalog, commodity)
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from("Required External Inputs"));
+    if let Some(calculation) = app.calculation() {
+        push_rate_lines(
+            catalog,
+            calculation.external_inputs(),
+            factory_plan.display_rate_unit(),
+            &mut lines,
+        );
+    } else {
+        lines.push(Line::from(" none"));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("Targets")),
+        area,
+    );
+}
+
+fn render_results_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let lines = if let Some(error) = app.calculation_error() {
+        vec![
+            Line::from("Calculation error"),
+            Line::from(error.to_string()),
+            Line::from("Open diagnostics for details."),
+        ]
+    } else if let Some(calculation) = app.calculation() {
+        match app.workspace_view() {
+            WorkspaceView::AggregatedTable => aggregated_table_lines(app),
+            WorkspaceView::DependencyTree => dependency_tree_lines(app, calculation),
+        }
+    } else {
+        vec![Line::from("No calculation result")]
+    };
+
+    let title = match app.workspace_view() {
+        WorkspaceView::AggregatedTable => "Aggregated Table",
+        WorkspaceView::DependencyTree => "Dependency Tree",
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+fn aggregated_table_lines(app: &App) -> Vec<Line<'static>> {
+    let catalog = active_catalog(app);
+    let Some(calculation) = app.calculation() else {
+        return vec![Line::from("No calculation result")];
+    };
+    let unit = calculation.display_rate_unit();
+    let mut lines = vec![Line::from("Aggregated Table")];
+    lines.push(Line::from(
+        "Product | Rate | Recipe | Machine | Machines | Energy | Belt",
+    ));
+    for (index, step) in calculation.production_steps().iter().enumerate() {
+        let marker = if index == app.selected_result_index() {
+            ">"
+        } else {
+            " "
+        };
+        let belt = calculation
+            .belt_equivalents()
+            .iter()
+            .find(|equivalent| equivalent.commodity() == step.planning_product())
+            .map_or_else(
+                || "-".to_owned(),
+                |equivalent| format!("{} belts", format_quantity(equivalent.exact_belts().get())),
+            );
+        lines.push(Line::from(format!(
+            "{marker} {} | {} | {} | {} | {}/{} | {} | {belt}",
+            commodity_label(catalog, step.planning_product()),
+            format_rate(step.required_output_rate(), unit),
+            recipe_label(catalog, step.recipe()),
+            machine_label(catalog, step.machine()),
+            format_quantity(step.fractional_machine_count().get()),
+            step.installed_machine_count(),
+            step_energy_summary(step.energy()),
+        )));
+    }
+    lines
+}
+
+fn dependency_tree_lines(
+    app: &App,
+    calculation: &crate::planner::CalculationResult,
+) -> Vec<Line<'static>> {
+    let catalog = active_catalog(app);
+    let mut lines = vec![Line::from("Dependency Tree")];
+    for tree in calculation.dependency_trees() {
+        push_dependency_node_lines(catalog, tree, 0, &mut lines);
+    }
+    lines
+}
+
+fn push_dependency_node_lines(
+    catalog: Option<&Catalog>,
+    node: &DependencyNode,
+    depth: usize,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let indent = "  ".repeat(depth);
+    let mut tags = Vec::new();
+    if node.is_shared() {
+        tags.push("[shared]");
+    }
+    match node.kind() {
+        DependencyNodeKind::Production => {}
+        DependencyNodeKind::ExternalInput => tags.push("[external]"),
+        DependencyNodeKind::FuelInput => tags.push("[fuel]"),
+    }
+    let tag_text = if tags.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", tags.join(" "))
+    };
+    let machine_text = match (node.recipe(), node.machine()) {
+        (Some(recipe), Some(machine)) => format!(
+            " via {} on {}",
+            recipe_label(catalog, recipe),
+            machine_label(catalog, machine)
+        ),
+        _ => String::new(),
+    };
+    lines.push(Line::from(format!(
+        "{indent}- {} {}{tag_text}{machine_text}",
+        commodity_label(catalog, node.commodity()),
+        format_rate(node.required_rate(), RateUnit::Second),
+    )));
+    for child in node.children() {
+        push_dependency_node_lines(catalog, child, depth + 1, lines);
+    }
+}
+
+fn render_details_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
+    let lines = selected_step_detail_lines(app);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Selected Step"),
+        ),
+        area,
+    );
+}
+
+fn selected_step_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let catalog = active_catalog(app);
+    let Some(calculation) = app.calculation() else {
+        if let Some(error) = app.calculation_error() {
+            return vec![
+                Line::from("Calculation error"),
+                Line::from(error.to_string()),
+            ];
+        }
+        return vec![Line::from("No selected step")];
+    };
+    let Some(step) = calculation
+        .production_steps()
+        .get(app.selected_result_index())
+        .or_else(|| calculation.production_steps().first())
+    else {
+        return vec![Line::from("No production steps")];
+    };
+
+    let mut lines = vec![
+        Line::from("Selected Step"),
+        Line::from(format!(
+            "Product: {}",
+            commodity_label(catalog, step.planning_product())
+        )),
+        Line::from(format!(
+            "Required: {}",
+            format_rate(step.required_output_rate(), calculation.display_rate_unit())
+        )),
+        Line::from(format!("Recipe: {}", recipe_label(catalog, step.recipe()))),
+        Line::from(format!(
+            "Machine: {}",
+            machine_label(catalog, step.machine())
+        )),
+        Line::from(format!(
+            "Machines: {} fractional / {} installed",
+            format_quantity(step.fractional_machine_count().get()),
+            step.installed_machine_count()
+        )),
+        Line::from(format!(
+            "Modules: {}",
+            module_list_label(catalog, step.modules())
+        )),
+        Line::from(format!("Energy: {}", step_energy_summary(step.energy()))),
+        Line::from(""),
+        Line::from("Ingredients"),
+    ];
+    push_rate_lines(
+        catalog,
+        step.ingredients(),
+        calculation.display_rate_unit(),
+        &mut lines,
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from("Products"));
+    push_rate_lines(
+        catalog,
+        step.products(),
+        calculation.display_rate_unit(),
+        &mut lines,
+    );
+
+    let belt = calculation
+        .belt_equivalents()
+        .iter()
+        .find(|equivalent| equivalent.commodity() == step.planning_product())
+        .map_or_else(
+            || "Belt: none".to_owned(),
+            |equivalent| {
+                format!(
+                    "Belt: {} exact / {} installed",
+                    format_quantity(equivalent.exact_belts().get()),
+                    equivalent.installed_belts()
+                )
+            },
+        );
+    lines.push(Line::from(""));
+    lines.push(Line::from(belt));
+    lines
 }
 
 fn render_blocked_plan(app: &App, frame: &mut Frame<'_>, area: Rect) {
@@ -567,8 +924,8 @@ fn render_blocked_plan(app: &App, frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_overlay(overlay: &Overlay, frame: &mut Frame<'_>, area: Rect) {
-    let overlay_area = centered_rect(area, 52, 7);
+fn render_overlay(app: &App, overlay: &Overlay, frame: &mut Frame<'_>, area: Rect) {
+    let overlay_area = centered_rect(area, 74, 14);
     let lines = match overlay {
         Overlay::ConfirmExit => vec![
             Line::from("Discard unsaved changes and exit?"),
@@ -589,19 +946,300 @@ fn render_overlay(overlay: &Overlay, frame: &mut Frame<'_>, area: Rect) {
         ],
         Overlay::Help => vec![
             Line::from("Help"),
-            Line::from("Use the listed commands to manage profiles and plans."),
+            Line::from("j/k or arrows move selection"),
+            Line::from("Tab changes focus"),
+            Line::from("t switches table and dependency tree"),
+            Line::from("r recipe | m machine | u modules | f fuel | b belt"),
+            Line::from("x toggles external input"),
             Line::from("Esc close"),
         ],
-        Overlay::Diagnostics => vec![Line::from("Diagnostics"), Line::from("Esc close")],
-        Overlay::Selection(_) => vec![Line::from("Selection"), Line::from("Esc close")],
+        Overlay::Diagnostics => diagnostics_lines(app),
+        Overlay::Selection(kind) => selection_lines(app, kind),
     };
     frame.render_widget(Clear, overlay_area);
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("Confirm")),
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(overlay_title(overlay)),
+        ),
         overlay_area,
     );
+}
+
+fn diagnostics_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from("Diagnostics")];
+    if let Some(error) = app.calculation_error() {
+        lines.push(Line::from(format!("Calculation error: {error}")));
+    }
+    if let Some(profile) = app.active_profile() {
+        for diagnostic in profile.diagnostics() {
+            let severity = match diagnostic.severity {
+                DiagnosticSeverity::Warning => "warning",
+                DiagnosticSeverity::Error => "error",
+            };
+            lines.push(Line::from(format!(
+                "{severity}: {} {}",
+                diagnostic.path, diagnostic.message
+            )));
+        }
+    }
+    if lines.len() == 1 {
+        lines.push(Line::from("No diagnostics"));
+    }
+    lines.push(Line::from("Esc close"));
+    lines
+}
+
+fn selection_lines(app: &App, kind: &SelectionKind) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(format!("Selection: {}", selection_kind_title(kind))),
+        Line::from(format!("Query: {}", app.selection_query())),
+        Line::from(""),
+    ];
+    let options = selection_option_labels(app, kind);
+    if options.is_empty() {
+        lines.push(Line::from("No matches"));
+    } else {
+        for (index, option) in options.into_iter().take(9).enumerate() {
+            let marker = if index == app.selector_index() {
+                ">"
+            } else {
+                " "
+            };
+            lines.push(Line::from(format!("{marker} {option}")));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("Enter confirm | Esc close"));
+    lines
+}
+
+fn selection_option_labels(app: &App, kind: &SelectionKind) -> Vec<String> {
+    let Some(catalog) = active_catalog(app) else {
+        return Vec::new();
+    };
+    let query = app.selection_query().to_lowercase();
+    match kind {
+        SelectionKind::Commodity => catalog
+            .commodities()
+            .filter(|commodity| {
+                matches_query(&query, commodity.id().as_str(), commodity.localized_name())
+            })
+            .map(|commodity| commodity_label(Some(catalog), commodity.id()))
+            .collect(),
+        SelectionKind::Recipe { commodity } => catalog
+            .recipes_for_product(commodity)
+            .iter()
+            .filter_map(|recipe_id| catalog.recipe(recipe_id))
+            .filter(|recipe| {
+                recipe.supported()
+                    && matches_query(&query, recipe.id().as_str(), recipe.localized_name())
+            })
+            .map(|recipe| recipe_label(Some(catalog), recipe.id()))
+            .collect(),
+        SelectionKind::Machine { recipe } => {
+            catalog.recipe(recipe).map_or_else(Vec::new, |recipe| {
+                catalog
+                    .machines_for_category(recipe.category())
+                    .iter()
+                    .filter_map(|machine_id| catalog.machine(machine_id))
+                    .filter(|machine| {
+                        matches_query(&query, machine.id().as_str(), machine.localized_name())
+                    })
+                    .map(|machine| machine_label(Some(catalog), machine.id()))
+                    .collect()
+            })
+        }
+        SelectionKind::Modules { .. } => catalog
+            .modules()
+            .filter(|module| {
+                module.is_selectable()
+                    && matches_query(&query, module.id().as_str(), module.localized_name())
+            })
+            .map(|module| module_label(Some(catalog), module.id()))
+            .collect(),
+        SelectionKind::Fuel { .. } => catalog
+            .fuels()
+            .filter(|fuel| matches_query(&query, fuel.id().as_str(), fuel.localized_name()))
+            .map(|fuel| fuel_label(Some(catalog), fuel.id()))
+            .collect(),
+        SelectionKind::Belt => catalog
+            .belts()
+            .filter(|belt| matches_query(&query, belt.id().as_str(), belt.localized_name()))
+            .map(|belt| belt_label(Some(catalog), belt.id()))
+            .collect(),
+    }
+}
+
+fn overlay_title(overlay: &Overlay) -> &'static str {
+    match overlay {
+        Overlay::Selection(_) => "Selection",
+        Overlay::Diagnostics => "Diagnostics",
+        Overlay::Help => "Help",
+        Overlay::ConfirmExit
+        | Overlay::ConfirmProfileReplace { .. }
+        | Overlay::ConfirmProfileDelete { .. } => "Confirm",
+    }
+}
+
+fn active_catalog(app: &App) -> Option<&Catalog> {
+    app.active_profile()
+        .map(crate::persistence::DatasetProfile::catalog)
+}
+
+fn push_rate_lines(
+    catalog: Option<&Catalog>,
+    rates: &[CommodityRate],
+    unit: RateUnit,
+    lines: &mut Vec<Line<'static>>,
+) {
+    if rates.is_empty() {
+        lines.push(Line::from(" none"));
+        return;
+    }
+    for rate in rates {
+        lines.push(Line::from(format!(
+            " {} {}",
+            commodity_label(catalog, rate.commodity()),
+            format_rate(rate.rate(), unit)
+        )));
+    }
+}
+
+fn commodity_label(catalog: Option<&Catalog>, id: &CommodityId) -> String {
+    catalog
+        .and_then(|catalog| catalog.commodity(id))
+        .map_or_else(
+            || id.to_string(),
+            |commodity| label_with_id(id.as_str(), commodity.localized_name()),
+        )
+}
+
+fn recipe_label(catalog: Option<&Catalog>, id: &RecipeId) -> String {
+    catalog.and_then(|catalog| catalog.recipe(id)).map_or_else(
+        || id.to_string(),
+        |recipe| label_with_id(id.as_str(), recipe.localized_name()),
+    )
+}
+
+fn machine_label(catalog: Option<&Catalog>, id: &MachineId) -> String {
+    catalog.and_then(|catalog| catalog.machine(id)).map_or_else(
+        || id.to_string(),
+        |machine| label_with_id(id.as_str(), machine.localized_name()),
+    )
+}
+
+fn module_label(catalog: Option<&Catalog>, id: &ModuleId) -> String {
+    catalog.and_then(|catalog| catalog.module(id)).map_or_else(
+        || id.to_string(),
+        |module| label_with_id(id.as_str(), module.localized_name()),
+    )
+}
+
+fn fuel_label(catalog: Option<&Catalog>, id: &FuelId) -> String {
+    catalog.and_then(|catalog| catalog.fuel(id)).map_or_else(
+        || id.to_string(),
+        |fuel| label_with_id(id.as_str(), fuel.localized_name()),
+    )
+}
+
+fn belt_label(catalog: Option<&Catalog>, id: &BeltId) -> String {
+    catalog.and_then(|catalog| catalog.belt(id)).map_or_else(
+        || id.to_string(),
+        |belt| label_with_id(id.as_str(), belt.localized_name()),
+    )
+}
+
+fn module_list_label(catalog: Option<&Catalog>, modules: &[ModuleId]) -> String {
+    if modules.is_empty() {
+        return "none".to_owned();
+    }
+    modules
+        .iter()
+        .map(|module| module_label(catalog, module))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn label_with_id(id: &str, localized_name: Option<&str>) -> String {
+    localized_name.map_or_else(
+        || id.to_owned(),
+        |name| {
+            if name == id {
+                id.to_owned()
+            } else {
+                format!("{name} ({id})")
+            }
+        },
+    )
+}
+
+fn format_rate(rate: Positive, unit: RateUnit) -> String {
+    format!(
+        "{}{}",
+        format_quantity(unit.convert_rate(rate)),
+        rate_unit_suffix(unit)
+    )
+}
+
+fn rate_unit_suffix(unit: RateUnit) -> &'static str {
+    match unit {
+        RateUnit::Second => "/s",
+        RateUnit::Minute => "/min",
+        RateUnit::Hour => "/h",
+    }
+}
+
+fn format_quantity(value: f64) -> String {
+    if (value.round() - value).abs() < 1.0e-9 {
+        format!("{value:.0}")
+    } else if value.abs() >= 100.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+fn step_energy_summary(energy: &StepEnergy) -> String {
+    match energy {
+        StepEnergy::Electric(power) => format!(
+            "Electric {}",
+            format_power(power.fractional_process_watts().get())
+        ),
+        StepEnergy::Burner(fuel) => format!(
+            "Fuel {} {}",
+            fuel.fuel(),
+            format_rate(fuel.rate_per_second(), RateUnit::Second)
+        ),
+    }
+}
+
+fn format_power(watts: f64) -> String {
+    if watts >= 1_000_000.0 {
+        format!("{}MW", format_quantity(watts / 1_000_000.0))
+    } else if watts >= 1_000.0 {
+        format!("{}kW", format_quantity(watts / 1_000.0))
+    } else {
+        format!("{}W", format_quantity(watts))
+    }
+}
+
+fn selection_kind_title(kind: &SelectionKind) -> &'static str {
+    match kind {
+        SelectionKind::Commodity => "Commodity",
+        SelectionKind::Recipe { .. } => "Recipe",
+        SelectionKind::Machine { .. } => "Machine",
+        SelectionKind::Modules { .. } => "Modules",
+        SelectionKind::Fuel { .. } => "Fuel",
+        SelectionKind::Belt => "Belt",
+    }
+}
+
+fn matches_query(query: &str, id: &str, localized_name: Option<&str>) -> bool {
+    query.is_empty()
+        || id.to_lowercase().contains(query)
+        || localized_name.is_some_and(|name| name.to_lowercase().contains(query))
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {

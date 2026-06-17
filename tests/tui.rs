@@ -3,10 +3,12 @@ use std::path::PathBuf;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use factorio_planner_tui::app::{Action, App, ExitState, Overlay, WorkspaceView};
+use factorio_planner_tui::catalog::{CommodityId, ItemId, MachineId, RecipeId};
 use factorio_planner_tui::cli::StartupMode;
 use factorio_planner_tui::persistence::{
-    PlanFileStore, ProfileImportRequest, ProfileName, ProfileStore,
+    PlanDocument, PlanFileStore, PlanName, ProfileImportRequest, ProfileName, ProfileStore,
 };
+use factorio_planner_tui::planner::{FactoryPlan, Target};
 use factorio_planner_tui::tui::{EventContext, TranslatedEvent, render, translate_event};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -33,6 +35,26 @@ fn ctrl_key(code: KeyCode) -> Event {
 
 fn profile_name(name: &str) -> ProfileName {
     ProfileName::new(name).expect("test profile name should be valid")
+}
+
+fn plan_name(name: &str) -> PlanName {
+    PlanName::new(name).expect("test plan name should be valid")
+}
+
+fn item(name: &str) -> CommodityId {
+    CommodityId::Item(ItemId::new(name).expect("test item ID should be valid"))
+}
+
+fn recipe_id(name: &str) -> RecipeId {
+    RecipeId::new(name).expect("test recipe ID should be valid")
+}
+
+fn machine_id(name: &str) -> MachineId {
+    MachineId::new(name).expect("test machine ID should be valid")
+}
+
+fn target(commodity: CommodityId, rate_per_second: f64) -> Target {
+    Target::new(commodity, rate_per_second).expect("test target should be valid")
 }
 
 fn write_data(directory: &TempDir, name: &str, contents: &str) -> PathBuf {
@@ -108,12 +130,82 @@ fn buffer_to_string(buffer: &Buffer) -> String {
     lines.join("\n")
 }
 
-fn create_profile(root: &TempDir, sources: &TempDir, name: &str, data_name: &str, data: &str) {
+fn create_profile(
+    root: &TempDir,
+    sources: &TempDir,
+    name: &str,
+    data_name: &str,
+    data: &str,
+) -> factorio_planner_tui::persistence::DatasetProfile {
     let store = ProfileStore::new(root.path());
     let data_path = write_data(sources, data_name, data);
     store
         .create(&ProfileImportRequest::new(profile_name(name), &data_path))
-        .unwrap();
+        .unwrap()
+}
+
+fn workspace_data() -> &'static str {
+    r#"{
+        "item": {
+            "iron-ore": {"type": "item", "name": "iron-ore"},
+            "iron-plate": {"type": "item", "name": "iron-plate"},
+            "iron-gear-wheel": {"type": "item", "name": "iron-gear-wheel"},
+            "pipe": {"type": "item", "name": "pipe"}
+        },
+        "recipe": {
+            "advanced-iron-plate": {
+                "type": "recipe",
+                "name": "advanced-iron-plate",
+                "category": "crafting",
+                "hidden": true,
+                "energy_required": 1,
+                "ingredients": [],
+                "results": [{"type": "item", "name": "iron-plate", "amount": 2}]
+            },
+            "iron-plate": {
+                "type": "recipe",
+                "name": "iron-plate",
+                "category": "crafting",
+                "energy_required": 1,
+                "ingredients": [{"type": "item", "name": "iron-ore", "amount": 1}],
+                "results": [{"type": "item", "name": "iron-plate", "amount": 1}]
+            },
+            "iron-gear-wheel": {
+                "type": "recipe",
+                "name": "iron-gear-wheel",
+                "category": "crafting",
+                "energy_required": 0.5,
+                "ingredients": [{"type": "item", "name": "iron-plate", "amount": 2}],
+                "results": [{"type": "item", "name": "iron-gear-wheel", "amount": 1}]
+            },
+            "pipe": {
+                "type": "recipe",
+                "name": "pipe",
+                "category": "crafting",
+                "energy_required": 0.5,
+                "ingredients": [{"type": "item", "name": "iron-plate", "amount": 1}],
+                "results": [{"type": "item", "name": "pipe", "amount": 1}]
+            }
+        },
+        "assembling-machine": {
+            "assembler": {
+                "type": "assembling-machine",
+                "name": "assembler",
+                "crafting_categories": ["crafting"],
+                "crafting_speed": 1,
+                "module_slots": 2,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        },
+        "transport-belt": {
+            "transport-belt": {
+                "type": "transport-belt",
+                "name": "transport-belt",
+                "speed": 0.03125
+            }
+        }
+    }"#
 }
 
 #[test]
@@ -326,6 +418,143 @@ fn renders_profile_confirmation_overlays() {
     let delete = render_to_string(&app, 80, 20);
     assert!(delete.contains("Delete profile main?"));
     assert!(delete.contains("Esc cancel"));
+}
+
+#[test]
+fn renders_planning_workspace_table_and_selected_step_details() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "workspace.json", workspace_data());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut plan = FactoryPlan::new(target(item("iron-gear-wheel"), 3.0));
+    plan.add_target(target(item("pipe"), 4.0));
+    plan.set_selected_belt(factorio_planner_tui::catalog::BeltId::new("transport-belt").unwrap());
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        plan,
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let app = App::start(
+        StartupMode::OpenPlan { path },
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 120, 32);
+
+    assert!(screen.contains("Starter Base"));
+    assert!(screen.contains("Targets"));
+    assert!(screen.contains("Aggregated Table"));
+    assert!(screen.contains("iron-gear-wheel"));
+    assert!(screen.contains("iron-plate"));
+    assert!(screen.contains("assembler"));
+    assert!(screen.contains("Selected Step"));
+    assert!(screen.contains("External Inputs"));
+    assert!(screen.contains("iron-ore"));
+    assert!(screen.contains("Belt"));
+}
+
+#[test]
+fn renders_dependency_tree_with_shared_and_external_labels() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "workspace.json", workspace_data());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut plan = FactoryPlan::new(target(item("iron-gear-wheel"), 3.0));
+    plan.add_target(target(item("pipe"), 4.0));
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        plan,
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(
+        StartupMode::OpenPlan { path },
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::SetWorkspaceView(WorkspaceView::DependencyTree),
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 120, 32);
+
+    assert!(screen.contains("Dependency Tree"));
+    assert!(screen.contains("[shared]"));
+    assert!(screen.contains("[external]"));
+    assert!(screen.contains("iron-plate"));
+}
+
+#[test]
+fn renders_selection_and_diagnostics_overlays_from_workspace_state() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "workspace.json", workspace_data());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-plate"), 2.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(
+        StartupMode::OpenPlan { path },
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::OpenOverlay(Overlay::Selection(
+            factorio_planner_tui::app::SelectionKind::Recipe {
+                commodity: item("iron-plate"),
+            },
+        )),
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("advanced".to_owned()),
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+
+    let selection = render_to_string(&app, 100, 28);
+    assert!(selection.contains("Selection: Recipe"));
+    assert!(selection.contains("Query: advanced"));
+    assert!(selection.contains("advanced-iron-plate"));
+
+    app.dispatch(
+        Action::SetMachineChoice {
+            recipe: recipe_id("iron-plate"),
+            machine: machine_id("missing-machine"),
+        },
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::OpenOverlay(Overlay::Diagnostics),
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+    let diagnostics = render_to_string(&app, 100, 28);
+    assert!(diagnostics.contains("Diagnostics"));
+    assert!(diagnostics.contains("missing-machine"));
 }
 
 #[test]

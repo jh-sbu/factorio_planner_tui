@@ -36,6 +36,12 @@ pub enum WorkspaceView {
     DependencyTree,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MoveDirection {
+    Previous,
+    Next,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Overlay {
     Selection(SelectionKind),
@@ -99,6 +105,10 @@ pub struct App {
     calculation: Option<CalculationResult>,
     calculation_error: Option<PlannerError>,
     workspace_view: WorkspaceView,
+    selected_target_index: usize,
+    selected_result_index: usize,
+    selector_index: usize,
+    selection_query: String,
     exit_state: ExitState,
     pending_import: Option<PendingImport>,
     status_message: Option<String>,
@@ -158,6 +168,10 @@ impl App {
             calculation: None,
             calculation_error: None,
             workspace_view: WorkspaceView::AggregatedTable,
+            selected_target_index: 0,
+            selected_result_index: 0,
+            selector_index: 0,
+            selection_query: String::new(),
             exit_state: ExitState::Running,
             pending_import: None,
             status_message: None,
@@ -219,8 +233,33 @@ impl App {
             }
             Action::SetWorkspaceView(view) => self.workspace_view = *view,
             Action::MoveFocus(focus) => self.focus = *focus,
-            Action::OpenOverlay(overlay) => self.overlay = Some(overlay.clone()),
-            Action::CloseOverlay => self.overlay = None,
+            Action::CycleFocus { reverse } => self.cycle_focus(*reverse),
+            Action::MoveWorkspaceSelection(direction) => self.move_workspace_selection(*direction),
+            Action::OpenRecipeSelectionForSelected => self.open_recipe_selection_for_selected(),
+            Action::OpenMachineSelectionForSelected => self.open_machine_selection_for_selected(),
+            Action::OpenModulesSelectionForSelected => self.open_modules_selection_for_selected(),
+            Action::OpenFuelSelectionForSelected => self.open_fuel_selection_for_selected(),
+            Action::ToggleSelectedExternalInput => {
+                if let Some(commodity) = self.current_workspace_commodity() {
+                    self.dispatch_plan_action(Action::ToggleExternalInput { commodity })?;
+                }
+            }
+            Action::MoveSelectorSelection(direction) => self.move_selector_selection(*direction),
+            Action::SetSelectionQuery(query) => {
+                self.selection_query.clone_from(query);
+                self.selector_index = 0;
+            }
+            Action::ConfirmSelection => self.confirm_selection()?,
+            Action::OpenOverlay(overlay) => {
+                self.selector_index = 0;
+                self.selection_query.clear();
+                self.overlay = Some(overlay.clone());
+            }
+            Action::CloseOverlay => {
+                self.overlay = None;
+                self.selector_index = 0;
+                self.selection_query.clear();
+            }
             Action::RequestExit => self.request_exit(),
             Action::ConfirmExit => {
                 self.overlay = None;
@@ -234,74 +273,74 @@ impl App {
     }
 
     fn dispatch_plan_action(&mut self, action: Action) -> Result<(), AppError> {
-        match action {
+        let changed = match action {
             Action::AddTarget(target) => {
                 self.edit_plan(|plan| {
                     plan.add_target(target);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::ReplaceTarget { index, target } => {
                 self.try_edit_plan(|plan| plan.replace_target(index, target).map(|_| ()))?;
-                self.recalculate_current()
+                true
             }
             Action::RemoveTarget { index } => {
                 self.try_edit_plan(|plan| plan.remove_target(index).map(|_| ()))?;
-                self.recalculate_current()
+                true
             }
             Action::SetRecipeChoice { commodity, recipe } => {
                 self.edit_plan(|plan| {
                     plan.set_recipe_choice(commodity, recipe);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::ClearRecipeChoice { commodity } => {
                 self.edit_plan(|plan| {
                     plan.clear_recipe_choice(&commodity);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::SetMachineChoice { recipe, machine } => {
                 self.edit_plan(|plan| {
                     plan.set_machine_choice(recipe, machine);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::ClearMachineChoice { recipe } => {
                 self.edit_plan(|plan| {
                     plan.clear_machine_choice(&recipe);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::SetModules { commodity, modules } => {
                 self.edit_plan(|plan| {
                     plan.set_modules(commodity, modules);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::ClearModules { commodity } => {
                 self.edit_plan(|plan| {
                     plan.clear_modules(&commodity);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::SetFuelChoice { commodity, fuel } => {
                 self.edit_plan(|plan| {
                     plan.set_fuel_choice(commodity, fuel);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::ClearFuelChoice { commodity } => {
                 self.edit_plan(|plan| {
                     plan.clear_fuel_choice(&commodity);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::ToggleExternalInput { commodity } => {
                 self.edit_plan(|plan| {
                     plan.toggle_external_input(commodity);
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::SetSelectedBelt { belt } => {
                 self.edit_plan(|plan| match belt {
@@ -312,16 +351,21 @@ impl App {
                         plan.clear_selected_belt();
                     }
                 })?;
-                self.recalculate_current()
+                true
             }
             Action::SetDisplayRateUnit { unit } => {
                 self.edit_plan(|plan| {
                     plan.set_display_rate_unit(unit);
                 })?;
-                self.recalculate_current()
+                true
             }
-            _ => Ok(()),
+            _ => false,
+        };
+        if changed {
+            self.recalculate_current()?;
+            self.clamp_workspace_selection();
         }
+        Ok(())
     }
 
     #[must_use]
@@ -372,6 +416,26 @@ impl App {
     #[must_use]
     pub const fn workspace_view(&self) -> WorkspaceView {
         self.workspace_view
+    }
+
+    #[must_use]
+    pub const fn selected_target_index(&self) -> usize {
+        self.selected_target_index
+    }
+
+    #[must_use]
+    pub const fn selected_result_index(&self) -> usize {
+        self.selected_result_index
+    }
+
+    #[must_use]
+    pub const fn selector_index(&self) -> usize {
+        self.selector_index
+    }
+
+    #[must_use]
+    pub fn selection_query(&self) -> &str {
+        &self.selection_query
     }
 
     #[must_use]
@@ -439,6 +503,7 @@ impl App {
                 self.focus = FocusTarget::TargetList;
                 self.workspace_view = WorkspaceView::AggregatedTable;
                 self.recalculate_current()?;
+                self.clamp_workspace_selection();
             }
             crate::persistence::PlanOpenResult::Blocked(blocked) => {
                 self.plan = None;
@@ -475,7 +540,9 @@ impl App {
         self.screen = Screen::PlanningWorkspace;
         self.focus = FocusTarget::TargetList;
         self.workspace_view = WorkspaceView::AggregatedTable;
-        self.recalculate_current()
+        self.recalculate_current()?;
+        self.clamp_workspace_selection();
+        Ok(())
     }
 
     fn save_plan(&mut self, path: &Path, plans: &PlanFileStore) -> Result<(), AppError> {
@@ -500,7 +567,9 @@ impl App {
         self.screen = Screen::PlanningWorkspace;
         self.focus = FocusTarget::TargetList;
         self.workspace_view = WorkspaceView::AggregatedTable;
-        self.recalculate_current()
+        self.recalculate_current()?;
+        self.clamp_workspace_selection();
+        Ok(())
     }
 
     fn request_exit(&mut self) {
@@ -556,6 +625,247 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn clamp_workspace_selection(&mut self) {
+        let target_len = self
+            .plan
+            .as_ref()
+            .map_or(0, |document| document.plan().targets().len());
+        clamp_index(&mut self.selected_target_index, target_len);
+        let result_len = self
+            .calculation
+            .as_ref()
+            .map_or(0, |calculation| calculation.production_steps().len());
+        clamp_index(&mut self.selected_result_index, result_len);
+    }
+
+    fn move_workspace_selection(&mut self, direction: MoveDirection) {
+        match self.focus {
+            FocusTarget::TargetList => {
+                let len = self
+                    .plan
+                    .as_ref()
+                    .map_or(0, |document| document.plan().targets().len());
+                move_index(&mut self.selected_target_index, len, direction);
+            }
+            FocusTarget::Results | FocusTarget::StepConfiguration => {
+                let len = self
+                    .calculation
+                    .as_ref()
+                    .map_or(0, |calculation| calculation.production_steps().len());
+                move_index(&mut self.selected_result_index, len, direction);
+            }
+            FocusTarget::StartMenu | FocusTarget::ProfileList => {}
+        }
+    }
+
+    fn cycle_focus(&mut self, reverse: bool) {
+        self.focus = if self.screen == Screen::PlanningWorkspace {
+            cycle_focus_in_order(
+                self.focus,
+                &[
+                    FocusTarget::TargetList,
+                    FocusTarget::Results,
+                    FocusTarget::StepConfiguration,
+                ],
+                reverse,
+            )
+        } else {
+            match self.focus {
+                FocusTarget::StartMenu => FocusTarget::ProfileList,
+                FocusTarget::ProfileList => FocusTarget::StartMenu,
+                focus => focus,
+            }
+        };
+    }
+
+    fn move_selector_selection(&mut self, direction: MoveDirection) {
+        let len = self.selection_option_count();
+        move_index(&mut self.selector_index, len, direction);
+    }
+
+    fn open_recipe_selection_for_selected(&mut self) {
+        if let Some(commodity) = self.current_workspace_commodity() {
+            self.selector_index = 0;
+            self.selection_query.clear();
+            self.overlay = Some(Overlay::Selection(SelectionKind::Recipe { commodity }));
+        }
+    }
+
+    fn open_machine_selection_for_selected(&mut self) {
+        if let Some(recipe) = self.current_workspace_recipe() {
+            self.selector_index = 0;
+            self.selection_query.clear();
+            self.overlay = Some(Overlay::Selection(SelectionKind::Machine { recipe }));
+        }
+    }
+
+    fn open_modules_selection_for_selected(&mut self) {
+        if let Some(commodity) = self.current_workspace_commodity() {
+            self.selector_index = 0;
+            self.selection_query.clear();
+            self.overlay = Some(Overlay::Selection(SelectionKind::Modules { commodity }));
+        }
+    }
+
+    fn open_fuel_selection_for_selected(&mut self) {
+        if let Some(commodity) = self.current_workspace_commodity() {
+            self.selector_index = 0;
+            self.selection_query.clear();
+            self.overlay = Some(Overlay::Selection(SelectionKind::Fuel { commodity }));
+        }
+    }
+
+    fn current_workspace_commodity(&self) -> Option<CommodityId> {
+        match self.focus {
+            FocusTarget::TargetList => self
+                .plan
+                .as_ref()
+                .and_then(|document| document.plan().targets().get(self.selected_target_index))
+                .map(|target| target.commodity().clone()),
+            FocusTarget::Results | FocusTarget::StepConfiguration => self
+                .calculation
+                .as_ref()
+                .and_then(|calculation| {
+                    calculation
+                        .production_steps()
+                        .get(self.selected_result_index)
+                        .or_else(|| calculation.production_steps().first())
+                })
+                .map(|step| step.planning_product().clone()),
+            FocusTarget::StartMenu | FocusTarget::ProfileList => None,
+        }
+    }
+
+    fn current_workspace_recipe(&self) -> Option<RecipeId> {
+        self.calculation
+            .as_ref()
+            .and_then(|calculation| {
+                calculation
+                    .production_steps()
+                    .get(self.selected_result_index)
+                    .or_else(|| calculation.production_steps().first())
+            })
+            .map(|step| step.recipe().clone())
+    }
+
+    fn selection_option_count(&self) -> usize {
+        let Some(Overlay::Selection(kind)) = self.overlay.as_ref() else {
+            return 0;
+        };
+        self.selection_values(kind).len()
+    }
+
+    fn confirm_selection(&mut self) -> Result<(), AppError> {
+        let Some(Overlay::Selection(kind)) = self.overlay.clone() else {
+            return Ok(());
+        };
+        let Some(value) = self
+            .selection_values(&kind)
+            .into_iter()
+            .nth(self.selector_index)
+        else {
+            self.status_message = Some("no matching selection".to_owned());
+            return Ok(());
+        };
+
+        match (kind, value) {
+            (SelectionKind::Commodity, SelectionValue::Commodity(commodity)) => {
+                self.status_message = Some(format!("selected commodity {commodity}"));
+            }
+            (SelectionKind::Recipe { commodity }, SelectionValue::Recipe(recipe)) => {
+                self.dispatch_plan_action(Action::SetRecipeChoice { commodity, recipe })?;
+            }
+            (SelectionKind::Machine { recipe }, SelectionValue::Machine(machine)) => {
+                self.dispatch_plan_action(Action::SetMachineChoice { recipe, machine })?;
+            }
+            (SelectionKind::Modules { commodity }, SelectionValue::Module(module)) => {
+                let mut modules = self
+                    .plan
+                    .as_ref()
+                    .ok_or(AppError::NoOpenPlan)?
+                    .plan()
+                    .modules_for(&commodity)
+                    .to_vec();
+                modules.push(module);
+                self.dispatch_plan_action(Action::SetModules { commodity, modules })?;
+            }
+            (SelectionKind::Fuel { commodity }, SelectionValue::Fuel(fuel)) => {
+                self.dispatch_plan_action(Action::SetFuelChoice { commodity, fuel })?;
+            }
+            (SelectionKind::Belt, SelectionValue::Belt(belt)) => {
+                self.dispatch_plan_action(Action::SetSelectedBelt { belt: Some(belt) })?;
+            }
+            _ => {}
+        }
+
+        self.overlay = None;
+        self.selector_index = 0;
+        self.selection_query.clear();
+        Ok(())
+    }
+
+    fn selection_values(&self, kind: &SelectionKind) -> Vec<SelectionValue> {
+        let Some(profile) = self.active_profile.as_ref() else {
+            return Vec::new();
+        };
+        let catalog = profile.catalog();
+        let query = self.selection_query.to_lowercase();
+        match kind {
+            SelectionKind::Commodity => catalog
+                .commodities()
+                .filter(|commodity| {
+                    selection_matches(&query, commodity.id().as_str(), commodity.localized_name())
+                })
+                .map(|commodity| SelectionValue::Commodity(commodity.id().clone()))
+                .collect(),
+            SelectionKind::Recipe { commodity } => catalog
+                .recipes_for_product(commodity)
+                .iter()
+                .filter_map(|recipe_id| catalog.recipe(recipe_id))
+                .filter(|recipe| {
+                    recipe.supported()
+                        && selection_matches(&query, recipe.id().as_str(), recipe.localized_name())
+                })
+                .map(|recipe| SelectionValue::Recipe(recipe.id().clone()))
+                .collect(),
+            SelectionKind::Machine { recipe } => {
+                catalog.recipe(recipe).map_or_else(Vec::new, |recipe| {
+                    catalog
+                        .machines_for_category(recipe.category())
+                        .iter()
+                        .filter_map(|machine_id| catalog.machine(machine_id))
+                        .filter(|machine| {
+                            selection_matches(
+                                &query,
+                                machine.id().as_str(),
+                                machine.localized_name(),
+                            )
+                        })
+                        .map(|machine| SelectionValue::Machine(machine.id().clone()))
+                        .collect()
+                })
+            }
+            SelectionKind::Modules { .. } => catalog
+                .modules()
+                .filter(|module| {
+                    module.is_selectable()
+                        && selection_matches(&query, module.id().as_str(), module.localized_name())
+                })
+                .map(|module| SelectionValue::Module(module.id().clone()))
+                .collect(),
+            SelectionKind::Fuel { .. } => catalog
+                .fuels()
+                .filter(|fuel| selection_matches(&query, fuel.id().as_str(), fuel.localized_name()))
+                .map(|fuel| SelectionValue::Fuel(fuel.id().clone()))
+                .collect(),
+            SelectionKind::Belt => catalog
+                .belts()
+                .filter(|belt| selection_matches(&query, belt.id().as_str(), belt.localized_name()))
+                .map(|belt| SelectionValue::Belt(belt.id().clone()))
+                .collect(),
+        }
     }
 }
 
@@ -639,6 +949,18 @@ pub enum Action {
     },
     SetWorkspaceView(WorkspaceView),
     MoveFocus(FocusTarget),
+    CycleFocus {
+        reverse: bool,
+    },
+    MoveWorkspaceSelection(MoveDirection),
+    OpenRecipeSelectionForSelected,
+    OpenMachineSelectionForSelected,
+    OpenModulesSelectionForSelected,
+    OpenFuelSelectionForSelected,
+    ToggleSelectedExternalInput,
+    MoveSelectorSelection(MoveDirection),
+    SetSelectionQuery(String),
+    ConfirmSelection,
     OpenOverlay(Overlay),
     CloseOverlay,
     RequestExit,
@@ -653,6 +975,57 @@ fn pluralize(count: usize, unit: &str) -> String {
     } else {
         format!("{count} {unit}s")
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SelectionValue {
+    Commodity(CommodityId),
+    Recipe(RecipeId),
+    Machine(MachineId),
+    Module(ModuleId),
+    Fuel(FuelId),
+    Belt(BeltId),
+}
+
+fn selection_matches(query: &str, id: &str, localized_name: Option<&str>) -> bool {
+    query.is_empty()
+        || id.to_lowercase().contains(query)
+        || localized_name.is_some_and(|name| name.to_lowercase().contains(query))
+}
+
+fn move_index(index: &mut usize, len: usize, direction: MoveDirection) {
+    if len == 0 {
+        *index = 0;
+        return;
+    }
+    match direction {
+        MoveDirection::Previous => {
+            *index = index.saturating_sub(1);
+        }
+        MoveDirection::Next => {
+            *index = (*index + 1).min(len - 1);
+        }
+    }
+}
+
+fn clamp_index(index: &mut usize, len: usize) {
+    if len == 0 {
+        *index = 0;
+    } else {
+        *index = (*index).min(len - 1);
+    }
+}
+
+fn cycle_focus_in_order(focus: FocusTarget, order: &[FocusTarget], reverse: bool) -> FocusTarget {
+    let Some(position) = order.iter().position(|candidate| *candidate == focus) else {
+        return order[0];
+    };
+    let next = if reverse {
+        position.checked_sub(1).unwrap_or(order.len() - 1)
+    } else {
+        (position + 1) % order.len()
+    };
+    order[next]
 }
 
 #[derive(Debug, Error)]
