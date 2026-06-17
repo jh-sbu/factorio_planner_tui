@@ -2,7 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use factorio_planner_tui::app::{Action, App, ExitState, Overlay, WorkspaceView};
+use factorio_planner_tui::app::{
+    Action, App, ExitState, FocusTarget, MoveDirection, Overlay, OverlayKind, Screen,
+    TextPromptKind, WorkspaceView,
+};
 use factorio_planner_tui::catalog::{CommodityId, ItemId, MachineId, RecipeId};
 use factorio_planner_tui::cli::StartupMode;
 use factorio_planner_tui::persistence::{
@@ -294,6 +297,85 @@ fn table_tree_toggle_uses_current_workspace_view() {
 }
 
 #[test]
+fn start_profile_keys_move_activate_and_return() {
+    assert_eq!(
+        translate_event(
+            &key(KeyCode::Char('j'), KeyEventKind::Press),
+            EventContext {
+                screen: Screen::Start,
+                focus: FocusTarget::StartMenu,
+                ..EventContext::default()
+            },
+        ),
+        TranslatedEvent::Action(Action::MoveSelection(MoveDirection::Next))
+    );
+    assert_eq!(
+        translate_event(
+            &key(KeyCode::Enter, KeyEventKind::Press),
+            EventContext {
+                screen: Screen::Start,
+                focus: FocusTarget::ProfileList,
+                ..EventContext::default()
+            },
+        ),
+        TranslatedEvent::Action(Action::ActivateSelection)
+    );
+    assert_eq!(
+        translate_event(
+            &key(KeyCode::Esc, KeyEventKind::Press),
+            EventContext {
+                screen: Screen::Profiles,
+                focus: FocusTarget::ProfileList,
+                ..EventContext::default()
+            },
+        ),
+        TranslatedEvent::Action(Action::ReturnToStart)
+    );
+}
+
+#[test]
+fn text_prompt_keys_edit_and_submit_without_treating_q_as_quit() {
+    let context = EventContext {
+        overlay_kind: Some(OverlayKind::TextPrompt),
+        ..EventContext::default()
+    };
+
+    assert_eq!(
+        translate_event(&key(KeyCode::Char('q'), KeyEventKind::Press), context),
+        TranslatedEvent::Action(Action::AppendPromptText("q".to_owned()))
+    );
+    assert_eq!(
+        translate_event(&key(KeyCode::Backspace, KeyEventKind::Press), context),
+        TranslatedEvent::Action(Action::BackspacePromptText)
+    );
+    assert_eq!(
+        translate_event(&key(KeyCode::Enter, KeyEventKind::Press), context),
+        TranslatedEvent::Action(Action::SubmitPrompt)
+    );
+    assert_eq!(
+        translate_event(&ctrl_key(KeyCode::Char('c')), context),
+        TranslatedEvent::Action(Action::RequestExit)
+    );
+}
+
+#[test]
+fn selection_overlay_printable_keys_edit_query() {
+    let context = EventContext {
+        overlay_kind: Some(OverlayKind::Selection),
+        ..EventContext::default()
+    };
+
+    assert_eq!(
+        translate_event(&key(KeyCode::Char('i'), KeyEventKind::Press), context),
+        TranslatedEvent::Action(Action::AppendSelectionQuery("i".to_owned()))
+    );
+    assert_eq!(
+        translate_event(&key(KeyCode::Backspace, KeyEventKind::Press), context),
+        TranslatedEvent::Action(Action::BackspaceSelectionQuery)
+    );
+}
+
+#[test]
 fn resize_events_request_redraw_without_mutating_app_state() {
     assert_eq!(
         translate_event(&Event::Resize(100, 40), EventContext::default()),
@@ -330,12 +412,37 @@ fn renders_start_screen_with_profile_metadata() {
     let screen = render_to_string(&app, 100, 24);
 
     assert!(screen.contains("Profiles (2)"));
+    assert!(screen.contains("> Import data"));
+    assert!(screen.contains("> main"));
     assert!(screen.contains("main"));
     assert!(screen.contains("active"));
     assert!(screen.contains("warnings"));
     assert!(screen.contains("1 warning"));
     assert!(screen.contains("Data source:"));
     assert!(screen.contains("full.json"));
+}
+
+#[test]
+fn renders_text_prompt_overlay() {
+    let mut app = App::new();
+    app.dispatch(
+        Action::OpenOverlay(Overlay::TextPrompt(TextPromptKind::PlanName)),
+        &ProfileStore::new(TempDir::new().unwrap().path()),
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+    app.dispatch(
+        Action::AppendPromptText("Starter Base".to_owned()),
+        &ProfileStore::new(TempDir::new().unwrap().path()),
+        &PlanFileStore::new(),
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 80, 20);
+
+    assert!(screen.contains("Plan name"));
+    assert!(screen.contains("Starter Base"));
+    assert!(screen.contains("Enter confirm"));
 }
 
 #[test]

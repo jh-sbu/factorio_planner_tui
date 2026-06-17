@@ -21,8 +21,8 @@ use thiserror::Error;
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::app::{
-    Action, App, AppError, ExitState, FocusTarget, MoveDirection, Overlay, Screen, SelectionKind,
-    WorkspaceView,
+    Action, App, AppError, ExitState, FocusTarget, MoveDirection, Overlay, OverlayKind, Screen,
+    SelectionKind, TextPromptKind, WorkspaceView,
 };
 use crate::catalog::{
     BeltId, Catalog, CommodityId, FuelId, MachineId, ModuleId, Positive, RecipeId,
@@ -36,7 +36,10 @@ const MIN_TERMINAL_HEIGHT: u16 = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventContext {
+    pub screen: Screen,
     pub overlay_open: bool,
+    pub overlay_kind: Option<OverlayKind>,
+    pub create_plan_in_progress: bool,
     pub exit_state: ExitState,
     pub workspace_view: WorkspaceView,
     pub focus: FocusTarget,
@@ -46,7 +49,10 @@ impl EventContext {
     #[must_use]
     pub fn from_app(app: &App) -> Self {
         Self {
+            screen: app.screen(),
             overlay_open: app.overlay().is_some(),
+            overlay_kind: app.overlay().map(OverlayKind::from),
+            create_plan_in_progress: app.create_plan_in_progress(),
             exit_state: app.exit_state(),
             workspace_view: app.workspace_view(),
             focus: app.focus(),
@@ -57,7 +63,10 @@ impl EventContext {
 impl Default for EventContext {
     fn default() -> Self {
         Self {
+            screen: Screen::Start,
             overlay_open: false,
+            overlay_kind: None,
+            create_plan_in_progress: false,
             exit_state: ExitState::Running,
             workspace_view: WorkspaceView::AggregatedTable,
             focus: FocusTarget::StartMenu,
@@ -88,18 +97,32 @@ pub fn translate_event(event: &Event, context: EventContext) -> TranslatedEvent 
 }
 
 fn translate_key_event(key: KeyEvent, context: EventContext) -> TranslatedEvent {
+    if matches!(key.code, KeyCode::Char('c' | 'C')) && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return TranslatedEvent::Action(Action::RequestExit);
+    }
+    if context.overlay_kind == Some(OverlayKind::TextPrompt) {
+        return translate_text_prompt_key_event(key);
+    }
+    if context.overlay_kind == Some(OverlayKind::Selection) {
+        return translate_selection_key_event(key, context);
+    }
+
     match key.code {
         KeyCode::Char('q' | 'Q') => TranslatedEvent::Action(Action::RequestExit),
-        KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            TranslatedEvent::Action(Action::RequestExit)
-        }
         KeyCode::Enter if context.exit_state == ExitState::WaitingForConfirmation => {
             TranslatedEvent::Action(Action::ConfirmExit)
         }
         KeyCode::Enter if context.overlay_open => TranslatedEvent::Action(Action::ConfirmSelection),
+        KeyCode::Enter if matches!(context.screen, Screen::Start | Screen::Profiles) => {
+            TranslatedEvent::Action(Action::ActivateSelection)
+        }
         KeyCode::Char('?') => TranslatedEvent::Action(Action::OpenOverlay(Overlay::Help)),
         KeyCode::Esc if context.exit_state == ExitState::WaitingForConfirmation => {
             TranslatedEvent::Action(Action::CancelExit)
+        }
+        KeyCode::Esc if context.screen == Screen::Profiles => {
+            TranslatedEvent::Action(Action::ReturnToStart)
         }
         KeyCode::Esc if context.overlay_open => TranslatedEvent::Action(Action::CloseOverlay),
         KeyCode::Up | KeyCode::Char('k' | 'K') if context.overlay_open => {
@@ -109,10 +132,10 @@ fn translate_key_event(key: KeyEvent, context: EventContext) -> TranslatedEvent 
             TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Next))
         }
         KeyCode::Up | KeyCode::Char('k' | 'K') => {
-            TranslatedEvent::Action(Action::MoveWorkspaceSelection(MoveDirection::Previous))
+            TranslatedEvent::Action(Action::MoveSelection(MoveDirection::Previous))
         }
         KeyCode::Down | KeyCode::Char('j' | 'J') => {
-            TranslatedEvent::Action(Action::MoveWorkspaceSelection(MoveDirection::Next))
+            TranslatedEvent::Action(Action::MoveSelection(MoveDirection::Next))
         }
         KeyCode::Tab => TranslatedEvent::Action(Action::CycleFocus { reverse: false }),
         KeyCode::BackTab => TranslatedEvent::Action(Action::CycleFocus { reverse: true }),
@@ -134,6 +157,39 @@ fn translate_key_event(key: KeyEvent, context: EventContext) -> TranslatedEvent 
             TranslatedEvent::Action(Action::OpenOverlay(Overlay::Selection(SelectionKind::Belt)))
         }
         KeyCode::Char('x' | 'X') => TranslatedEvent::Action(Action::ToggleSelectedExternalInput),
+        _ => TranslatedEvent::Ignored,
+    }
+}
+
+fn translate_text_prompt_key_event(key: KeyEvent) -> TranslatedEvent {
+    match key.code {
+        KeyCode::Enter => TranslatedEvent::Action(Action::SubmitPrompt),
+        KeyCode::Esc => TranslatedEvent::Action(Action::CancelPrompt),
+        KeyCode::Backspace => TranslatedEvent::Action(Action::BackspacePromptText),
+        KeyCode::Char(value) => {
+            TranslatedEvent::Action(Action::AppendPromptText(value.to_string()))
+        }
+        _ => TranslatedEvent::Ignored,
+    }
+}
+
+fn translate_selection_key_event(key: KeyEvent, context: EventContext) -> TranslatedEvent {
+    match key.code {
+        KeyCode::Enter => TranslatedEvent::Action(Action::ConfirmSelection),
+        KeyCode::Esc if context.create_plan_in_progress => {
+            TranslatedEvent::Action(Action::CancelPrompt)
+        }
+        KeyCode::Esc => TranslatedEvent::Action(Action::CloseOverlay),
+        KeyCode::Up | KeyCode::Char('k' | 'K') => {
+            TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Previous))
+        }
+        KeyCode::Down | KeyCode::Char('j' | 'J') => {
+            TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Next))
+        }
+        KeyCode::Backspace => TranslatedEvent::Action(Action::BackspaceSelectionQuery),
+        KeyCode::Char(value) => {
+            TranslatedEvent::Action(Action::AppendSelectionQuery(value.to_string()))
+        }
         _ => TranslatedEvent::Ignored,
     }
 }
@@ -451,7 +507,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     } else if app.screen() == Screen::PlanningWorkspace {
         "j/k move | Tab focus | t table/tree | r recipe | m machine | u modules | f fuel | b belt | ? help | q quit"
     } else {
-        "Import data | Open plan | ? help | q quit"
+        "j/k move | Tab focus | Enter select | ? help | q quit"
     };
     frame.render_widget(Paragraph::new(footer_text), footer);
 
@@ -482,14 +538,22 @@ fn render_start_screen(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(area);
 
-    let commands = vec![
-        Line::from("Start"),
-        Line::from(""),
-        Line::from("Import data"),
-        Line::from("Create plan"),
-        Line::from("Open plan"),
-        Line::from("Manage profiles"),
-    ];
+    let action_labels = ["Import data", "Create plan", "Open plan", "Manage profiles"];
+    let mut commands = vec![Line::from("Start"), Line::from("")];
+    for (index, label) in action_labels.iter().enumerate() {
+        let marker = if app.focus() == FocusTarget::StartMenu
+            && index == app.selected_start_action_index()
+        {
+            ">"
+        } else {
+            " "
+        };
+        commands.push(Line::from(format!("{marker} {label}")));
+    }
+    if let Some(status) = app.status_message() {
+        commands.push(Line::from(""));
+        commands.push(Line::from(status.to_owned()));
+    }
     frame.render_widget(
         Paragraph::new(commands).block(Block::default().borders(Borders::ALL).title("Actions")),
         left,
@@ -509,7 +573,12 @@ fn render_profile_list(app: &App, frame: &mut Frame<'_>, area: Rect, title: &'st
         lines.push(Line::from("No dataset profiles"));
         lines.push(Line::from("Import data to create the first profile."));
     } else {
-        for summary in app.profiles() {
+        for (index, summary) in app.profiles().iter().enumerate() {
+            let marker = if index == app.selected_profile_index() {
+                ">"
+            } else {
+                " "
+            };
             let active_marker = if app
                 .active_profile()
                 .is_some_and(|profile| profile.name() == summary.name())
@@ -520,7 +589,7 @@ fn render_profile_list(app: &App, frame: &mut Frame<'_>, area: Rect, title: &'st
             };
             lines.push(Line::from(""));
             lines.push(Line::from(format!(
-                "{}{} - {}",
+                "{marker} {}{} - {}",
                 summary.name(),
                 active_marker,
                 pluralize(summary.warning_count(), "warning")
@@ -944,6 +1013,7 @@ fn render_overlay(app: &App, overlay: &Overlay, frame: &mut Frame<'_>, area: Rec
             Line::from("Enter confirm"),
             Line::from("Esc cancel"),
         ],
+        Overlay::TextPrompt(kind) => text_prompt_lines(app, *kind),
         Overlay::Help => vec![
             Line::from("Help"),
             Line::from("j/k or arrows move selection"),
@@ -965,6 +1035,24 @@ fn render_overlay(app: &App, overlay: &Overlay, frame: &mut Frame<'_>, area: Rec
         ),
         overlay_area,
     );
+}
+
+fn text_prompt_lines(app: &App, kind: TextPromptKind) -> Vec<Line<'static>> {
+    let title = match kind {
+        TextPromptKind::PlanName => "Plan name",
+        TextPromptKind::TargetRate => "Target rate per second",
+    };
+    let mut lines = vec![
+        Line::from(title),
+        Line::from(""),
+        Line::from(app.prompt_input().to_owned()),
+        Line::from(""),
+        Line::from("Enter confirm | Esc cancel"),
+    ];
+    if let Some(status) = app.status_message() {
+        lines.push(Line::from(status.to_owned()));
+    }
+    lines
 }
 
 fn diagnostics_lines(app: &App) -> Vec<Line<'static>> {
@@ -1077,6 +1165,10 @@ fn overlay_title(overlay: &Overlay) -> &'static str {
         Overlay::Selection(_) => "Selection",
         Overlay::Diagnostics => "Diagnostics",
         Overlay::Help => "Help",
+        Overlay::TextPrompt(kind) => match kind {
+            TextPromptKind::PlanName => "Plan name",
+            TextPromptKind::TargetRate => "Target rate",
+        },
         Overlay::ConfirmExit
         | Overlay::ConfirmProfileReplace { .. }
         | Overlay::ConfirmProfileDelete { .. } => "Confirm",

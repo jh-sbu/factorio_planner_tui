@@ -218,6 +218,194 @@ fn startup_can_select_a_dataset_without_opening_a_workspace() {
 }
 
 #[test]
+fn start_and_profile_selections_are_keyboard_driven() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "alpha", "alpha.json", full_data());
+    create_profile(&root, &sources, "beta", "beta.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let mut app = App::start(StartupMode::StartScreen, &profile_store, &plan_store).unwrap();
+
+    assert_eq!(app.selected_start_action_index(), 0);
+    assert_eq!(app.selected_profile_index(), 0);
+
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(app.selected_start_action_index(), 1);
+
+    app.dispatch(
+        Action::CycleFocus { reverse: false },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(app.selected_profile_index(), 1);
+
+    app.dispatch(Action::ActivateSelection, &profile_store, &plan_store)
+        .unwrap();
+
+    assert_eq!(app.screen(), Screen::Start);
+    assert_eq!(app.active_profile().unwrap().name(), &profile_name("beta"));
+    assert_eq!(
+        profile_store.active_profile_name().unwrap(),
+        Some(profile_name("beta"))
+    );
+}
+
+#[test]
+fn manage_profiles_opens_and_escape_returns_to_start() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let mut app = App::start(StartupMode::StartScreen, &profile_store, &plan_store).unwrap();
+
+    for _ in 0..3 {
+        app.dispatch(
+            Action::MoveSelection(MoveDirection::Next),
+            &profile_store,
+            &plan_store,
+        )
+        .unwrap();
+    }
+    app.dispatch(Action::ActivateSelection, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(app.screen(), Screen::Profiles);
+
+    app.dispatch(Action::ReturnToStart, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(app.screen(), Screen::Start);
+}
+
+#[test]
+fn create_plan_prompt_flow_builds_a_workspace() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let mut app = App::start(StartupMode::StartScreen, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ActivateSelection, &profile_store, &plan_store)
+        .unwrap();
+    assert!(matches!(app.overlay(), Some(Overlay::TextPrompt(_))));
+
+    app.dispatch(
+        Action::AppendPromptText("Starter Base".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::SubmitPrompt, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(
+        app.overlay(),
+        Some(&Overlay::Selection(SelectionKind::Commodity))
+    );
+
+    app.dispatch(
+        Action::SetSelectionQuery("iron-plate".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+    assert!(matches!(app.overlay(), Some(Overlay::TextPrompt(_))));
+
+    app.dispatch(
+        Action::AppendPromptText("2.5".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::SubmitPrompt, &profile_store, &plan_store)
+        .unwrap();
+
+    assert_eq!(app.screen(), Screen::PlanningWorkspace);
+    let plan = app.plan().unwrap();
+    assert_eq!(plan.name(), &plan_name("Starter Base"));
+    assert_eq!(plan.dataset_profile(), &profile_name("main"));
+    assert!(plan.is_dirty());
+    assert_eq!(plan.plan().targets()[0].commodity(), &item("iron-plate"));
+    assert_close(plan.plan().targets()[0].rate_per_second().get(), 2.5);
+}
+
+#[test]
+fn create_plan_prompt_validation_and_cancel_keep_state_safe() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let mut app = App::start(StartupMode::StartScreen, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ActivateSelection, &profile_store, &plan_store)
+        .unwrap();
+    app.dispatch(Action::SubmitPrompt, &profile_store, &plan_store)
+        .unwrap();
+    assert!(matches!(app.overlay(), Some(Overlay::TextPrompt(_))));
+    assert!(app.status_message().unwrap().contains("plan name"));
+
+    app.dispatch(
+        Action::AppendPromptText("Starter Base".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::SubmitPrompt, &profile_store, &plan_store)
+        .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("iron-plate".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+    app.dispatch(
+        Action::AppendPromptText("0".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::SubmitPrompt, &profile_store, &plan_store)
+        .unwrap();
+    assert!(matches!(app.overlay(), Some(Overlay::TextPrompt(_))));
+    assert!(app.status_message().unwrap().contains("positive"));
+
+    app.dispatch(Action::CancelPrompt, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(app.screen(), Screen::Start);
+    assert!(app.overlay().is_none());
+    assert!(app.plan().is_none());
+}
+
+#[test]
 fn opens_a_ready_plan_and_recalculates_after_action_edits() {
     let root = TempDir::new().unwrap();
     let sources = TempDir::new().unwrap();

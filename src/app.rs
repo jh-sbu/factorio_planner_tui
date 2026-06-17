@@ -42,14 +42,59 @@ pub enum MoveDirection {
     Next,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartAction {
+    ImportData,
+    CreatePlan,
+    OpenPlan,
+    ManageProfiles,
+}
+
+const START_ACTIONS: [StartAction; 4] = [
+    StartAction::ImportData,
+    StartAction::CreatePlan,
+    StartAction::OpenPlan,
+    StartAction::ManageProfiles,
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Overlay {
     Selection(SelectionKind),
+    TextPrompt(TextPromptKind),
     Diagnostics,
     Help,
     ConfirmExit,
     ConfirmProfileReplace { profile: ProfileName },
     ConfirmProfileDelete { profile: ProfileName },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextPromptKind {
+    PlanName,
+    TargetRate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayKind {
+    Selection,
+    TextPrompt,
+    Diagnostics,
+    Help,
+    Confirmation,
+}
+
+impl From<&Overlay> for OverlayKind {
+    fn from(overlay: &Overlay) -> Self {
+        match overlay {
+            Overlay::Selection(_) => Self::Selection,
+            Overlay::TextPrompt(_) => Self::TextPrompt,
+            Overlay::Diagnostics => Self::Diagnostics,
+            Overlay::Help => Self::Help,
+            Overlay::ConfirmExit
+            | Overlay::ConfirmProfileReplace { .. }
+            | Overlay::ConfirmProfileDelete { .. } => Self::Confirmation,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +138,13 @@ impl PendingImport {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CreatePlanDraft {
+    profile: ProfileName,
+    name: Option<PlanName>,
+    commodity: Option<CommodityId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct App {
     screen: Screen,
@@ -105,10 +157,14 @@ pub struct App {
     calculation: Option<CalculationResult>,
     calculation_error: Option<PlannerError>,
     workspace_view: WorkspaceView,
+    selected_start_action_index: usize,
+    selected_profile_index: usize,
     selected_target_index: usize,
     selected_result_index: usize,
     selector_index: usize,
     selection_query: String,
+    prompt_input: String,
+    create_plan_draft: Option<CreatePlanDraft>,
     exit_state: ExitState,
     pending_import: Option<PendingImport>,
     status_message: Option<String>,
@@ -168,10 +224,14 @@ impl App {
             calculation: None,
             calculation_error: None,
             workspace_view: WorkspaceView::AggregatedTable,
+            selected_start_action_index: 0,
+            selected_profile_index: 0,
             selected_target_index: 0,
             selected_result_index: 0,
             selector_index: 0,
             selection_query: String::new(),
+            prompt_input: String::new(),
+            create_plan_draft: None,
             exit_state: ExitState::Running,
             pending_import: None,
             status_message: None,
@@ -234,6 +294,9 @@ impl App {
             Action::SetWorkspaceView(view) => self.workspace_view = *view,
             Action::MoveFocus(focus) => self.focus = *focus,
             Action::CycleFocus { reverse } => self.cycle_focus(*reverse),
+            Action::MoveSelection(direction) => self.move_selection(*direction),
+            Action::ActivateSelection => self.activate_selection(profiles)?,
+            Action::ReturnToStart => self.return_to_start(),
             Action::MoveWorkspaceSelection(direction) => self.move_workspace_selection(*direction),
             Action::OpenRecipeSelectionForSelected => self.open_recipe_selection_for_selected(),
             Action::OpenMachineSelectionForSelected => self.open_machine_selection_for_selected(),
@@ -249,6 +312,20 @@ impl App {
                 self.selection_query.clone_from(query);
                 self.selector_index = 0;
             }
+            Action::AppendSelectionQuery(text) => {
+                self.selection_query.push_str(text);
+                self.selector_index = 0;
+            }
+            Action::BackspaceSelectionQuery => {
+                self.selection_query.pop();
+                self.selector_index = 0;
+            }
+            Action::AppendPromptText(text) => self.prompt_input.push_str(text),
+            Action::BackspacePromptText => {
+                self.prompt_input.pop();
+            }
+            Action::SubmitPrompt => self.submit_prompt(profiles)?,
+            Action::CancelPrompt => self.cancel_prompt(),
             Action::ConfirmSelection => self.confirm_selection()?,
             Action::OpenOverlay(overlay) => {
                 self.selector_index = 0;
@@ -259,6 +336,7 @@ impl App {
                 self.overlay = None;
                 self.selector_index = 0;
                 self.selection_query.clear();
+                self.prompt_input.clear();
             }
             Action::RequestExit => self.request_exit(),
             Action::ConfirmExit => {
@@ -419,6 +497,16 @@ impl App {
     }
 
     #[must_use]
+    pub const fn selected_start_action_index(&self) -> usize {
+        self.selected_start_action_index
+    }
+
+    #[must_use]
+    pub const fn selected_profile_index(&self) -> usize {
+        self.selected_profile_index
+    }
+
+    #[must_use]
     pub const fn selected_target_index(&self) -> usize {
         self.selected_target_index
     }
@@ -436,6 +524,16 @@ impl App {
     #[must_use]
     pub fn selection_query(&self) -> &str {
         &self.selection_query
+    }
+
+    #[must_use]
+    pub fn prompt_input(&self) -> &str {
+        &self.prompt_input
+    }
+
+    #[must_use]
+    pub const fn create_plan_in_progress(&self) -> bool {
+        self.create_plan_draft.is_some()
     }
 
     #[must_use]
@@ -458,6 +556,15 @@ impl App {
         if let Some(active) = profiles.active_profile_name()? {
             self.active_profile = Some(profiles.open(&active)?);
         }
+        if let Some(active) = self.active_profile.as_ref()
+            && let Some(index) = self
+                .profiles
+                .iter()
+                .position(|summary| summary.name() == active.name())
+        {
+            self.selected_profile_index = index;
+        }
+        clamp_index(&mut self.selected_profile_index, self.profiles.len());
         Ok(())
     }
 
@@ -589,6 +696,14 @@ impl App {
         }
     }
 
+    fn return_to_start(&mut self) {
+        if self.screen == Screen::Profiles {
+            self.screen = Screen::Start;
+            self.focus = FocusTarget::StartMenu;
+            self.overlay = None;
+        }
+    }
+
     fn edit_plan(&mut self, edit: impl FnOnce(&mut FactoryPlan)) -> Result<(), AppError> {
         let document = self.plan.as_mut().ok_or(AppError::NoOpenPlan)?;
         document.edit_plan(edit);
@@ -660,9 +775,30 @@ impl App {
         }
     }
 
+    fn move_selection(&mut self, direction: MoveDirection) {
+        match (self.screen, self.focus) {
+            (Screen::Start, FocusTarget::StartMenu) => {
+                move_index(
+                    &mut self.selected_start_action_index,
+                    START_ACTIONS.len(),
+                    direction,
+                );
+            }
+            (Screen::Start | Screen::Profiles, FocusTarget::ProfileList) => {
+                move_index(
+                    &mut self.selected_profile_index,
+                    self.profiles.len(),
+                    direction,
+                );
+            }
+            (Screen::PlanningWorkspace, _) => self.move_workspace_selection(direction),
+            _ => {}
+        }
+    }
+
     fn cycle_focus(&mut self, reverse: bool) {
-        self.focus = if self.screen == Screen::PlanningWorkspace {
-            cycle_focus_in_order(
+        self.focus = match self.screen {
+            Screen::PlanningWorkspace => cycle_focus_in_order(
                 self.focus,
                 &[
                     FocusTarget::TargetList,
@@ -670,14 +806,92 @@ impl App {
                     FocusTarget::StepConfiguration,
                 ],
                 reverse,
-            )
-        } else {
-            match self.focus {
+            ),
+            Screen::Start => match self.focus {
                 FocusTarget::StartMenu => FocusTarget::ProfileList,
-                FocusTarget::ProfileList => FocusTarget::StartMenu,
-                focus => focus,
-            }
+                _ => FocusTarget::StartMenu,
+            },
+            Screen::Profiles => FocusTarget::ProfileList,
+            _ => self.focus,
         };
+    }
+
+    fn activate_selection(&mut self, profiles: &ProfileStore) -> Result<(), AppError> {
+        match (self.screen, self.focus) {
+            (Screen::Start, FocusTarget::StartMenu) => self.activate_start_action(profiles),
+            (Screen::Start | Screen::Profiles, FocusTarget::ProfileList) => {
+                self.select_selected_profile(profiles)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn activate_start_action(&mut self, profiles: &ProfileStore) -> Result<(), AppError> {
+        match START_ACTIONS[self.selected_start_action_index] {
+            StartAction::ImportData => {
+                self.status_message = Some(
+                    "Interactive import is not implemented yet; run with --import-data PATH --profile NAME"
+                        .to_owned(),
+                );
+                Ok(())
+            }
+            StartAction::CreatePlan => self.begin_create_plan(profiles),
+            StartAction::OpenPlan => {
+                self.status_message = Some(
+                    "Interactive plan opening is not implemented yet; run with --plan PATH"
+                        .to_owned(),
+                );
+                Ok(())
+            }
+            StartAction::ManageProfiles => {
+                self.screen = Screen::Profiles;
+                self.focus = FocusTarget::ProfileList;
+                Ok(())
+            }
+        }
+    }
+
+    fn select_selected_profile(&mut self, profiles: &ProfileStore) -> Result<(), AppError> {
+        let Some(profile) = self
+            .profiles
+            .get(self.selected_profile_index)
+            .map(|summary| summary.name().clone())
+        else {
+            self.status_message = Some("No dataset profile is available".to_owned());
+            return Ok(());
+        };
+        self.select_profile(&profile, profiles)
+    }
+
+    fn begin_create_plan(&mut self, profiles: &ProfileStore) -> Result<(), AppError> {
+        let profile = if let Some(active) = self.active_profile.as_ref() {
+            active.name().clone()
+        } else if let Some(profile) = self
+            .profiles
+            .get(self.selected_profile_index)
+            .map(|summary| summary.name().clone())
+        {
+            self.select_profile(&profile, profiles)?;
+            profile
+        } else {
+            self.status_message = Some(
+                "No dataset profile is available; import data with --import-data PATH --profile NAME"
+                    .to_owned(),
+            );
+            return Ok(());
+        };
+
+        self.create_plan_draft = Some(CreatePlanDraft {
+            profile,
+            name: None,
+            commodity: None,
+        });
+        self.prompt_input.clear();
+        self.selection_query.clear();
+        self.selector_index = 0;
+        self.overlay = Some(Overlay::TextPrompt(TextPromptKind::PlanName));
+        self.status_message = Some("Enter plan name".to_owned());
+        Ok(())
     }
 
     fn move_selector_selection(&mut self, direction: MoveDirection) {
@@ -772,6 +986,15 @@ impl App {
 
         match (kind, value) {
             (SelectionKind::Commodity, SelectionValue::Commodity(commodity)) => {
+                if let Some(draft) = self.create_plan_draft.as_mut() {
+                    draft.commodity = Some(commodity);
+                    self.overlay = Some(Overlay::TextPrompt(TextPromptKind::TargetRate));
+                    self.prompt_input.clear();
+                    self.selection_query.clear();
+                    self.selector_index = 0;
+                    self.status_message = Some("Enter target rate per second".to_owned());
+                    return Ok(());
+                }
                 self.status_message = Some(format!("selected commodity {commodity}"));
             }
             (SelectionKind::Recipe { commodity }, SelectionValue::Recipe(recipe)) => {
@@ -804,6 +1027,74 @@ impl App {
         self.selector_index = 0;
         self.selection_query.clear();
         Ok(())
+    }
+
+    fn submit_prompt(&mut self, profiles: &ProfileStore) -> Result<(), AppError> {
+        let Some(Overlay::TextPrompt(kind)) = self.overlay else {
+            return Ok(());
+        };
+
+        match kind {
+            TextPromptKind::PlanName => {
+                let Ok(name) = PlanName::new(self.prompt_input.clone()) else {
+                    self.status_message = Some("Enter a valid plan name".to_owned());
+                    return Ok(());
+                };
+                if let Some(draft) = self.create_plan_draft.as_mut() {
+                    draft.name = Some(name);
+                }
+                self.prompt_input.clear();
+                self.selection_query.clear();
+                self.selector_index = 0;
+                self.overlay = Some(Overlay::Selection(SelectionKind::Commodity));
+                self.status_message = Some("Choose target commodity".to_owned());
+            }
+            TextPromptKind::TargetRate => {
+                let Ok(rate_per_second) = self.prompt_input.trim().parse::<f64>() else {
+                    self.status_message =
+                        Some("Target rate must be a positive number per second".to_owned());
+                    return Ok(());
+                };
+                let Some(draft) = self.create_plan_draft.clone() else {
+                    self.cancel_prompt();
+                    return Ok(());
+                };
+                let Some(name) = draft.name else {
+                    self.status_message = Some("Enter a valid plan name".to_owned());
+                    self.overlay = Some(Overlay::TextPrompt(TextPromptKind::PlanName));
+                    return Ok(());
+                };
+                let Some(commodity) = draft.commodity else {
+                    self.status_message = Some("Choose target commodity".to_owned());
+                    self.overlay = Some(Overlay::Selection(SelectionKind::Commodity));
+                    return Ok(());
+                };
+                let Ok(target) = Target::new(commodity, rate_per_second) else {
+                    self.status_message =
+                        Some("Target rate must be positive per second".to_owned());
+                    return Ok(());
+                };
+                self.create_plan(name, &draft.profile, target, profiles)?;
+                self.create_plan_draft = None;
+                self.prompt_input.clear();
+                self.selection_query.clear();
+                self.selector_index = 0;
+                self.overlay = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_prompt(&mut self) {
+        self.create_plan_draft = None;
+        self.prompt_input.clear();
+        self.selection_query.clear();
+        self.selector_index = 0;
+        self.overlay = None;
+        self.status_message = Some("Create plan cancelled".to_owned());
+        if self.screen == Screen::Profiles {
+            self.screen = Screen::Start;
+        }
     }
 
     fn selection_values(&self, kind: &SelectionKind) -> Vec<SelectionValue> {
@@ -952,6 +1243,9 @@ pub enum Action {
     CycleFocus {
         reverse: bool,
     },
+    MoveSelection(MoveDirection),
+    ActivateSelection,
+    ReturnToStart,
     MoveWorkspaceSelection(MoveDirection),
     OpenRecipeSelectionForSelected,
     OpenMachineSelectionForSelected,
@@ -960,6 +1254,12 @@ pub enum Action {
     ToggleSelectedExternalInput,
     MoveSelectorSelection(MoveDirection),
     SetSelectionQuery(String),
+    AppendSelectionQuery(String),
+    BackspaceSelectionQuery,
+    AppendPromptText(String),
+    BackspacePromptText,
+    SubmitPrompt,
+    CancelPrompt,
     ConfirmSelection,
     OpenOverlay(Overlay),
     CloseOverlay,
