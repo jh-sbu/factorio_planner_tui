@@ -328,3 +328,36 @@ fn binary_reports_help_and_pre_tui_errors() {
         .failure()
         .stderr(contains("open import source"));
 }
+
+#[test]
+fn binary_reports_import_diagnostic_context_for_invalid_data() {
+    let sources = TempDir::new().unwrap();
+    let data_path = write_data(
+        &sources,
+        "invalid.raw.json",
+        r#"{
+            "recipe": {
+                "broken": {
+                    "type": "recipe",
+                    "name": "broken"
+                }
+            }
+        }"#,
+    );
+
+    Command::cargo_bin("factorio_planner_tui")
+        .unwrap()
+        .args([
+            "--import-data",
+            data_path.to_str().unwrap(),
+            "--profile",
+            "invalid",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "data.raw contains invalid supported prototype data",
+        ))
+        .stderr(contains("/recipe/broken/results"))
+        .stderr(contains("missing required results"));
+}

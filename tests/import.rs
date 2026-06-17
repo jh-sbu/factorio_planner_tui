@@ -651,6 +651,198 @@ fn ignores_unrelated_top_level_collections() {
 }
 
 #[test]
+fn imports_item_like_prototype_collections_as_item_commodities() {
+    let report = import(
+        r#"{
+            "ammo": {"firearm-magazine": {"type": "ammo", "name": "firearm-magazine"}},
+            "armor": {"light-armor": {"type": "armor", "name": "light-armor"}},
+            "blueprint": {"blueprint": {"type": "blueprint", "name": "blueprint"}},
+            "blueprint-book": {"blueprint-book": {"type": "blueprint-book", "name": "blueprint-book"}},
+            "capsule": {"grenade": {"type": "capsule", "name": "grenade"}},
+            "copy-paste-tool": {"cut-paste-tool": {"type": "copy-paste-tool", "name": "cut-paste-tool"}},
+            "deconstruction-item": {"deconstruction-planner": {"type": "deconstruction-item", "name": "deconstruction-planner"}},
+            "gun": {"pistol": {"type": "gun", "name": "pistol"}},
+            "item": {"iron-plate": {"type": "item", "name": "iron-plate"}},
+            "item-with-entity-data": {"locomotive": {"type": "item-with-entity-data", "name": "locomotive"}},
+            "rail-planner": {"rail": {"type": "rail-planner", "name": "rail"}},
+            "repair-tool": {"repair-pack": {"type": "repair-tool", "name": "repair-pack"}},
+            "selection-tool": {"selection-tool": {"type": "selection-tool", "name": "selection-tool"}},
+            "spidertron-remote": {"spidertron-remote": {"type": "spidertron-remote", "name": "spidertron-remote"}},
+            "tool": {"automation-science-pack": {"type": "tool", "name": "automation-science-pack"}},
+            "upgrade-item": {"upgrade-planner": {"type": "upgrade-item", "name": "upgrade-planner"}},
+            "recipe": {
+                "mixed-products": {
+                    "type": "recipe",
+                    "name": "mixed-products",
+                    "ingredients": [{"type": "item", "name": "iron-plate", "amount": 1}],
+                    "results": [
+                        {"type": "item", "name": "firearm-magazine", "amount": 1},
+                        {"type": "item", "name": "light-armor", "amount": 1},
+                        {"type": "item", "name": "blueprint", "amount": 1},
+                        {"type": "item", "name": "blueprint-book", "amount": 1},
+                        {"type": "item", "name": "grenade", "amount": 1},
+                        {"type": "item", "name": "cut-paste-tool", "amount": 1},
+                        {"type": "item", "name": "deconstruction-planner", "amount": 1},
+                        {"type": "item", "name": "pistol", "amount": 1},
+                        {"type": "item", "name": "locomotive", "amount": 1},
+                        {"type": "item", "name": "rail", "amount": 1},
+                        {"type": "item", "name": "repair-pack", "amount": 1},
+                        {"type": "item", "name": "selection-tool", "amount": 1},
+                        {"type": "item", "name": "spidertron-remote", "amount": 1},
+                        {"type": "item", "name": "automation-science-pack", "amount": 1},
+                        {"type": "item", "name": "upgrade-planner", "amount": 1}
+                    ]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    for name in [
+        "firearm-magazine",
+        "light-armor",
+        "blueprint",
+        "blueprint-book",
+        "grenade",
+        "cut-paste-tool",
+        "deconstruction-planner",
+        "pistol",
+        "locomotive",
+        "rail",
+        "repair-pack",
+        "selection-tool",
+        "spidertron-remote",
+        "automation-science-pack",
+        "upgrade-planner",
+    ] {
+        assert!(
+            report.catalog().commodity(&item(name)).is_some(),
+            "missing item-like commodity {name}"
+        );
+    }
+    assert!(report.diagnostics().is_empty());
+}
+
+#[test]
+fn ignores_parameter_recipes_without_results() {
+    let report = import(
+        r#"{
+            "item": {"iron-plate": {"type": "item", "name": "iron-plate"}},
+            "recipe": {
+                "parameter-0": {
+                    "type": "recipe",
+                    "name": "parameter-0",
+                    "category": "parameters",
+                    "parameter": true
+                },
+                "iron-plate": {
+                    "type": "recipe",
+                    "name": "iron-plate",
+                    "results": [{"type": "item", "name": "iron-plate", "amount": 1}]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    assert!(
+        report
+            .catalog()
+            .recipe(&RecipeId::new("parameter-0").unwrap())
+            .is_none()
+    );
+    assert!(
+        report
+            .catalog()
+            .recipe(&RecipeId::new("iron-plate").unwrap())
+            .is_some()
+    );
+    assert!(report.diagnostics().is_empty());
+}
+
+#[test]
+fn ignores_hidden_empty_placeholder_recipes() {
+    let report = import(
+        r#"{
+            "item": {"iron-plate": {"type": "item", "name": "iron-plate"}},
+            "recipe": {
+                "recipe-unknown": {
+                    "type": "recipe",
+                    "name": "recipe-unknown",
+                    "hidden": true,
+                    "ingredients": {},
+                    "results": {}
+                },
+                "iron-plate": {
+                    "type": "recipe",
+                    "name": "iron-plate",
+                    "results": [{"type": "item", "name": "iron-plate", "amount": 1}]
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    assert!(
+        report
+            .catalog()
+            .recipe(&RecipeId::new("recipe-unknown").unwrap())
+            .is_none()
+    );
+    assert!(
+        report
+            .catalog()
+            .recipe(&RecipeId::new("iron-plate").unwrap())
+            .is_some()
+    );
+    assert!(report.diagnostics().is_empty());
+}
+
+#[test]
+fn rejects_non_parameter_recipes_without_results() {
+    let diagnostics = invalid_data(
+        r#"{
+            "recipe": {
+                "broken": {
+                    "type": "recipe",
+                    "name": "broken"
+                }
+            }
+        }"#,
+    );
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "/recipe/broken/results"
+            && diagnostic.message == "missing required results"
+    }));
+}
+
+#[test]
+fn rejects_non_placeholder_object_recipe_fields() {
+    let diagnostics = invalid_data(
+        r#"{
+            "recipe": {
+                "broken": {
+                    "type": "recipe",
+                    "name": "broken",
+                    "ingredients": {},
+                    "results": {}
+                }
+            }
+        }"#,
+    );
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "/recipe/broken/ingredients"
+            && diagnostic.message == "ingredients must be an array"
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.path == "/recipe/broken/results"
+            && diagnostic.message == "results must be an array"
+    }));
+}
+
+#[test]
 fn reports_malformed_supported_fields_with_precise_context() {
     let diagnostics = invalid_data(
         r#"{

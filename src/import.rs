@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::Read;
 
 use serde::Deserialize;
@@ -18,6 +19,7 @@ const DEFAULT_MAXIMUM_PRODUCTIVITY: f64 = 3.0;
 const MINIMUM_RECIPE_DURATION: f64 = 0.001;
 const DEFAULT_BURNER_FUEL_CATEGORY: &str = "chemical";
 const TICKS_PER_SECOND: f64 = 60.0;
+const MAX_DISPLAYED_IMPORT_DIAGNOSTICS: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiagnosticSeverity {
@@ -65,21 +67,71 @@ impl ImportReport {
     }
 }
 
-#[derive(Clone, Debug, Error, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ImportError {
-    #[error("invalid JSON at line {line}, column {column}: {message}")]
     Json {
         line: usize,
         column: usize,
         message: String,
     },
-    #[error("data.raw contains invalid supported prototype data")]
-    InvalidData { diagnostics: Vec<ImportDiagnostic> },
+    InvalidData {
+        diagnostics: Vec<ImportDiagnostic>,
+    },
 }
+
+impl fmt::Display for ImportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json {
+                line,
+                column,
+                message,
+            } => {
+                write!(
+                    formatter,
+                    "invalid JSON at line {line}, column {column}: {message}"
+                )
+            }
+            Self::InvalidData { diagnostics } => {
+                write!(
+                    formatter,
+                    "data.raw contains invalid supported prototype data"
+                )?;
+                write_import_diagnostic_summary(formatter, diagnostics)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImportError {}
 
 #[derive(Debug, Default, Deserialize)]
 struct RelevantCollections {
+    ammo: Option<Value>,
+    armor: Option<Value>,
+    blueprint: Option<Value>,
+    #[serde(rename = "blueprint-book")]
+    blueprint_book: Option<Value>,
+    capsule: Option<Value>,
+    #[serde(rename = "copy-paste-tool")]
+    copy_paste_tool: Option<Value>,
+    #[serde(rename = "deconstruction-item")]
+    deconstruction_item: Option<Value>,
     item: Option<Value>,
+    gun: Option<Value>,
+    #[serde(rename = "item-with-entity-data")]
+    item_with_entity_data: Option<Value>,
+    #[serde(rename = "rail-planner")]
+    rail_planner: Option<Value>,
+    #[serde(rename = "repair-tool")]
+    repair_tool: Option<Value>,
+    #[serde(rename = "selection-tool")]
+    selection_tool: Option<Value>,
+    #[serde(rename = "spidertron-remote")]
+    spidertron_remote: Option<Value>,
+    tool: Option<Value>,
+    #[serde(rename = "upgrade-item")]
+    upgrade_item: Option<Value>,
     fluid: Option<Value>,
     module: Option<Value>,
     recipe: Option<Value>,
@@ -258,6 +310,93 @@ fn parse_data_raw_inner(
         &mut diagnostics,
         locale,
     );
+    parse_item_like_collection("ammo", raw.ammo, &mut commodities, &mut diagnostics, locale);
+    parse_item_like_collection(
+        "armor",
+        raw.armor,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "blueprint",
+        raw.blueprint,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "blueprint-book",
+        raw.blueprint_book,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "capsule",
+        raw.capsule,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "copy-paste-tool",
+        raw.copy_paste_tool,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "deconstruction-item",
+        raw.deconstruction_item,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection("gun", raw.gun, &mut commodities, &mut diagnostics, locale);
+    parse_item_like_collection(
+        "item-with-entity-data",
+        raw.item_with_entity_data,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "rail-planner",
+        raw.rail_planner,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "repair-tool",
+        raw.repair_tool,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "selection-tool",
+        raw.selection_tool,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection(
+        "spidertron-remote",
+        raw.spidertron_remote,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
+    parse_item_like_collection("tool", raw.tool, &mut commodities, &mut diagnostics, locale);
+    parse_item_like_collection(
+        "upgrade-item",
+        raw.upgrade_item,
+        &mut commodities,
+        &mut diagnostics,
+        locale,
+    );
     parse_commodity_collection(
         "fluid",
         raw.fluid,
@@ -330,6 +469,37 @@ fn json_error(error: &serde_json::Error) -> ImportError {
         column: error.column().max(1),
         message: error.to_string(),
     }
+}
+
+fn write_import_diagnostic_summary(
+    formatter: &mut fmt::Formatter<'_>,
+    diagnostics: &[ImportDiagnostic],
+) -> fmt::Result {
+    let error_count = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        .count();
+    let mut shown = 0;
+
+    for diagnostic in diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        .take(MAX_DISPLAYED_IMPORT_DIAGNOSTICS)
+    {
+        shown += 1;
+        write!(
+            formatter,
+            "\n  error at {}: {}",
+            diagnostic.path, diagnostic.message
+        )?;
+    }
+
+    let remaining = error_count.saturating_sub(shown);
+    if remaining > 0 {
+        write!(formatter, "\n  ... and {remaining} more errors")?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1072,6 +1242,23 @@ fn parse_commodity_collection(
     }
 }
 
+fn parse_item_like_collection(
+    collection_name: &str,
+    collection: Option<Value>,
+    commodities: &mut Vec<Commodity>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
+) {
+    parse_commodity_collection(
+        collection_name,
+        collection,
+        CommodityKind::Item,
+        commodities,
+        diagnostics,
+        locale,
+    );
+}
+
 fn parse_recipe_collection(
     collection: Option<Value>,
     commodities: &BTreeSet<CommodityId>,
@@ -1094,9 +1281,29 @@ fn parse_recipe_collection(
     prototypes
         .into_iter()
         .filter_map(|(id, prototype)| {
+            if is_parameter_recipe(&prototype) || is_hidden_empty_placeholder_recipe(&prototype) {
+                return None;
+            }
             parse_recipe(&id, prototype, commodities, diagnostics, locale)
         })
         .collect()
+}
+
+fn is_parameter_recipe(prototype: &Value) -> bool {
+    let Value::Object(fields) = prototype else {
+        return false;
+    };
+    matches!(fields.get("parameter"), Some(Value::Bool(true)))
+}
+
+fn is_hidden_empty_placeholder_recipe(prototype: &Value) -> bool {
+    let Value::Object(fields) = prototype else {
+        return false;
+    };
+
+    matches!(fields.get("hidden"), Some(Value::Bool(true)))
+        && matches!(fields.get("ingredients"), Some(Value::Object(entries)) if entries.is_empty())
+        && matches!(fields.get("results"), Some(Value::Object(entries)) if entries.is_empty())
 }
 
 fn parse_machine_collection(
