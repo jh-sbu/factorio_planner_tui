@@ -1,0 +1,4 @@
+interface:
+  display_name: "Debug Factorio TUI"
+  short_description: "Exercise and inspect interactive TUI workflows"
+  default_prompt: "Use $debug-factorio-tui to reproduce and inspect this interactive TUI behavior."
