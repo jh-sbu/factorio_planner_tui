@@ -769,11 +769,28 @@ fn render_targets_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
 fn render_results_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let lines = if let Some(error) = app.calculation_error() {
-        vec![
+        let mut lines = vec![
             Line::from("Calculation error"),
             Line::from(error.to_string()),
-            Line::from("Open diagnostics for details."),
-        ]
+        ];
+        if app.cycle_error_commodities().is_empty() {
+            lines.push(Line::from("Open diagnostics for details."));
+        } else {
+            lines.push(Line::from("Select a cycle member, then use r or x:"));
+            let catalog = active_catalog(app);
+            for (index, commodity) in app.cycle_error_commodities().iter().enumerate() {
+                let marker = if index == app.selected_result_index() {
+                    ">"
+                } else {
+                    " "
+                };
+                lines.push(Line::from(format!(
+                    "{marker} {}",
+                    commodity_label(catalog, commodity)
+                )));
+            }
+        }
+        lines
     } else if let Some(calculation) = app.calculation() {
         match app.workspace_view() {
             WorkspaceView::AggregatedTable => aggregated_table_lines(app),

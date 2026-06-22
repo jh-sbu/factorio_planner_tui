@@ -211,6 +211,35 @@ fn workspace_data() -> &'static str {
     }"#
 }
 
+fn cyclic_data() -> &'static str {
+    r#"{
+        "item": {
+            "a": {"type": "item", "name": "a"},
+            "b": {"type": "item", "name": "b"}
+        },
+        "recipe": {
+            "make-a": {
+                "type": "recipe", "name": "make-a", "category": "crafting",
+                "ingredients": [{"type": "item", "name": "b", "amount": 1}],
+                "results": [{"type": "item", "name": "a", "amount": 1}]
+            },
+            "make-b": {
+                "type": "recipe", "name": "make-b", "category": "crafting",
+                "ingredients": [{"type": "item", "name": "a", "amount": 1}],
+                "results": [{"type": "item", "name": "b", "amount": 1}]
+            }
+        },
+        "assembling-machine": {
+            "assembler": {
+                "type": "assembling-machine", "name": "assembler",
+                "crafting_categories": ["crafting"], "crafting_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        }
+    }"#
+}
+
 #[test]
 fn key_translation_ignores_non_press_events() {
     let context = EventContext::default();
@@ -394,6 +423,30 @@ fn renders_empty_start_screen() {
     assert!(screen.contains("No dataset profiles"));
     assert!(screen.contains("Import data"));
     assert!(screen.contains("Open plan"));
+}
+
+#[test]
+fn renders_selectable_cycle_members_with_resolution_keys() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "cycle.json", cyclic_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("cycle.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Cycle"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("a"), 1.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    let screen = render_to_string(&app, 150, 30);
+
+    assert!(screen.contains("Select a cycle member, then use r or x:"));
+    assert!(screen.contains("> a"));
+    assert!(screen.contains("  b"));
 }
 
 #[test]

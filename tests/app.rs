@@ -80,6 +80,41 @@ fn full_data() -> &'static str {
     }"#
 }
 
+fn cyclic_data() -> &'static str {
+    r#"{
+        "item": {
+            "a": {"type": "item", "name": "a"},
+            "b": {"type": "item", "name": "b"}
+        },
+        "recipe": {
+            "make-a": {
+                "type": "recipe",
+                "name": "make-a",
+                "category": "crafting",
+                "ingredients": [{"type": "item", "name": "b", "amount": 1}],
+                "results": [{"type": "item", "name": "a", "amount": 1}]
+            },
+            "make-b": {
+                "type": "recipe",
+                "name": "make-b",
+                "category": "crafting",
+                "ingredients": [{"type": "item", "name": "a", "amount": 1}],
+                "results": [{"type": "item", "name": "b", "amount": 1}]
+            }
+        },
+        "assembling-machine": {
+            "assembler": {
+                "type": "assembling-machine",
+                "name": "assembler",
+                "crafting_categories": ["crafting"],
+                "crafting_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        }
+    }"#
+}
+
 fn minimal_data(result_name: &str) -> String {
     format!(
         r#"{{
@@ -601,6 +636,68 @@ fn workspace_selection_and_selector_confirmation_drive_plan_edits() {
         Some(&recipe_id("advanced-iron-plate"))
     );
     assert!(app.plan().unwrap().is_dirty());
+}
+
+#[test]
+fn cycle_error_members_remain_selectable_for_recipe_changes() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "cycle.json", cyclic_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("cycle.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Cycle"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("a"), 1.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+    assert!(matches!(
+        app.calculation_error(),
+        Some(PlannerError::Cycle { .. })
+    ));
+
+    app.dispatch(
+        Action::MoveFocus(factorio_planner_tui::app::FocusTarget::Results),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::OpenRecipeSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(
+        app.overlay(),
+        Some(&Overlay::Selection(SelectionKind::Recipe {
+            commodity: item("a")
+        }))
+    );
+
+    app.dispatch(Action::CloseOverlay, &profile_store, &plan_store)
+        .unwrap();
+    app.dispatch(
+        Action::MoveWorkspaceSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::OpenRecipeSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(
+        app.overlay(),
+        Some(&Overlay::Selection(SelectionKind::Recipe {
+            commodity: item("b")
+        }))
+    );
 }
 
 #[test]

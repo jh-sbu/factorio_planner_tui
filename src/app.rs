@@ -492,6 +492,18 @@ impl App {
     }
 
     #[must_use]
+    pub fn cycle_error_commodities(&self) -> &[CommodityId] {
+        let Some(PlannerError::Cycle { path }) = self.calculation_error.as_ref() else {
+            return &[];
+        };
+        if path.len() > 1 && path.first() == path.last() {
+            &path[..path.len() - 1]
+        } else {
+            path
+        }
+    }
+
+    #[must_use]
     pub const fn workspace_view(&self) -> WorkspaceView {
         self.workspace_view
     }
@@ -748,10 +760,7 @@ impl App {
             .as_ref()
             .map_or(0, |document| document.plan().targets().len());
         clamp_index(&mut self.selected_target_index, target_len);
-        let result_len = self
-            .calculation
-            .as_ref()
-            .map_or(0, |calculation| calculation.production_steps().len());
+        let result_len = self.workspace_result_len();
         clamp_index(&mut self.selected_result_index, result_len);
     }
 
@@ -765,10 +774,7 @@ impl App {
                 move_index(&mut self.selected_target_index, len, direction);
             }
             FocusTarget::Results | FocusTarget::StepConfiguration => {
-                let len = self
-                    .calculation
-                    .as_ref()
-                    .map_or(0, |calculation| calculation.production_steps().len());
+                let len = self.workspace_result_len();
                 move_index(&mut self.selected_result_index, len, direction);
             }
             FocusTarget::StartMenu | FocusTarget::ProfileList => {}
@@ -947,7 +953,12 @@ impl App {
                         .get(self.selected_result_index)
                         .or_else(|| calculation.production_steps().first())
                 })
-                .map(|step| step.planning_product().clone()),
+                .map(|step| step.planning_product().clone())
+                .or_else(|| {
+                    self.cycle_error_commodities()
+                        .get(self.selected_result_index)
+                        .cloned()
+                }),
             FocusTarget::StartMenu | FocusTarget::ProfileList => None,
         }
     }
@@ -962,6 +973,13 @@ impl App {
                     .or_else(|| calculation.production_steps().first())
             })
             .map(|step| step.recipe().clone())
+    }
+
+    fn workspace_result_len(&self) -> usize {
+        self.calculation.as_ref().map_or_else(
+            || self.cycle_error_commodities().len(),
+            |calculation| calculation.production_steps().len(),
+        )
     }
 
     fn selection_option_count(&self) -> usize {
