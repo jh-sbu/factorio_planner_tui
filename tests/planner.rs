@@ -2,7 +2,7 @@ use factorio_planner_tui::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, Fuel,
     FuelCategory, FuelId, ItemId, Machine, MachineEnergySource, MachineId, Module, ModuleCategory,
     ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId,
-    UnsupportedEnergySource,
+    ResourceCategory, ResourceSource, ResourceSourceId, UnsupportedEnergySource,
 };
 use factorio_planner_tui::planner::{
     DependencyNodeKind, FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit,
@@ -40,6 +40,10 @@ fn fuel_id(name: &str) -> FuelId {
 
 fn belt_id(name: &str) -> BeltId {
     BeltId::new(name).expect("test belt ID should be valid")
+}
+
+fn resource_id(name: &str) -> ResourceSourceId {
+    ResourceSourceId::new(name).expect("test resource source ID should be valid")
 }
 
 fn positive(value: f64) -> Positive {
@@ -348,6 +352,44 @@ fn catalog_with_belts(
     .unwrap()
 }
 
+fn catalog_with_resources(
+    commodities: impl IntoIterator<Item = CommodityId>,
+    recipes: Vec<Recipe>,
+    machines: Vec<Machine>,
+    resource_sources: Vec<ResourceSource>,
+) -> Catalog {
+    Catalog::try_from_parts(CatalogParts {
+        commodities: commodities
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        recipes,
+        machines,
+        resource_sources,
+        ..CatalogParts::default()
+    })
+    .unwrap()
+}
+
+fn resource_source(
+    name: &str,
+    product: CommodityId,
+    amount: f64,
+    required_fluid: Option<(CommodityId, f64)>,
+) -> ResourceSource {
+    ResourceSource::new(
+        resource_id(name),
+        ResourceCategory::new("basic-solid").unwrap(),
+        false,
+        positive(1.0),
+        vec![Product::new(product, positive(amount))],
+        required_fluid.map(|(commodity, amount)| {
+            factorio_planner_tui::catalog::Ingredient::new(commodity, positive(amount))
+        }),
+    )
+    .unwrap()
+}
+
 fn belt_equivalent_for<'a>(
     equivalents: &'a [factorio_planner_tui::planner::BeltEquivalent],
     commodity: &CommodityId,
@@ -392,6 +434,62 @@ fn calculates_one_target_with_one_recipe_and_machine_without_mutating_inputs() {
     assert_close(step.craft_rate().get(), 1.5);
     assert_close(step.fractional_machine_count().get(), 3.0);
     assert_eq!(step.installed_machine_count(), 3);
+}
+
+#[test]
+fn extracts_resource_targets_without_unexplained_external_inputs() {
+    let ore = item("iron-ore");
+    let catalog = catalog_with_resources(
+        [ore.clone()],
+        vec![],
+        vec![],
+        vec![resource_source("iron-ore", ore.clone(), 2.0, None)],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(ore.clone(), 6.0))).unwrap();
+
+    assert!(result.production_steps().is_empty());
+    assert!(result.external_inputs().is_empty());
+    assert_eq!(result.extraction_steps().len(), 1);
+    let step = &result.extraction_steps()[0];
+    assert_eq!(step.planning_product(), &ore);
+    assert_eq!(step.source(), &resource_id("iron-ore"));
+    assert_close(step.required_output_rate().get(), 6.0);
+    assert_close(step.extraction_rate().get(), 3.0);
+    assert_close(rate_for(step.products(), &ore), 6.0);
+
+    let tree = &result.dependency_trees()[0];
+    assert_eq!(tree.kind(), DependencyNodeKind::Production);
+    assert!(tree.recipe().is_none());
+    assert!(tree.machine().is_none());
+    assert!(tree.fractional_machine_count().is_none());
+}
+
+#[test]
+fn resource_required_fluids_expand_as_dependencies() {
+    let ore = item("uranium-ore");
+    let acid = fluid("sulfuric-acid");
+    let catalog = catalog_with_resources(
+        [ore.clone(), acid.clone()],
+        vec![],
+        vec![],
+        vec![resource_source(
+            "uranium-ore",
+            ore.clone(),
+            0.5,
+            Some((acid.clone(), 10.0)),
+        )],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(ore.clone(), 1.0))).unwrap();
+
+    assert_eq!(result.extraction_steps().len(), 1);
+    assert_close(rate_for(result.external_inputs(), &acid), 20.0);
+    assert_eq!(result.dependency_trees()[0].children().len(), 1);
+    let acid_node = &result.dependency_trees()[0].children()[0];
+    assert_eq!(acid_node.commodity(), &acid);
+    assert_eq!(acid_node.kind(), DependencyNodeKind::ExternalInput);
+    assert_close(acid_node.required_rate().get(), 20.0);
 }
 
 #[test]

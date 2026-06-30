@@ -13,7 +13,8 @@ use crate::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, DatasetFingerprint, Finite,
     FluidId, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource,
     MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive, Product,
-    Recipe, RecipeCategory, RecipeId, UnsupportedEnergySource,
+    Recipe, RecipeCategory, RecipeId, ResourceCategory, ResourceSource, ResourceSourceId,
+    UnsupportedEnergySource,
 };
 use crate::import::{
     DiagnosticSeverity, ImportDiagnostic, ImportError, LocaleError, LocalePrototypeKind,
@@ -22,8 +23,8 @@ use crate::import::{
 use crate::planner::{FactoryPlan, RateUnit, Target};
 
 pub const PROFILE_INDEX_SCHEMA_VERSION: u32 = 1;
-pub const CATALOG_SCHEMA_VERSION: u32 = 2;
-pub const IMPORTER_SCHEMA_VERSION: u32 = 2;
+pub const CATALOG_SCHEMA_VERSION: u32 = 3;
+pub const IMPORTER_SCHEMA_VERSION: u32 = 3;
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
 pub const PLAN_FILE_SUFFIX: &str = ".fptplan.json";
 
@@ -1491,6 +1492,8 @@ struct CatalogFile {
 struct CatalogDto {
     commodities: Vec<CommodityDto>,
     recipes: Vec<RecipeDto>,
+    #[serde(default)]
+    resource_sources: Vec<ResourceSourceDto>,
     machines: Vec<MachineDto>,
     modules: Vec<ModuleDto>,
     fuels: Vec<FuelDto>,
@@ -1502,6 +1505,10 @@ impl From<&Catalog> for CatalogDto {
         Self {
             commodities: catalog.commodities().map(CommodityDto::from).collect(),
             recipes: catalog.recipes().map(RecipeDto::from).collect(),
+            resource_sources: catalog
+                .resource_sources()
+                .map(ResourceSourceDto::from)
+                .collect(),
             machines: catalog.machines().map(MachineDto::from).collect(),
             modules: catalog.modules().map(ModuleDto::from).collect(),
             fuels: catalog.fuels().map(FuelDto::from).collect(),
@@ -1524,6 +1531,11 @@ impl TryFrom<CatalogDto> for Catalog {
                 .recipes
                 .into_iter()
                 .map(RecipeDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            resource_sources: catalog
+                .resource_sources
+                .into_iter()
+                .map(ResourceSourceDto::into_record)
                 .collect::<Result<Vec<_>, _>>()?,
             machines: catalog
                 .machines
@@ -1884,6 +1896,49 @@ impl ProductDto {
         Product::new(self.commodity.into_id()?, positive(self.amount)?)
             .with_productivity_amount(non_negative(self.productivity_amount)?)
             .map_err(|error| invalid_catalog(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ResourceSourceDto {
+    id: String,
+    category: String,
+    infinite: bool,
+    mining_time: f64,
+    products: Vec<ProductDto>,
+    required_fluid: Option<IngredientDto>,
+}
+
+impl From<&ResourceSource> for ResourceSourceDto {
+    fn from(source: &ResourceSource) -> Self {
+        Self {
+            id: source.id().as_str().to_owned(),
+            category: source.category().as_str().to_owned(),
+            infinite: source.infinite(),
+            mining_time: source.mining_time().get(),
+            products: source.products().iter().map(ProductDto::from).collect(),
+            required_fluid: source.required_fluid().map(IngredientDto::from),
+        }
+    }
+}
+
+impl ResourceSourceDto {
+    fn into_record(self) -> Result<ResourceSource, ProfileError> {
+        ResourceSource::new(
+            ResourceSourceId::new(self.id).map_err(|error| invalid_catalog(error.to_string()))?,
+            ResourceCategory::new(self.category)
+                .map_err(|error| invalid_catalog(error.to_string()))?,
+            self.infinite,
+            positive(self.mining_time)?,
+            self.products
+                .into_iter()
+                .map(ProductDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            self.required_fluid
+                .map(IngredientDto::into_record)
+                .transpose()?,
+        )
+        .map_err(|error| invalid_catalog(error.to_string()))
     }
 }
 

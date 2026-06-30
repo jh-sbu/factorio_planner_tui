@@ -3,7 +3,7 @@ use std::fs;
 use factorio_planner_tui::catalog::{CommodityId, ItemId};
 use factorio_planner_tui::import::{DiagnosticSeverity, LocalePrototypeKind};
 use factorio_planner_tui::persistence::{
-    ProfileError, ProfileImportRequest, ProfileName, ProfileStore,
+    CATALOG_SCHEMA_VERSION, ProfileError, ProfileImportRequest, ProfileName, ProfileStore,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -460,7 +460,7 @@ fn rejects_newer_index_and_catalog_schema_versions() {
         store.open(&profile_name("main")),
         Err(ProfileError::UnsupportedCatalogSchema {
             found: 999,
-            supported: 2
+            supported: CATALOG_SCHEMA_VERSION
         })
     ));
 }
@@ -483,7 +483,7 @@ fn rejects_pre_module_policy_cached_catalogs() {
         store.open(&profile_name("main")),
         Err(ProfileError::UnsupportedCatalogSchema {
             found: 1,
-            supported: 2
+            supported: CATALOG_SCHEMA_VERSION
         })
     ));
 }

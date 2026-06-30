@@ -10,7 +10,7 @@ use crate::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, Fuel,
     FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource, MachineId, Module,
     ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory,
-    RecipeId, UnsupportedEnergySource,
+    RecipeId, ResourceCategory, ResourceSource, ResourceSourceId, UnsupportedEnergySource,
 };
 
 const DEFAULT_RECIPE_CATEGORY: &str = "crafting";
@@ -135,6 +135,7 @@ struct RelevantCollections {
     fluid: Option<Value>,
     module: Option<Value>,
     recipe: Option<Value>,
+    resource: Option<Value>,
     #[serde(rename = "assembling-machine")]
     assembling_machine: Option<Value>,
     furnace: Option<Value>,
@@ -420,6 +421,8 @@ fn parse_data_raw_inner(
     validate_fuel_references(&parsed_fuels, &commodity_ids, &mut diagnostics);
     let fuels = parsed_fuels.into_iter().map(|parsed| parsed.fuel).collect();
     let recipes = parse_recipe_collection(raw.recipe, &commodity_ids, &mut diagnostics, locale);
+    let resource_sources =
+        parse_resource_collection(raw.resource, &commodity_ids, &mut diagnostics);
     let mut machines = parse_machine_collection(
         "assembling-machine",
         raw.assembling_machine,
@@ -441,6 +444,7 @@ fn parse_data_raw_inner(
     let catalog = Catalog::try_from_parts(CatalogParts {
         commodities,
         recipes,
+        resource_sources,
         machines,
         modules,
         fuels,
@@ -1287,6 +1291,465 @@ fn parse_recipe_collection(
             parse_recipe(&id, prototype, commodities, diagnostics, locale)
         })
         .collect()
+}
+
+fn parse_resource_collection(
+    collection: Option<Value>,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<ResourceSource> {
+    let Some(collection) = collection else {
+        return Vec::new();
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("resource"),
+            None,
+            "/resource".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return Vec::new();
+    };
+
+    prototypes
+        .into_iter()
+        .filter_map(|(id, prototype)| parse_resource(&id, prototype, commodities, diagnostics))
+        .collect()
+}
+
+fn parse_resource(
+    id: &str,
+    prototype: Value,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<ResourceSource> {
+    let prototype_path = format!("/resource/{}", pointer_segment(id));
+    let Value::Object(fields) = prototype else {
+        diagnostics.push(error_diagnostic(
+            Some("resource"),
+            Some(id),
+            prototype_path,
+            "prototype must be a JSON object",
+        ));
+        return None;
+    };
+
+    let initial_errors = error_count(diagnostics);
+    validate_prototype_identity(&fields, "resource", id, &prototype_path, diagnostics);
+    warn_unsupported_resource_fields(&fields, id, &prototype_path, diagnostics);
+
+    let resource_id = ResourceSourceId::new(id).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "resource",
+                id,
+                format!("{prototype_path}/name"),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    );
+    let category = parse_resource_category(&fields, id, &prototype_path, diagnostics);
+    let infinite = parse_resource_infinite(&fields, id, &prototype_path, diagnostics);
+    let minable = parse_resource_minable(&fields, id, &prototype_path, diagnostics);
+    let (mining_time, products, required_fluid) =
+        minable.as_ref().map_or((None, None, None), |minable| {
+            (
+                parse_resource_mining_time(minable, id, &prototype_path, diagnostics),
+                parse_resource_products(minable, id, &prototype_path, commodities, diagnostics),
+                parse_resource_required_fluid(
+                    minable,
+                    id,
+                    &prototype_path,
+                    commodities,
+                    diagnostics,
+                ),
+            )
+        });
+
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+
+    ResourceSource::new(
+        resource_id?,
+        category?,
+        infinite?,
+        mining_time?,
+        products?,
+        required_fluid?,
+    )
+    .map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "resource",
+                id,
+                prototype_path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn warn_unsupported_resource_fields(
+    fields: &Map<String, Value>,
+    resource_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) {
+    for field in ["minimum", "normal"] {
+        if fields.contains_key(field) {
+            diagnostics.push(warning_diagnostic(
+                "resource",
+                resource_id,
+                format!("{prototype_path}/{field}"),
+                format!("unsupported resource field {field:?} is not used for extraction rates"),
+            ));
+        }
+    }
+}
+
+fn parse_resource_category(
+    fields: &Map<String, Value>,
+    resource_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<ResourceCategory> {
+    let category = match fields.get("category") {
+        None => "basic-solid",
+        Some(Value::String(category)) => category,
+        Some(_) => {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                format!("{prototype_path}/category"),
+                "category must be a string",
+            );
+            return None;
+        }
+    };
+    ResourceCategory::new(category).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                format!("{prototype_path}/category"),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_resource_infinite(
+    fields: &Map<String, Value>,
+    resource_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<bool> {
+    match fields.get("infinite") {
+        None => Some(false),
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                format!("{prototype_path}/infinite"),
+                "infinite must be a boolean",
+            );
+            None
+        }
+    }
+}
+
+fn parse_resource_minable<'a>(
+    fields: &'a Map<String, Value>,
+    resource_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<&'a Map<String, Value>> {
+    let path = format!("{prototype_path}/minable");
+    match fields.get("minable") {
+        Some(Value::Object(minable)) => Some(minable),
+        Some(_) => {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                path,
+                "minable must be an object",
+            );
+            None
+        }
+        None => {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                path,
+                "missing required minable",
+            );
+            None
+        }
+    }
+}
+
+fn parse_resource_mining_time(
+    minable: &Map<String, Value>,
+    resource_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Positive> {
+    let path = format!("{prototype_path}/minable/mining_time");
+    let Some(value) = minable.get("mining_time") else {
+        prototype_error(
+            diagnostics,
+            "resource",
+            resource_id,
+            path,
+            "missing required mining_time",
+        );
+        return None;
+    };
+    let Value::Number(number) = value else {
+        prototype_error(
+            diagnostics,
+            "resource",
+            resource_id,
+            path,
+            "mining_time must be a number",
+        );
+        return None;
+    };
+    let Some(value) = number.as_f64() else {
+        prototype_error(
+            diagnostics,
+            "resource",
+            resource_id,
+            path,
+            "mining_time must be a finite number",
+        );
+        return None;
+    };
+    Positive::new(value).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_resource_products(
+    minable: &Map<String, Value>,
+    resource_id: &str,
+    prototype_path: &str,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Vec<Product>> {
+    if minable.contains_key("results") {
+        let mut fields = Map::new();
+        fields.insert(
+            "results".to_owned(),
+            minable
+                .get("results")
+                .expect("contains_key checked above")
+                .clone(),
+        );
+        return parse_products(
+            &fields,
+            resource_id,
+            &format!("{prototype_path}/minable"),
+            commodities,
+            diagnostics,
+        );
+    }
+
+    let path = format!("{prototype_path}/minable/result");
+    let Some(Value::String(result)) = minable.get("result") else {
+        prototype_error(
+            diagnostics,
+            "resource",
+            resource_id,
+            path,
+            "missing required result or results",
+        );
+        return None;
+    };
+    let commodity = ItemId::new(result.clone())
+        .map(CommodityId::Item)
+        .map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    "resource",
+                    resource_id,
+                    path.clone(),
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        )?;
+    if !commodities.contains(&commodity) {
+        prototype_error(
+            diagnostics,
+            "resource",
+            resource_id,
+            path,
+            format!("references missing item {result:?}"),
+        );
+        return None;
+    }
+
+    let amount = match minable.get("amount") {
+        None => Positive::new(1.0).expect("default resource amount is valid"),
+        Some(Value::Number(number)) => {
+            let amount = number.as_f64().unwrap_or(f64::NAN);
+            Positive::new(amount).map_or_else(
+                |error| {
+                    prototype_error(
+                        diagnostics,
+                        "resource",
+                        resource_id,
+                        format!("{prototype_path}/minable/amount"),
+                        error.to_string(),
+                    );
+                    None
+                },
+                Some,
+            )?
+        }
+        Some(_) => {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                format!("{prototype_path}/minable/amount"),
+                "amount must be a number",
+            );
+            return None;
+        }
+    };
+    Some(vec![Product::new(commodity, amount)])
+}
+
+fn parse_resource_required_fluid(
+    minable: &Map<String, Value>,
+    resource_id: &str,
+    prototype_path: &str,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Option<Ingredient>> {
+    let Some(required_fluid) = minable.get("required_fluid") else {
+        return Some(None);
+    };
+    let initial_errors = error_count(diagnostics);
+    let path = format!("{prototype_path}/minable/required_fluid");
+    let commodity = if let Value::String(required_fluid) = required_fluid {
+        let commodity = FluidId::new(required_fluid.clone())
+            .map(CommodityId::Fluid)
+            .map_or_else(
+                |error| {
+                    prototype_error(
+                        diagnostics,
+                        "resource",
+                        resource_id,
+                        path.clone(),
+                        error.to_string(),
+                    );
+                    None
+                },
+                Some,
+            );
+        if let Some(commodity) = &commodity
+            && !commodities.contains(commodity)
+        {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                path,
+                format!("references missing fluid {required_fluid:?}"),
+            );
+        }
+        commodity
+    } else {
+        prototype_error(
+            diagnostics,
+            "resource",
+            resource_id,
+            path,
+            "required_fluid must be a string",
+        );
+        None
+    };
+
+    let amount_path = format!("{prototype_path}/minable/fluid_amount");
+    let amount = if let Some(amount) = minable.get("fluid_amount") {
+        let Value::Number(number) = amount else {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                amount_path,
+                "fluid_amount must be a number",
+            );
+            return None;
+        };
+        let Some(amount) = number.as_f64() else {
+            prototype_error(
+                diagnostics,
+                "resource",
+                resource_id,
+                amount_path,
+                "fluid_amount must be a finite number",
+            );
+            return None;
+        };
+        Positive::new(amount).map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    "resource",
+                    resource_id,
+                    amount_path,
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        )
+    } else {
+        prototype_error(
+            diagnostics,
+            "resource",
+            resource_id,
+            amount_path,
+            "missing required fluid_amount",
+        );
+        None
+    };
+    if error_count(diagnostics) != initial_errors {
+        None
+    } else {
+        Some(Some(Ingredient::new(commodity?, amount?)))
+    }
 }
 
 fn is_parameter_recipe(prototype: &Value) -> bool {

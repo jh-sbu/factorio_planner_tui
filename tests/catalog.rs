@@ -2,7 +2,8 @@ use factorio_planner_tui::catalog::{
     Belt, BeltId, Catalog, CatalogError, CatalogParts, Commodity, CommodityId, DatasetFingerprint,
     Finite, FluidId, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource,
     MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
-    Product, Recipe, RecipeCategory, RecipeId, RecordError,
+    Product, ProductionSource, Recipe, RecipeCategory, RecipeId, RecordError, ResourceCategory,
+    ResourceSource, ResourceSourceId,
 };
 
 fn item(name: &str) -> ItemId {
@@ -15,6 +16,10 @@ fn recipe_id(name: &str) -> RecipeId {
 
 fn machine_id(name: &str) -> MachineId {
     MachineId::new(name).expect("test machine ID should be valid")
+}
+
+fn resource_id(name: &str) -> ResourceSourceId {
+    ResourceSourceId::new(name).expect("test resource source ID should be valid")
 }
 
 fn positive(value: f64) -> Positive {
@@ -294,6 +299,7 @@ fn catalog_indexes_and_looks_up_records_deterministically() {
             Commodity::new(coal, None),
         ],
         recipes: vec![gear_recipe, alternate_recipe],
+        resource_sources: vec![],
         machines: vec![fast_machine, slow_machine],
         modules: vec![Module::new(
             ModuleId::new("speed-module").unwrap(),
@@ -327,6 +333,13 @@ fn catalog_indexes_and_looks_up_records_deterministically() {
     assert_eq!(
         catalog.recipes_for_product(&gear),
         &[recipe_id("a-gear"), recipe_id("z-gear")]
+    );
+    assert_eq!(
+        catalog.sources_for_product(&gear),
+        &[
+            ProductionSource::Recipe(recipe_id("a-gear")),
+            ProductionSource::Recipe(recipe_id("z-gear")),
+        ]
     );
     assert_eq!(
         catalog.machines_for_category(&crafting),
@@ -577,6 +590,33 @@ fn recipes_and_products_expose_module_productivity_policy() {
         Some(&[speed].into_iter().collect())
     );
     assert_close(recipe.maximum_productivity().get(), 0.25);
+}
+
+#[test]
+fn resource_sources_are_indexed_as_production_sources() {
+    let ore = CommodityId::Item(item("iron-ore"));
+    let resource = ResourceSource::new(
+        resource_id("iron-ore"),
+        ResourceCategory::new("basic-solid").unwrap(),
+        false,
+        positive(1.0),
+        vec![Product::new(ore.clone(), positive(1.0))],
+        None,
+    )
+    .unwrap();
+
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: vec![Commodity::new(ore.clone(), None)],
+        resource_sources: vec![resource],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        catalog.sources_for_product(&ore),
+        &[ProductionSource::Resource(resource_id("iron-ore"))]
+    );
+    assert!(catalog.resource_source(&resource_id("iron-ore")).is_some());
 }
 
 #[test]

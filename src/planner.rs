@@ -5,7 +5,8 @@ use thiserror::Error;
 use crate::catalog::{
     BeltId, Catalog, CommodityId, Finite, Fuel, FuelCategory, FuelId, ItemId, Machine,
     MachineEnergySource, MachineId, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
-    Recipe, RecipeCategory, RecipeId, UnsupportedEnergySource,
+    ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceSource, ResourceSourceId,
+    UnsupportedEnergySource,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -569,8 +570,51 @@ impl ProductionStep {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ExtractionStep {
+    planning_product: CommodityId,
+    source: ResourceSourceId,
+    required_output_rate: Positive,
+    extraction_rate: Positive,
+    required_fluids: Vec<CommodityRate>,
+    products: Vec<CommodityRate>,
+}
+
+impl ExtractionStep {
+    #[must_use]
+    pub const fn planning_product(&self) -> &CommodityId {
+        &self.planning_product
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &ResourceSourceId {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn required_output_rate(&self) -> Positive {
+        self.required_output_rate
+    }
+
+    #[must_use]
+    pub const fn extraction_rate(&self) -> Positive {
+        self.extraction_rate
+    }
+
+    #[must_use]
+    pub fn required_fluids(&self) -> &[CommodityRate] {
+        &self.required_fluids
+    }
+
+    #[must_use]
+    pub fn products(&self) -> &[CommodityRate] {
+        &self.products
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CalculationResult {
     production_steps: Vec<ProductionStep>,
+    extraction_steps: Vec<ExtractionStep>,
     dependency_trees: Vec<DependencyNode>,
     external_inputs: Vec<CommodityRate>,
     item_flows: Vec<CommodityRate>,
@@ -586,6 +630,11 @@ impl CalculationResult {
     #[must_use]
     pub fn production_steps(&self) -> &[ProductionStep] {
         &self.production_steps
+    }
+
+    #[must_use]
+    pub fn extraction_steps(&self) -> &[ExtractionStep] {
+        &self.extraction_steps
     }
 
     #[must_use]
@@ -792,6 +841,7 @@ struct Calculation<'a> {
     plan: &'a FactoryPlan,
     resolved_plan: ResolvedPlan,
     production_steps: BTreeMap<CommodityId, ProductionStepAccumulator>,
+    extraction_steps: BTreeMap<CommodityId, ExtractionStepAccumulator>,
     external_inputs: BTreeMap<CommodityId, f64>,
 }
 
@@ -802,6 +852,7 @@ impl<'a> Calculation<'a> {
             plan,
             resolved_plan,
             production_steps: BTreeMap::new(),
+            extraction_steps: BTreeMap::new(),
             external_inputs: BTreeMap::new(),
         }
     }
@@ -815,10 +866,25 @@ impl<'a> Calculation<'a> {
             return self.add_external_input(commodity, required_rate);
         }
 
-        let Some(recipe_id) = self.resolved_plan.recipes.get(commodity) else {
+        let Some(source) = self.resolved_plan.sources.get(commodity) else {
             return self.add_external_input(commodity, required_rate);
         };
-        let recipe_id = recipe_id.clone();
+        match source.clone() {
+            ProductionSource::Recipe(recipe_id) => {
+                self.expand_recipe(commodity, required_rate, recipe_id)
+            }
+            ProductionSource::Resource(resource_id) => {
+                self.expand_resource(commodity, required_rate, resource_id)
+            }
+        }
+    }
+
+    fn expand_recipe(
+        &mut self,
+        commodity: &CommodityId,
+        required_rate: Positive,
+        recipe_id: RecipeId,
+    ) -> Result<(), PlannerError> {
         let recipe = self
             .catalog
             .recipe(&recipe_id)
@@ -905,6 +971,108 @@ impl<'a> Calculation<'a> {
                 &CommodityId::Item(fuel_rate.fuel_item().clone()),
                 fuel_rate.rate_per_second(),
             )?;
+        }
+        Ok(())
+    }
+
+    fn expand_resource(
+        &mut self,
+        commodity: &CommodityId,
+        required_rate: Positive,
+        resource_id: ResourceSourceId,
+    ) -> Result<(), PlannerError> {
+        let resource = self
+            .catalog
+            .resource_source(&resource_id)
+            .expect("resolved resource source IDs must remain present in the catalog");
+        let product_amount = resource
+            .products()
+            .iter()
+            .filter(|product| product.commodity() == commodity)
+            .map(|product| product.amount().get())
+            .sum::<f64>();
+        let extraction_rate = checked_positive(
+            required_rate.get() / product_amount,
+            "resource extraction rate per second",
+        )?;
+        let required_fluids = resource
+            .required_fluid()
+            .map(|fluid| {
+                checked_positive(
+                    extraction_rate.get() * fluid.amount().get(),
+                    "resource required fluid rate per second",
+                )
+                .map(|rate| CommodityRate {
+                    commodity: fluid.commodity().clone(),
+                    rate,
+                })
+            })
+            .transpose()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let products = aggregate_resource_products(resource, extraction_rate)?;
+
+        self.add_extraction_step(
+            commodity,
+            &resource_id,
+            required_rate,
+            extraction_rate,
+            &required_fluids,
+            &products,
+        )?;
+
+        for required_fluid in required_fluids {
+            self.expand(required_fluid.commodity(), required_fluid.rate())?;
+        }
+        Ok(())
+    }
+
+    fn add_extraction_step(
+        &mut self,
+        commodity: &CommodityId,
+        source: &ResourceSourceId,
+        required_output_rate: Positive,
+        extraction_rate: Positive,
+        required_fluids: &[CommodityRate],
+        products: &[CommodityRate],
+    ) -> Result<(), PlannerError> {
+        let step = self
+            .extraction_steps
+            .entry(commodity.clone())
+            .or_insert_with(|| ExtractionStepAccumulator {
+                planning_product: commodity.clone(),
+                source: source.clone(),
+                required_output_rate: 0.0,
+                extraction_rate: 0.0,
+                required_fluids: BTreeMap::new(),
+                products: BTreeMap::new(),
+            });
+        debug_assert_eq!(&step.source, source);
+        step.required_output_rate += required_output_rate.get();
+        checked_positive(
+            step.required_output_rate,
+            "aggregated resource required output rate per second",
+        )?;
+        step.extraction_rate += extraction_rate.get();
+        checked_positive(
+            step.extraction_rate,
+            "aggregated resource extraction rate per second",
+        )?;
+        for required_fluid in required_fluids {
+            let total = step
+                .required_fluids
+                .entry(required_fluid.commodity().clone())
+                .or_default();
+            *total += required_fluid.rate().get();
+            checked_positive(*total, "aggregated resource required fluid rate per second")?;
+        }
+        for product in products {
+            let total = step
+                .products
+                .entry(product.commodity().clone())
+                .or_default();
+            *total += product.rate().get();
+            checked_positive(*total, "aggregated resource product rate per second")?;
         }
         Ok(())
     }
@@ -1053,6 +1221,11 @@ impl<'a> Calculation<'a> {
             .into_values()
             .map(ProductionStepAccumulator::finish)
             .collect::<Result<Vec<_>, _>>()?;
+        let extraction_steps = self
+            .extraction_steps
+            .into_values()
+            .map(ExtractionStepAccumulator::finish)
+            .collect::<Result<Vec<_>, _>>()?;
         let external_inputs = self
             .external_inputs
             .into_iter()
@@ -1061,16 +1234,17 @@ impl<'a> Calculation<'a> {
                     .map(|rate| CommodityRate { commodity, rate })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let surplus = aggregate_surplus(&production_steps)?;
+        let surplus = aggregate_surplus(&production_steps, &extraction_steps)?;
         let electric_power = aggregate_electric_power(&production_steps)?;
         let burner_fuel_demand = aggregate_burner_fuel_demand(&production_steps)?;
         let (item_flows, fluid_flows) =
-            aggregate_logistics_flows(&production_steps, &external_inputs)?;
+            aggregate_logistics_flows(&production_steps, &extraction_steps, &external_inputs)?;
         let belt_equivalents =
             calculate_belt_equivalents(self.catalog, self.plan.selected_belt(), &item_flows)?;
 
         Ok(CalculationResult {
             production_steps,
+            extraction_steps,
             dependency_trees,
             external_inputs,
             item_flows,
@@ -1089,11 +1263,12 @@ fn resolve_plan(
     plan: &FactoryPlan,
     targets: &[(CommodityId, Positive)],
 ) -> Result<ResolvedPlan, PlannerError> {
-    let mut resolver = RecipeResolver::new(catalog, plan);
+    let mut resolver = SourceResolver::new(catalog, plan);
     for (commodity, _) in targets {
         resolver.visit(commodity)?;
     }
     Ok(ResolvedPlan {
+        sources: resolver.selected_sources,
         recipes: resolver.selected_recipes,
         machines: resolver.selected_machines,
         fuels: resolver.selected_fuels,
@@ -1101,14 +1276,16 @@ fn resolve_plan(
 }
 
 struct ResolvedPlan {
+    sources: BTreeMap<CommodityId, ProductionSource>,
     recipes: BTreeMap<CommodityId, RecipeId>,
     machines: BTreeMap<CommodityId, MachineId>,
     fuels: BTreeMap<CommodityId, FuelId>,
 }
 
-struct RecipeResolver<'a> {
+struct SourceResolver<'a> {
     catalog: &'a Catalog,
     plan: &'a FactoryPlan,
+    selected_sources: BTreeMap<CommodityId, ProductionSource>,
     selected_recipes: BTreeMap<CommodityId, RecipeId>,
     selected_machines: BTreeMap<CommodityId, MachineId>,
     selected_fuels: BTreeMap<CommodityId, FuelId>,
@@ -1116,11 +1293,12 @@ struct RecipeResolver<'a> {
     active_path: Vec<CommodityId>,
 }
 
-impl<'a> RecipeResolver<'a> {
+impl<'a> SourceResolver<'a> {
     fn new(catalog: &'a Catalog, plan: &'a FactoryPlan) -> Self {
         Self {
             catalog,
             plan,
+            selected_sources: BTreeMap::new(),
             selected_recipes: BTreeMap::new(),
             selected_machines: BTreeMap::new(),
             selected_fuels: BTreeMap::new(),
@@ -1144,34 +1322,55 @@ impl<'a> RecipeResolver<'a> {
             return Err(PlannerError::Cycle { path });
         }
 
-        let Some(recipe) = self.select_recipe(commodity)? else {
+        let Some(source) = self.select_source(commodity)? else {
             self.resolved.insert(commodity.clone());
             return Ok(());
         };
-        let recipe_id = recipe.id().clone();
-        let machine_id = select_machine(self.catalog, self.plan, recipe)?;
-        let machine = self
-            .catalog
-            .machine(&machine_id)
-            .expect("selected machine IDs must remain present in the catalog");
-        let fuel_id = select_fuel(self.catalog, self.plan, commodity, machine)?;
-        let mut dependencies = recipe
-            .ingredients()
-            .iter()
-            .map(|ingredient| ingredient.commodity().clone())
-            .collect::<Vec<_>>();
-        if let Some(fuel_id) = &fuel_id {
-            let fuel = self
-                .catalog
-                .fuel(fuel_id)
-                .expect("selected fuel IDs must remain present in the catalog");
-            dependencies.push(CommodityId::Item(fuel.item().clone()));
+
+        let mut dependencies = Vec::new();
+        match &source {
+            ProductionSource::Recipe(recipe_id) => {
+                let recipe = self
+                    .catalog
+                    .recipe(recipe_id)
+                    .expect("selected recipe IDs must remain present in the catalog");
+                let machine_id = select_machine(self.catalog, self.plan, recipe)?;
+                let machine = self
+                    .catalog
+                    .machine(&machine_id)
+                    .expect("selected machine IDs must remain present in the catalog");
+                let fuel_id = select_fuel(self.catalog, self.plan, commodity, machine)?;
+                dependencies.extend(
+                    recipe
+                        .ingredients()
+                        .iter()
+                        .map(|ingredient| ingredient.commodity().clone()),
+                );
+                if let Some(fuel_id) = &fuel_id {
+                    let fuel = self
+                        .catalog
+                        .fuel(fuel_id)
+                        .expect("selected fuel IDs must remain present in the catalog");
+                    dependencies.push(CommodityId::Item(fuel.item().clone()));
+                }
+                self.selected_recipes
+                    .insert(commodity.clone(), recipe_id.clone());
+                self.selected_machines.insert(commodity.clone(), machine_id);
+                if let Some(fuel_id) = fuel_id {
+                    self.selected_fuels.insert(commodity.clone(), fuel_id);
+                }
+            }
+            ProductionSource::Resource(resource_id) => {
+                let resource = self
+                    .catalog
+                    .resource_source(resource_id)
+                    .expect("selected resource source IDs must remain present in the catalog");
+                if let Some(required_fluid) = resource.required_fluid() {
+                    dependencies.push(required_fluid.commodity().clone());
+                }
+            }
         }
-        self.selected_recipes.insert(commodity.clone(), recipe_id);
-        self.selected_machines.insert(commodity.clone(), machine_id);
-        if let Some(fuel_id) = fuel_id {
-            self.selected_fuels.insert(commodity.clone(), fuel_id);
-        }
+        self.selected_sources.insert(commodity.clone(), source);
 
         self.active_path.push(commodity.clone());
         for dependency in dependencies {
@@ -1182,7 +1381,10 @@ impl<'a> RecipeResolver<'a> {
         Ok(())
     }
 
-    fn select_recipe(&self, commodity: &CommodityId) -> Result<Option<&Recipe>, PlannerError> {
+    fn select_source(
+        &self,
+        commodity: &CommodityId,
+    ) -> Result<Option<ProductionSource>, PlannerError> {
         if let Some(recipe_id) = self.plan.recipe_choice(commodity) {
             let recipe = self.catalog.recipe(recipe_id).ok_or_else(|| {
                 PlannerError::MissingRecipeChoice {
@@ -1206,19 +1408,36 @@ impl<'a> RecipeResolver<'a> {
                     recipe: recipe_id.clone(),
                 });
             }
-            return Ok(Some(recipe));
+            return Ok(Some(ProductionSource::Recipe(recipe.id().clone())));
         }
 
-        Ok(self
+        if let Some(recipe) = self
             .catalog
-            .recipes_for_product(commodity)
+            .sources_for_product(commodity)
             .iter()
-            .filter_map(|recipe_id| self.catalog.recipe(recipe_id))
+            .filter_map(|source| match source {
+                ProductionSource::Recipe(recipe_id) => self.catalog.recipe(recipe_id),
+                ProductionSource::Resource(_) => None,
+            })
             .filter(|recipe| recipe.supported())
             .min_by(|left, right| {
                 default_recipe_rank(left, commodity)
                     .cmp(&default_recipe_rank(right, commodity))
                     .then_with(|| left.id().cmp(right.id()))
+            })
+        {
+            return Ok(Some(ProductionSource::Recipe(recipe.id().clone())));
+        }
+
+        Ok(self
+            .catalog
+            .sources_for_product(commodity)
+            .iter()
+            .find_map(|source| match source {
+                ProductionSource::Recipe(_) => None,
+                ProductionSource::Resource(resource_id) => {
+                    Some(ProductionSource::Resource(resource_id.clone()))
+                }
             }))
     }
 }
@@ -1386,6 +1605,51 @@ struct ProductionStepAccumulator {
     products: BTreeMap<CommodityId, f64>,
 }
 
+struct ExtractionStepAccumulator {
+    planning_product: CommodityId,
+    source: ResourceSourceId,
+    required_output_rate: f64,
+    extraction_rate: f64,
+    required_fluids: BTreeMap<CommodityId, f64>,
+    products: BTreeMap<CommodityId, f64>,
+}
+
+impl ExtractionStepAccumulator {
+    fn finish(self) -> Result<ExtractionStep, PlannerError> {
+        let required_fluids = self
+            .required_fluids
+            .into_iter()
+            .map(|(commodity, rate)| {
+                checked_positive(rate, "aggregated resource required fluid rate per second")
+                    .map(|rate| CommodityRate { commodity, rate })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let products = self
+            .products
+            .into_iter()
+            .map(|(commodity, rate)| {
+                checked_positive(rate, "aggregated resource product rate per second")
+                    .map(|rate| CommodityRate { commodity, rate })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ExtractionStep {
+            planning_product: self.planning_product,
+            source: self.source,
+            required_output_rate: checked_positive(
+                self.required_output_rate,
+                "aggregated resource required output rate per second",
+            )?,
+            extraction_rate: checked_positive(
+                self.extraction_rate,
+                "aggregated resource extraction rate per second",
+            )?,
+            required_fluids,
+            products,
+        })
+    }
+}
+
 impl ProductionStepAccumulator {
     fn finish(self) -> Result<ProductionStep, PlannerError> {
         let fractional_machine_count = checked_positive(
@@ -1538,6 +1802,27 @@ fn aggregate_recipe_products(
         .into_iter()
         .map(|(commodity, rate)| {
             checked_positive(rate, "aggregated product rate per second")
+                .map(|rate| CommodityRate { commodity, rate })
+        })
+        .collect()
+}
+
+fn aggregate_resource_products(
+    resource: &ResourceSource,
+    extraction_rate: Positive,
+) -> Result<Vec<CommodityRate>, PlannerError> {
+    let mut rates = BTreeMap::<CommodityId, f64>::new();
+    for product in resource.products() {
+        let rate = extraction_rate.get() * product.amount().get();
+        checked_positive(rate, "resource product rate per second")?;
+        let total = rates.entry(product.commodity().clone()).or_default();
+        *total += rate;
+        checked_positive(*total, "aggregated resource product rate per second")?;
+    }
+    rates
+        .into_iter()
+        .map(|(commodity, rate)| {
+            checked_positive(rate, "aggregated resource product rate per second")
                 .map(|rate| CommodityRate { commodity, rate })
         })
         .collect()
@@ -1713,7 +1998,7 @@ fn build_dependency_node(
         DependencyEdgeKind::Normal => DependencyNodeKind::ExternalInput,
         DependencyEdgeKind::Fuel => DependencyNodeKind::FuelInput,
     };
-    let Some(recipe_id) = context.resolved_plan.recipes.get(commodity) else {
+    let Some(source) = context.resolved_plan.sources.get(commodity) else {
         return Ok(DependencyNode {
             commodity: commodity.clone(),
             required_rate,
@@ -1728,6 +2013,27 @@ fn build_dependency_node(
     };
     debug_assert!(!context.plan.external_inputs().contains(commodity));
 
+    match source {
+        ProductionSource::Recipe(recipe_id) => {
+            build_recipe_dependency_node(context, commodity, required_rate, edge_kind, recipe_id)
+        }
+        ProductionSource::Resource(resource_id) => build_resource_dependency_node(
+            context,
+            commodity,
+            required_rate,
+            edge_kind,
+            resource_id,
+        ),
+    }
+}
+
+fn build_recipe_dependency_node(
+    context: &DependencyBuildContext<'_>,
+    commodity: &CommodityId,
+    required_rate: Positive,
+    edge_kind: DependencyEdgeKind,
+    recipe_id: &RecipeId,
+) -> Result<DependencyNode, PlannerError> {
     let recipe = context
         .catalog
         .recipe(recipe_id)
@@ -1804,6 +2110,57 @@ fn build_dependency_node(
     })
 }
 
+fn build_resource_dependency_node(
+    context: &DependencyBuildContext<'_>,
+    commodity: &CommodityId,
+    required_rate: Positive,
+    edge_kind: DependencyEdgeKind,
+    resource_id: &ResourceSourceId,
+) -> Result<DependencyNode, PlannerError> {
+    let resource = context
+        .catalog
+        .resource_source(resource_id)
+        .expect("resolved resource source IDs must remain present in the catalog");
+    let product_amount = resource
+        .products()
+        .iter()
+        .filter(|product| product.commodity() == commodity)
+        .map(|product| product.amount().get())
+        .sum::<f64>();
+    let extraction_rate = checked_positive(
+        required_rate.get() / product_amount,
+        "dependency tree resource extraction rate per second",
+    )?;
+    let mut children = Vec::new();
+    if let Some(required_fluid) = resource.required_fluid() {
+        let rate = checked_positive(
+            extraction_rate.get() * required_fluid.amount().get(),
+            "dependency tree resource required fluid rate per second",
+        )?;
+        children.push(build_dependency_node(
+            context,
+            required_fluid.commodity(),
+            rate,
+            DependencyEdgeKind::Normal,
+        )?);
+    }
+
+    Ok(DependencyNode {
+        commodity: commodity.clone(),
+        required_rate,
+        kind: match edge_kind {
+            DependencyEdgeKind::Normal => DependencyNodeKind::Production,
+            DependencyEdgeKind::Fuel => DependencyNodeKind::FuelInput,
+        },
+        recipe: None,
+        machine: None,
+        fractional_machine_count: None,
+        installed_machine_count: None,
+        shared: false,
+        children,
+    })
+}
+
 fn append_fuel_dependency_child(
     context: &DependencyBuildContext<'_>,
     commodity: &CommodityId,
@@ -1845,7 +2202,7 @@ fn count_child_production_nodes(
     is_root: bool,
     counts: &mut BTreeMap<CommodityId, usize>,
 ) {
-    if !is_root && node.recipe().is_some() {
+    if !is_root && node.kind() == DependencyNodeKind::Production {
         *counts.entry(node.commodity().clone()).or_default() += 1;
     }
     for child in node.children() {
@@ -1854,9 +2211,8 @@ fn count_child_production_nodes(
 }
 
 fn mark_shared_dependency_nodes(node: &mut DependencyNode, counts: &BTreeMap<CommodityId, usize>) {
-    node.shared = node
-        .recipe()
-        .is_some_and(|_| counts.get(node.commodity()).copied().unwrap_or_default() > 1);
+    node.shared = node.kind() == DependencyNodeKind::Production
+        && counts.get(node.commodity()).copied().unwrap_or_default() > 1;
     for child in &mut node.children {
         mark_shared_dependency_nodes(child, counts);
     }
@@ -1873,6 +2229,7 @@ fn effective_product_amount(
 
 fn aggregate_surplus(
     production_steps: &[ProductionStep],
+    extraction_steps: &[ExtractionStep],
 ) -> Result<Vec<CommodityRate>, PlannerError> {
     let mut surplus = BTreeMap::<CommodityId, f64>::new();
     for step in production_steps {
@@ -1890,6 +2247,16 @@ fn aggregate_surplus(
             let total = surplus.entry(burnt_result.commodity().clone()).or_default();
             *total += burnt_result.rate().get();
             checked_positive(*total, "aggregated burnt-result surplus rate per second")?;
+        }
+    }
+    for step in extraction_steps {
+        for product in step.products() {
+            if product.commodity() == step.planning_product() {
+                continue;
+            }
+            let total = surplus.entry(product.commodity().clone()).or_default();
+            *total += product.rate().get();
+            checked_positive(*total, "aggregated resource surplus rate per second")?;
         }
     }
     surplus
@@ -1979,6 +2346,7 @@ fn aggregate_burner_fuel_demand(
 
 fn aggregate_logistics_flows(
     production_steps: &[ProductionStep],
+    extraction_steps: &[ExtractionStep],
     external_inputs: &[CommodityRate],
 ) -> Result<(Vec<CommodityRate>, Vec<CommodityRate>), PlannerError> {
     let mut flows = BTreeMap::<CommodityId, f64>::new();
@@ -1997,6 +2365,15 @@ fn aggregate_logistics_flows(
                 &mut flows,
                 burnt_result,
                 "aggregated burnt-result logistics flow rate per second",
+            )?;
+        }
+    }
+    for step in extraction_steps {
+        for product in step.products() {
+            add_rate(
+                &mut flows,
+                product,
+                "aggregated resource logistics flow rate per second",
             )?;
         }
     }

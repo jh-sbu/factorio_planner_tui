@@ -51,8 +51,16 @@ string_id!(FuelId);
 string_id!(BeltId);
 string_id!(DatasetFingerprint);
 string_id!(RecipeCategory);
+string_id!(ResourceSourceId);
+string_id!(ResourceCategory);
 string_id!(ModuleCategory);
 string_id!(FuelCategory);
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProductionSource {
+    Recipe(RecipeId),
+    Resource(ResourceSourceId),
+}
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CommodityId {
@@ -778,6 +786,75 @@ impl Belt {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceSource {
+    id: ResourceSourceId,
+    category: ResourceCategory,
+    infinite: bool,
+    mining_time: Positive,
+    products: Vec<Product>,
+    required_fluid: Option<Ingredient>,
+}
+
+impl ResourceSource {
+    /// Creates a normalized extraction source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::ResourceHasNoProducts`] when no product is
+    /// supplied.
+    pub fn new(
+        id: ResourceSourceId,
+        category: ResourceCategory,
+        infinite: bool,
+        mining_time: Positive,
+        products: Vec<Product>,
+        required_fluid: Option<Ingredient>,
+    ) -> Result<Self, RecordError> {
+        if products.is_empty() {
+            return Err(RecordError::ResourceHasNoProducts { resource: id });
+        }
+        Ok(Self {
+            id,
+            category,
+            infinite,
+            mining_time,
+            products,
+            required_fluid,
+        })
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &ResourceSourceId {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn category(&self) -> &ResourceCategory {
+        &self.category
+    }
+
+    #[must_use]
+    pub const fn infinite(&self) -> bool {
+        self.infinite
+    }
+
+    #[must_use]
+    pub const fn mining_time(&self) -> Positive {
+        self.mining_time
+    }
+
+    #[must_use]
+    pub fn products(&self) -> &[Product] {
+        &self.products
+    }
+
+    #[must_use]
+    pub const fn required_fluid(&self) -> Option<&Ingredient> {
+        self.required_fluid.as_ref()
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum RecordError {
     #[error("recipe {recipe} has no products")]
@@ -796,12 +873,15 @@ pub enum RecordError {
     },
     #[error("machine {machine} has no crafting categories")]
     MachineHasNoCraftingCategories { machine: MachineId },
+    #[error("resource source {resource} has no products")]
+    ResourceHasNoProducts { resource: ResourceSourceId },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CatalogParts {
     pub commodities: Vec<Commodity>,
     pub recipes: Vec<Recipe>,
+    pub resource_sources: Vec<ResourceSource>,
     pub machines: Vec<Machine>,
     pub modules: Vec<Module>,
     pub fuels: Vec<Fuel>,
@@ -812,10 +892,12 @@ pub struct CatalogParts {
 pub struct Catalog {
     commodities: BTreeMap<CommodityId, Commodity>,
     recipes: BTreeMap<RecipeId, Recipe>,
+    resource_sources: BTreeMap<ResourceSourceId, ResourceSource>,
     machines: BTreeMap<MachineId, Machine>,
     modules: BTreeMap<ModuleId, Module>,
     fuels: BTreeMap<FuelId, Fuel>,
     belts: BTreeMap<BeltId, Belt>,
+    sources_by_product: BTreeMap<CommodityId, Vec<ProductionSource>>,
     recipes_by_product: BTreeMap<CommodityId, Vec<RecipeId>>,
     machines_by_category: BTreeMap<RecipeCategory, Vec<MachineId>>,
 }
@@ -834,6 +916,9 @@ impl Catalog {
         let recipes = collect_unique(parts.recipes, Recipe::id, |id| {
             CatalogError::DuplicateRecipe { id }
         })?;
+        let resource_sources = collect_unique(parts.resource_sources, ResourceSource::id, |id| {
+            CatalogError::DuplicateResourceSource { id }
+        })?;
         let machines = collect_unique(parts.machines, Machine::id, |id| {
             CatalogError::DuplicateMachine { id }
         })?;
@@ -847,9 +932,10 @@ impl Catalog {
             id,
         })?;
 
-        validate_references(&commodities, &recipes, &fuels)?;
+        validate_references(&commodities, &recipes, &resource_sources, &fuels)?;
 
         let mut recipes_by_product: BTreeMap<CommodityId, Vec<RecipeId>> = BTreeMap::new();
+        let mut sources_by_product: BTreeMap<CommodityId, Vec<ProductionSource>> = BTreeMap::new();
         for (recipe_id, recipe) in &recipes {
             for product in recipe.products() {
                 let recipe_ids = recipes_by_product
@@ -857,6 +943,24 @@ impl Catalog {
                     .or_default();
                 if !recipe_ids.contains(recipe_id) {
                     recipe_ids.push(recipe_id.clone());
+                }
+                let sources = sources_by_product
+                    .entry(product.commodity().clone())
+                    .or_default();
+                let source = ProductionSource::Recipe(recipe_id.clone());
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+        }
+        for (resource_id, resource) in &resource_sources {
+            for product in resource.products() {
+                let sources = sources_by_product
+                    .entry(product.commodity().clone())
+                    .or_default();
+                let source = ProductionSource::Resource(resource_id.clone());
+                if !sources.contains(&source) {
+                    sources.push(source);
                 }
             }
         }
@@ -874,10 +978,12 @@ impl Catalog {
         Ok(Self {
             commodities,
             recipes,
+            resource_sources,
             machines,
             modules,
             fuels,
             belts,
+            sources_by_product,
             recipes_by_product,
             machines_by_category,
         })
@@ -891,6 +997,11 @@ impl Catalog {
     #[must_use]
     pub fn recipe(&self, id: &RecipeId) -> Option<&Recipe> {
         self.recipes.get(id)
+    }
+
+    #[must_use]
+    pub fn resource_source(&self, id: &ResourceSourceId) -> Option<&ResourceSource> {
+        self.resource_sources.get(id)
     }
 
     #[must_use]
@@ -919,6 +1030,11 @@ impl Catalog {
     }
 
     #[must_use]
+    pub fn sources_for_product(&self, id: &CommodityId) -> &[ProductionSource] {
+        self.sources_by_product.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
     pub fn machines_for_category(&self, category: &RecipeCategory) -> &[MachineId] {
         self.machines_by_category
             .get(category)
@@ -933,6 +1049,11 @@ impl Catalog {
     #[must_use]
     pub fn recipes(&self) -> impl ExactSizeIterator<Item = &Recipe> {
         self.recipes.values()
+    }
+
+    #[must_use]
+    pub fn resource_sources(&self) -> impl ExactSizeIterator<Item = &ResourceSource> {
+        self.resource_sources.values()
     }
 
     #[must_use]
@@ -1041,6 +1162,7 @@ where
 fn validate_references(
     commodities: &BTreeMap<CommodityId, Commodity>,
     recipes: &BTreeMap<RecipeId, Recipe>,
+    resource_sources: &BTreeMap<ResourceSourceId, ResourceSource>,
     fuels: &BTreeMap<FuelId, Fuel>,
 ) -> Result<(), CatalogError> {
     for (recipe_id, recipe) in recipes {
@@ -1059,6 +1181,25 @@ fn validate_references(
                     commodity: product.commodity().clone(),
                 });
             }
+        }
+    }
+
+    for (resource_id, resource) in resource_sources {
+        for product in resource.products() {
+            if !commodities.contains_key(product.commodity()) {
+                return Err(CatalogError::MissingResourceProduct {
+                    resource: resource_id.clone(),
+                    commodity: product.commodity().clone(),
+                });
+            }
+        }
+        if let Some(required_fluid) = resource.required_fluid()
+            && !commodities.contains_key(required_fluid.commodity())
+        {
+            return Err(CatalogError::MissingResourceRequiredFluid {
+                resource: resource_id.clone(),
+                commodity: required_fluid.commodity().clone(),
+            });
         }
     }
 
@@ -1087,6 +1228,8 @@ pub enum CatalogError {
     DuplicateCommodity { id: CommodityId },
     #[error("duplicate recipe ID {id}")]
     DuplicateRecipe { id: RecipeId },
+    #[error("duplicate resource source ID {id}")]
+    DuplicateResourceSource { id: ResourceSourceId },
     #[error("duplicate machine ID {id}")]
     DuplicateMachine { id: MachineId },
     #[error("duplicate module ID {id}")]
@@ -1103,6 +1246,16 @@ pub enum CatalogError {
     #[error("recipe {recipe} references missing product {commodity}")]
     MissingRecipeProduct {
         recipe: RecipeId,
+        commodity: CommodityId,
+    },
+    #[error("resource source {resource} references missing product {commodity}")]
+    MissingResourceProduct {
+        resource: ResourceSourceId,
+        commodity: CommodityId,
+    },
+    #[error("resource source {resource} references missing required fluid {commodity}")]
+    MissingResourceRequiredFluid {
+        resource: ResourceSourceId,
         commodity: CommodityId,
     },
     #[error("fuel {fuel} references missing item {item}")]

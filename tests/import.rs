@@ -2,8 +2,8 @@ use std::io::Cursor;
 
 use factorio_planner_tui::catalog::{
     BeltId, CommodityId, FluidId, FuelCategory, FuelId, ItemId, MachineEnergySource, MachineId,
-    ModuleCategory, ModuleEffect, ModuleId, Positive, RecipeCategory, RecipeId,
-    UnsupportedEnergySource,
+    ModuleCategory, ModuleEffect, ModuleId, Positive, ProductionSource, RecipeCategory, RecipeId,
+    ResourceSourceId, UnsupportedEnergySource,
 };
 use factorio_planner_tui::import::{
     DiagnosticSeverity, ImportError, PrototypeDisposition, parse_data_raw,
@@ -1406,5 +1406,117 @@ fn reports_malformed_product_productivity_fields() {
     );
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.path == "/recipe/plate/results/0/ignored_by_productivity"
+    }));
+}
+
+#[test]
+fn imports_resource_sources_with_products_and_required_fluids() {
+    let report = import(
+        r#"{
+            "item": {
+                "iron-ore": {"type": "item", "name": "iron-ore"},
+                "uranium-ore": {"type": "item", "name": "uranium-ore"}
+            },
+            "fluid": {
+                "sulfuric-acid": {"type": "fluid", "name": "sulfuric-acid"},
+                "crude-oil": {"type": "fluid", "name": "crude-oil"}
+            },
+            "resource": {
+                "iron-ore": {
+                    "type": "resource",
+                    "name": "iron-ore",
+                    "minable": {
+                        "mining_time": 1,
+                        "result": "iron-ore",
+                        "amount": 1
+                    }
+                },
+                "uranium-ore": {
+                    "type": "resource",
+                    "name": "uranium-ore",
+                    "category": "basic-solid",
+                    "minable": {
+                        "mining_time": 2,
+                        "required_fluid": "sulfuric-acid",
+                        "fluid_amount": 10,
+                        "results": [{"type": "item", "name": "uranium-ore", "amount": 1, "probability": 0.5}]
+                    }
+                },
+                "crude-oil": {
+                    "type": "resource",
+                    "name": "crude-oil",
+                    "category": "basic-fluid",
+                    "infinite": true,
+                    "minable": {
+                        "mining_time": 1,
+                        "results": [{"type": "fluid", "name": "crude-oil", "amount": 10}]
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let catalog = report.catalog();
+
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(
+        catalog.sources_for_product(&item("iron-ore")),
+        &[ProductionSource::Resource(
+            ResourceSourceId::new("iron-ore").unwrap()
+        )]
+    );
+
+    let uranium = catalog
+        .resource_source(&ResourceSourceId::new("uranium-ore").unwrap())
+        .unwrap();
+    assert_eq!(uranium.category().as_str(), "basic-solid");
+    assert_close(uranium.mining_time().get(), 2.0);
+    assert_close(uranium.products()[0].amount().get(), 0.5);
+    let acid = uranium.required_fluid().unwrap();
+    assert_eq!(acid.commodity(), &fluid("sulfuric-acid"));
+    assert_close(acid.amount().get(), 10.0);
+
+    let oil = catalog
+        .resource_source(&ResourceSourceId::new("crude-oil").unwrap())
+        .unwrap();
+    assert!(oil.infinite());
+    assert_eq!(oil.products()[0].commodity(), &fluid("crude-oil"));
+}
+
+#[test]
+fn reports_malformed_and_unsupported_resource_fields() {
+    let diagnostics = invalid_data(
+        r#"{
+            "item": {"iron-ore": {"type": "item", "name": "iron-ore"}},
+            "resource": {
+                "bad": {
+                    "type": "resource",
+                    "name": "bad",
+                    "minimum": 100,
+                    "minable": {
+                        "mining_time": 0,
+                        "required_fluid": "missing-fluid",
+                        "fluid_amount": "a lot",
+                        "results": [{"type": "item", "name": "iron-ore", "amount": 1}]
+                    }
+                }
+            }
+        }"#,
+    );
+
+    for path in [
+        "/resource/bad/minable/mining_time",
+        "/resource/bad/minable/required_fluid",
+        "/resource/bad/minable/fluid_amount",
+    ] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.path == path),
+            "missing diagnostic for {path}: {diagnostics:#?}"
+        );
+    }
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Warning
+            && diagnostic.path == "/resource/bad/minimum"
+            && diagnostic.disposition == PrototypeDisposition::PartiallyRetained
     }));
 }
