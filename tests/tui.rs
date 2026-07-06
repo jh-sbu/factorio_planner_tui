@@ -394,9 +394,19 @@ fn selection_overlay_printable_keys_edit_query() {
         ..EventContext::default()
     };
 
+    for value in ['i', 'j', 'k', 'J', 'K'] {
+        assert_eq!(
+            translate_event(&key(KeyCode::Char(value), KeyEventKind::Press), context),
+            TranslatedEvent::Action(Action::AppendSelectionQuery(value.to_string()))
+        );
+    }
     assert_eq!(
-        translate_event(&key(KeyCode::Char('i'), KeyEventKind::Press), context),
-        TranslatedEvent::Action(Action::AppendSelectionQuery("i".to_owned()))
+        translate_event(&key(KeyCode::Up, KeyEventKind::Press), context),
+        TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Previous))
+    );
+    assert_eq!(
+        translate_event(&key(KeyCode::Down, KeyEventKind::Press), context),
+        TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Next))
     );
     assert_eq!(
         translate_event(&key(KeyCode::Backspace, KeyEventKind::Press), context),

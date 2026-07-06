@@ -180,10 +180,10 @@ fn translate_selection_key_event(key: KeyEvent, context: EventContext) -> Transl
             TranslatedEvent::Action(Action::CancelPrompt)
         }
         KeyCode::Esc => TranslatedEvent::Action(Action::CloseOverlay),
-        KeyCode::Up | KeyCode::Char('k' | 'K') => {
-            TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Previous))
-        }
-        KeyCode::Down | KeyCode::Char('j' | 'J') => {
+        KeyCode::Up => TranslatedEvent::Action(Action::MoveSelectorSelection(
+            MoveDirection::Previous,
+        )),
+        KeyCode::Down => {
             TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Next))
         }
         KeyCode::Backspace => TranslatedEvent::Action(Action::BackspaceSelectionQuery),
