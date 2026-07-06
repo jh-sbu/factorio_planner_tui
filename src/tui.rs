@@ -13,9 +13,9 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use thiserror::Error;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -180,9 +180,9 @@ fn translate_selection_key_event(key: KeyEvent, context: EventContext) -> Transl
             TranslatedEvent::Action(Action::CancelPrompt)
         }
         KeyCode::Esc => TranslatedEvent::Action(Action::CloseOverlay),
-        KeyCode::Up => TranslatedEvent::Action(Action::MoveSelectorSelection(
-            MoveDirection::Previous,
-        )),
+        KeyCode::Up => {
+            TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Previous))
+        }
         KeyCode::Down => {
             TranslatedEvent::Action(Action::MoveSelectorSelection(MoveDirection::Next))
         }
@@ -534,6 +534,21 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+fn section_block(title: &'static str, focused: bool) -> Block<'static> {
+    let block = Block::default().borders(Borders::ALL).title(title);
+    if focused {
+        let style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        block
+            .border_type(BorderType::Thick)
+            .border_style(style)
+            .title_style(style)
+    } else {
+        block
+    }
+}
+
 fn render_start_screen(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(area);
@@ -555,18 +570,39 @@ fn render_start_screen(app: &App, frame: &mut Frame<'_>, area: Rect) {
         commands.push(Line::from(status.to_owned()));
     }
     frame.render_widget(
-        Paragraph::new(commands).block(Block::default().borders(Borders::ALL).title("Actions")),
+        Paragraph::new(commands).block(section_block(
+            "Actions",
+            app.focus() == FocusTarget::StartMenu,
+        )),
         left,
     );
 
-    render_profile_list(app, frame, right, "Profiles");
+    render_profile_list(
+        app,
+        frame,
+        right,
+        "Profiles",
+        app.focus() == FocusTarget::ProfileList,
+    );
 }
 
 fn render_profile_screen(app: &App, frame: &mut Frame<'_>, area: Rect) {
-    render_profile_list(app, frame, area, "Profile Workflows");
+    render_profile_list(
+        app,
+        frame,
+        area,
+        "Profile Workflows",
+        app.focus() == FocusTarget::ProfileList,
+    );
 }
 
-fn render_profile_list(app: &App, frame: &mut Frame<'_>, area: Rect, title: &'static str) {
+fn render_profile_list(
+    app: &App,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    focused: bool,
+) {
     let mut lines = vec![Line::from(format!("Profiles ({})", app.profiles().len()))];
     if app.profiles().is_empty() {
         lines.push(Line::from(""));
@@ -612,7 +648,7 @@ fn render_profile_list(app: &App, frame: &mut Frame<'_>, area: Rect, title: &'st
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(title)),
+            .block(section_block(title, focused)),
         area,
     );
 }
@@ -762,7 +798,10 @@ fn render_targets_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title("Targets")),
+            .block(section_block(
+                "Targets",
+                app.focus() == FocusTarget::TargetList,
+            )),
         area,
     );
 }
@@ -807,7 +846,7 @@ fn render_results_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(title)),
+            .block(section_block(title, app.focus() == FocusTarget::Results)),
         area,
     );
 }
@@ -904,11 +943,12 @@ fn push_dependency_node_lines(
 fn render_details_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let lines = selected_step_detail_lines(app);
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Selected Step"),
-        ),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .block(section_block(
+                "Selected Step",
+                app.focus() == FocusTarget::StepConfiguration,
+            )),
         area,
     );
 }

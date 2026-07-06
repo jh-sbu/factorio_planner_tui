@@ -16,6 +16,7 @@ use factorio_planner_tui::tui::{EventContext, TranslatedEvent, render, translate
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::style::{Color, Modifier};
 use tempfile::TempDir;
 
 fn key(code: KeyCode, kind: KeyEventKind) -> Event {
@@ -114,10 +115,14 @@ fn warning_data() -> &'static str {
 }
 
 fn render_to_string(app: &App, width: u16, height: u16) -> String {
+    buffer_to_string(&render_to_buffer(app, width, height))
+}
+
+fn render_to_buffer(app: &App, width: u16, height: u16) -> Buffer {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| render(app, frame)).unwrap();
-    buffer_to_string(terminal.backend().buffer())
+    terminal.backend().buffer().clone()
 }
 
 fn buffer_to_string(buffer: &Buffer) -> String {
@@ -131,6 +136,55 @@ fn buffer_to_string(buffer: &Buffer) -> String {
         lines.push(line.trim_end().to_owned());
     }
     lines.join("\n")
+}
+
+fn title_position(buffer: &Buffer, title: &str) -> (u16, u16) {
+    let area = buffer.area;
+    for y in area.y..area.y + area.height {
+        let mut line = String::new();
+        for x in area.x..area.x + area.width {
+            line.push_str(buffer[(x, y)].symbol());
+        }
+        if let Some(offset) = line.find(title) {
+            let cell_offset = line[..offset].chars().count();
+            return (area.x + u16::try_from(cell_offset).unwrap(), y);
+        }
+    }
+    panic!("title {title:?} not found in rendered buffer");
+}
+
+fn assert_title_focused(buffer: &Buffer, title: &str) {
+    let (x, y) = title_position(buffer, title);
+    let title_cell = &buffer[(x, y)];
+    let corner_cell = &buffer[(x - 1, y)];
+    assert_eq!(title_cell.fg, Color::Green, "{title} title foreground");
+    assert!(
+        title_cell.modifier.contains(Modifier::BOLD),
+        "{title} title modifier"
+    );
+    assert_eq!(corner_cell.symbol(), "┏", "{title} border symbol");
+    assert_eq!(corner_cell.fg, Color::Green, "{title} border foreground");
+    assert!(
+        corner_cell.modifier.contains(Modifier::BOLD),
+        "{title} border modifier"
+    );
+}
+
+fn assert_title_not_focused(buffer: &Buffer, title: &str) {
+    let (x, y) = title_position(buffer, title);
+    let title_cell = &buffer[(x, y)];
+    let corner_cell = &buffer[(x - 1, y)];
+    assert_eq!(title_cell.fg, Color::Reset, "{title} title foreground");
+    assert!(
+        !title_cell.modifier.contains(Modifier::BOLD),
+        "{title} title modifier"
+    );
+    assert_eq!(corner_cell.symbol(), "┌", "{title} border symbol");
+    assert_eq!(corner_cell.fg, Color::Reset, "{title} border foreground");
+    assert!(
+        !corner_cell.modifier.contains(Modifier::BOLD),
+        "{title} border modifier"
+    );
 }
 
 fn create_profile(
@@ -486,6 +540,71 @@ fn renders_start_screen_with_profile_metadata() {
 }
 
 #[test]
+fn start_screen_styles_the_focused_section() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let mut app = App::start(StartupMode::StartScreen, &profile_store, &plan_store).unwrap();
+
+    let actions_focused = render_to_buffer(&app, 100, 24);
+    assert_title_focused(&actions_focused, "Actions");
+    assert_title_not_focused(&actions_focused, "Profiles");
+
+    app.dispatch(
+        Action::CycleFocus { reverse: false },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let profiles_focused = render_to_buffer(&app, 100, 24);
+    assert_title_not_focused(&profiles_focused, "Actions");
+    assert_title_focused(&profiles_focused, "Profiles");
+}
+
+#[test]
+fn profile_screen_styles_profile_workflows_as_focused() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let mut app = App::start(StartupMode::StartScreen, &profile_store, &plan_store).unwrap();
+    app.dispatch(
+        Action::MoveFocus(FocusTarget::StartMenu),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ActivateSelection, &profile_store, &plan_store)
+        .unwrap();
+
+    let screen = render_to_buffer(&app, 100, 24);
+
+    assert_title_focused(&screen, "Profile Workflows");
+}
+
+#[test]
 fn renders_text_prompt_overlay() {
     let mut app = App::new();
     app.dispatch(
@@ -626,6 +745,53 @@ fn renders_planning_workspace_table_and_selected_step_details() {
     assert!(screen.contains("External Inputs"));
     assert!(screen.contains("iron-ore"));
     assert!(screen.contains("Belt"));
+}
+
+#[test]
+fn workspace_styles_the_focused_section() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "workspace.json", workspace_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-gear-wheel"), 3.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    let targets_focused = render_to_buffer(&app, 120, 32);
+    assert_title_focused(&targets_focused, "Targets");
+    assert_title_not_focused(&targets_focused, "Aggregated Table");
+    assert_title_not_focused(&targets_focused, "Selected Step");
+
+    app.dispatch(
+        Action::CycleFocus { reverse: false },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let results_focused = render_to_buffer(&app, 120, 32);
+    assert_title_not_focused(&results_focused, "Targets");
+    assert_title_focused(&results_focused, "Aggregated Table");
+    assert_title_not_focused(&results_focused, "Selected Step");
+
+    app.dispatch(
+        Action::CycleFocus { reverse: false },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let details_focused = render_to_buffer(&app, 120, 32);
+    assert_title_not_focused(&details_focused, "Targets");
+    assert_title_not_focused(&details_focused, "Aggregated Table");
+    assert_title_focused(&details_focused, "Selected Step");
 }
 
 #[test]
