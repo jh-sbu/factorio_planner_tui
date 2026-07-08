@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 use crate::catalog::{
-    BeltId, Catalog, CommodityId, Finite, Fuel, FuelCategory, FuelId, ItemId, Machine,
+    BeltId, Catalog, CommodityId, Finite, FluidSource, Fuel, FuelCategory, FuelId, ItemId, Machine,
     MachineEnergySource, MachineId, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
     ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceSource, ResourceSourceId,
     UnsupportedEnergySource,
@@ -572,7 +572,7 @@ impl ProductionStep {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExtractionStep {
     planning_product: CommodityId,
-    source: ResourceSourceId,
+    source: ProductionSource,
     required_output_rate: Positive,
     extraction_rate: Positive,
     required_fluids: Vec<CommodityRate>,
@@ -586,7 +586,7 @@ impl ExtractionStep {
     }
 
     #[must_use]
-    pub const fn source(&self) -> &ResourceSourceId {
+    pub const fn source(&self) -> &ProductionSource {
         &self.source
     }
 
@@ -876,6 +876,9 @@ impl<'a> Calculation<'a> {
             ProductionSource::Resource(resource_id) => {
                 self.expand_resource(commodity, required_rate, resource_id)
             }
+            ProductionSource::Fluid(fluid_source_id) => {
+                self.expand_fluid_source(commodity, required_rate, fluid_source_id)
+            }
         }
     }
 
@@ -1014,7 +1017,7 @@ impl<'a> Calculation<'a> {
 
         self.add_extraction_step(
             commodity,
-            &resource_id,
+            &ProductionSource::Resource(resource_id.clone()),
             required_rate,
             extraction_rate,
             &required_fluids,
@@ -1027,10 +1030,67 @@ impl<'a> Calculation<'a> {
         Ok(())
     }
 
+    fn expand_fluid_source(
+        &mut self,
+        commodity: &CommodityId,
+        required_rate: Positive,
+        fluid_source_id: crate::catalog::FluidSourceId,
+    ) -> Result<(), PlannerError> {
+        let source = self
+            .catalog
+            .fluid_source(&fluid_source_id)
+            .expect("resolved fluid source IDs must remain present in the catalog");
+        let product_amount = source
+            .products()
+            .iter()
+            .filter(|product| product.commodity() == commodity)
+            .map(|product| product.amount().get())
+            .sum::<f64>();
+        let source_rate = checked_positive(
+            required_rate.get() / product_amount,
+            "fluid source rate per second",
+        )?;
+        let ingredients = source
+            .ingredients()
+            .iter()
+            .map(|ingredient| {
+                checked_positive(
+                    source_rate.get() * ingredient.amount().get(),
+                    "fluid source ingredient rate per second",
+                )
+                .map(|rate| CommodityRate {
+                    commodity: ingredient.commodity().clone(),
+                    rate,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let products = aggregate_fluid_source_products(source, source_rate)?;
+
+        self.add_extraction_step(
+            commodity,
+            &ProductionSource::Fluid(fluid_source_id.clone()),
+            required_rate,
+            source_rate,
+            &ingredients,
+            &products,
+        )?;
+
+        for ingredient in ingredients {
+            self.expand(ingredient.commodity(), ingredient.rate())?;
+        }
+        if let Some(fuel_rate) = fluid_source_fuel_rate(self.catalog, source, source_rate)? {
+            self.expand(
+                &CommodityId::Item(fuel_rate.fuel_item().clone()),
+                fuel_rate.rate_per_second(),
+            )?;
+        }
+        Ok(())
+    }
+
     fn add_extraction_step(
         &mut self,
         commodity: &CommodityId,
-        source: &ResourceSourceId,
+        source: &ProductionSource,
         required_output_rate: Positive,
         extraction_rate: Positive,
         required_fluids: &[CommodityRate],
@@ -1234,11 +1294,16 @@ impl<'a> Calculation<'a> {
                     .map(|rate| CommodityRate { commodity, rate })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let surplus = aggregate_surplus(&production_steps, &extraction_steps)?;
+        let surplus = aggregate_surplus(self.catalog, &production_steps, &extraction_steps)?;
         let electric_power = aggregate_electric_power(&production_steps)?;
-        let burner_fuel_demand = aggregate_burner_fuel_demand(&production_steps)?;
-        let (item_flows, fluid_flows) =
-            aggregate_logistics_flows(&production_steps, &extraction_steps, &external_inputs)?;
+        let burner_fuel_demand =
+            aggregate_burner_fuel_demand(self.catalog, &production_steps, &extraction_steps)?;
+        let (item_flows, fluid_flows) = aggregate_logistics_flows(
+            self.catalog,
+            &production_steps,
+            &extraction_steps,
+            &external_inputs,
+        )?;
         let belt_equivalents =
             calculate_belt_equivalents(self.catalog, self.plan.selected_belt(), &item_flows)?;
 
@@ -1369,6 +1434,28 @@ impl<'a> SourceResolver<'a> {
                     dependencies.push(required_fluid.commodity().clone());
                 }
             }
+            ProductionSource::Fluid(fluid_source_id) => {
+                let source = self
+                    .catalog
+                    .fluid_source(fluid_source_id)
+                    .expect("selected fluid source IDs must remain present in the catalog");
+                dependencies.extend(
+                    source
+                        .ingredients()
+                        .iter()
+                        .map(|ingredient| ingredient.commodity().clone()),
+                );
+                if let Some(MachineEnergySource::Burner {
+                    fuel_categories, ..
+                }) = source.energy_source()
+                    && let Some(fuel) = fuel_categories
+                        .iter()
+                        .flat_map(|category| compatible_fuels(self.catalog, category))
+                        .max_by(|left, right| compare_fuels(left, right))
+                {
+                    dependencies.push(CommodityId::Item(fuel.item().clone()));
+                }
+            }
         }
         self.selected_sources.insert(commodity.clone(), source);
 
@@ -1417,7 +1504,7 @@ impl<'a> SourceResolver<'a> {
             .iter()
             .filter_map(|source| match source {
                 ProductionSource::Recipe(recipe_id) => self.catalog.recipe(recipe_id),
-                ProductionSource::Resource(_) => None,
+                ProductionSource::Resource(_) | ProductionSource::Fluid(_) => None,
             })
             .filter(|recipe| recipe.supported())
             .min_by(|left, right| {
@@ -1429,15 +1516,30 @@ impl<'a> SourceResolver<'a> {
             return Ok(Some(ProductionSource::Recipe(recipe.id().clone())));
         }
 
+        let resource_source =
+            self.catalog
+                .sources_for_product(commodity)
+                .iter()
+                .find_map(|source| match source {
+                    ProductionSource::Recipe(_) => None,
+                    ProductionSource::Resource(resource_id) => {
+                        Some(ProductionSource::Resource(resource_id.clone()))
+                    }
+                    ProductionSource::Fluid(_) => None,
+                });
+        if resource_source.is_some() {
+            return Ok(resource_source);
+        }
+
         Ok(self
             .catalog
             .sources_for_product(commodity)
             .iter()
             .find_map(|source| match source {
-                ProductionSource::Recipe(_) => None,
-                ProductionSource::Resource(resource_id) => {
-                    Some(ProductionSource::Resource(resource_id.clone()))
+                ProductionSource::Fluid(source_id) => {
+                    Some(ProductionSource::Fluid(source_id.clone()))
                 }
+                ProductionSource::Recipe(_) | ProductionSource::Resource(_) => None,
             }))
     }
 }
@@ -1566,6 +1668,49 @@ fn select_fuel(
     }
 }
 
+fn compatible_fuels<'a>(catalog: &'a Catalog, category: &FuelCategory) -> Vec<&'a Fuel> {
+    catalog
+        .fuels()
+        .filter(|fuel| fuel.category() == category)
+        .collect()
+}
+
+fn fluid_source_fuel_rate(
+    catalog: &Catalog,
+    source: &FluidSource,
+    source_rate: Positive,
+) -> Result<Option<FuelUsage>, PlannerError> {
+    let Some(MachineEnergySource::Burner {
+        fuel_categories,
+        effectivity,
+    }) = source.energy_source()
+    else {
+        return Ok(None);
+    };
+    let fuel = fuel_categories
+        .iter()
+        .flat_map(|category| compatible_fuels(catalog, category))
+        .max_by(|left, right| compare_fuels(left, right))
+        .expect("catalog validation ensures fluid source fuel categories have fuels");
+    let active_watts = checked_positive(
+        source
+            .energy_usage()
+            .expect("burner fluid sources must have energy usage")
+            .get()
+            * source_rate.get(),
+        "fluid source active power",
+    )?;
+    StepEnergyConfiguration::Burner {
+        fuel: fuel.id().clone(),
+        fuel_item: fuel.item().clone(),
+        active_watts_per_machine: active_watts,
+        effectivity: *effectivity,
+        fuel_value: fuel.fuel_value(),
+        burnt_result: fuel.burnt_result().cloned(),
+    }
+    .fuel_rate(Positive::new(1.0).expect("one is positive"))
+}
+
 fn compare_fuels(left: &Fuel, right: &Fuel) -> std::cmp::Ordering {
     left.fuel_value()
         .get()
@@ -1607,7 +1752,7 @@ struct ProductionStepAccumulator {
 
 struct ExtractionStepAccumulator {
     planning_product: CommodityId,
-    source: ResourceSourceId,
+    source: ProductionSource,
     required_output_rate: f64,
     extraction_rate: f64,
     required_fluids: BTreeMap<CommodityId, f64>,
@@ -1828,6 +1973,29 @@ fn aggregate_resource_products(
         .collect()
 }
 
+fn aggregate_fluid_source_products(
+    source: &FluidSource,
+    source_rate: Positive,
+) -> Result<Vec<CommodityRate>, PlannerError> {
+    let mut products = BTreeMap::<CommodityId, f64>::new();
+    for product in source.products() {
+        let rate = checked_positive(
+            source_rate.get() * product.amount().get(),
+            "fluid source product rate per second",
+        )?;
+        let total = products.entry(product.commodity().clone()).or_default();
+        *total += rate.get();
+        checked_positive(*total, "aggregated fluid source product rate per second")?;
+    }
+    products
+        .into_iter()
+        .map(|(commodity, rate)| {
+            checked_positive(rate, "aggregated fluid source product rate per second")
+                .map(|rate| CommodityRate { commodity, rate })
+        })
+        .collect()
+}
+
 struct ModuleConfiguration {
     modules: Vec<ModuleId>,
     speed_multiplier: Positive,
@@ -2024,6 +2192,13 @@ fn build_dependency_node(
             edge_kind,
             resource_id,
         ),
+        ProductionSource::Fluid(fluid_source_id) => build_fluid_source_dependency_node(
+            context,
+            commodity,
+            required_rate,
+            edge_kind,
+            fluid_source_id,
+        ),
     }
 }
 
@@ -2161,6 +2336,65 @@ fn build_resource_dependency_node(
     })
 }
 
+fn build_fluid_source_dependency_node(
+    context: &DependencyBuildContext<'_>,
+    commodity: &CommodityId,
+    required_rate: Positive,
+    edge_kind: DependencyEdgeKind,
+    source_id: &crate::catalog::FluidSourceId,
+) -> Result<DependencyNode, PlannerError> {
+    let source = context
+        .catalog
+        .fluid_source(source_id)
+        .expect("resolved fluid source IDs must remain present in the catalog");
+    let product_amount = source
+        .products()
+        .iter()
+        .filter(|product| product.commodity() == commodity)
+        .map(|product| product.amount().get())
+        .sum::<f64>();
+    let source_rate = checked_positive(
+        required_rate.get() / product_amount,
+        "dependency tree fluid source rate per second",
+    )?;
+    let mut children = Vec::new();
+    for ingredient in source.ingredients() {
+        let rate = checked_positive(
+            source_rate.get() * ingredient.amount().get(),
+            "dependency tree fluid source ingredient rate per second",
+        )?;
+        children.push(build_dependency_node(
+            context,
+            ingredient.commodity(),
+            rate,
+            DependencyEdgeKind::Normal,
+        )?);
+    }
+    if let Some(fuel_usage) = fluid_source_fuel_rate(context.catalog, source, source_rate)? {
+        children.push(build_dependency_node(
+            context,
+            &CommodityId::Item(fuel_usage.fuel_item().clone()),
+            fuel_usage.rate_per_second(),
+            DependencyEdgeKind::Fuel,
+        )?);
+    }
+
+    Ok(DependencyNode {
+        commodity: commodity.clone(),
+        required_rate,
+        kind: match edge_kind {
+            DependencyEdgeKind::Normal => DependencyNodeKind::Production,
+            DependencyEdgeKind::Fuel => DependencyNodeKind::FuelInput,
+        },
+        recipe: None,
+        machine: None,
+        fractional_machine_count: None,
+        installed_machine_count: None,
+        shared: false,
+        children,
+    })
+}
+
 fn append_fuel_dependency_child(
     context: &DependencyBuildContext<'_>,
     commodity: &CommodityId,
@@ -2228,6 +2462,7 @@ fn effective_product_amount(
 }
 
 fn aggregate_surplus(
+    catalog: &Catalog,
     production_steps: &[ProductionStep],
     extraction_steps: &[ExtractionStep],
 ) -> Result<Vec<CommodityRate>, PlannerError> {
@@ -2257,6 +2492,22 @@ fn aggregate_surplus(
             let total = surplus.entry(product.commodity().clone()).or_default();
             *total += product.rate().get();
             checked_positive(*total, "aggregated resource surplus rate per second")?;
+        }
+        if let ProductionSource::Fluid(source_id) = step.source() {
+            let source = catalog
+                .fluid_source(source_id)
+                .expect("calculated fluid source IDs must remain present in the catalog");
+            if let Some(fuel_usage) =
+                fluid_source_fuel_rate(catalog, source, step.extraction_rate())?
+                && let Some(burnt_result) = fuel_usage.burnt_result()
+            {
+                let total = surplus.entry(burnt_result.commodity().clone()).or_default();
+                *total += burnt_result.rate().get();
+                checked_positive(
+                    *total,
+                    "aggregated fluid source burnt-result surplus rate per second",
+                )?;
+            }
         }
     }
     surplus
@@ -2307,34 +2558,26 @@ fn aggregate_electric_power(
 }
 
 fn aggregate_burner_fuel_demand(
+    catalog: &Catalog,
     production_steps: &[ProductionStep],
+    extraction_steps: &[ExtractionStep],
 ) -> Result<Vec<FuelUsage>, PlannerError> {
     let mut rates = BTreeMap::<FuelId, FuelUsageAccumulator>::new();
     for step in production_steps {
         if let StepEnergy::Burner(fuel_usage) = step.energy() {
-            let entry =
-                rates
-                    .entry(fuel_usage.fuel().clone())
-                    .or_insert_with(|| FuelUsageAccumulator {
-                        fuel: fuel_usage.fuel().clone(),
-                        fuel_item: fuel_usage.fuel_item().clone(),
-                        rate_per_second: 0.0,
-                        burnt_result: fuel_usage
-                            .burnt_result()
-                            .map(|rate| rate.commodity().clone()),
-                    });
-            debug_assert_eq!(entry.fuel_item, *fuel_usage.fuel_item());
-            debug_assert_eq!(
-                entry.burnt_result.as_ref(),
-                fuel_usage
-                    .burnt_result()
-                    .map(crate::planner::CommodityRate::commodity)
-            );
-            entry.rate_per_second += fuel_usage.rate_per_second().get();
-            checked_positive(
-                entry.rate_per_second,
-                "aggregated burner fuel rate per second",
-            )?;
+            add_fuel_usage(&mut rates, fuel_usage)?;
+        }
+    }
+    for step in extraction_steps {
+        if let ProductionSource::Fluid(source_id) = step.source() {
+            let source = catalog
+                .fluid_source(source_id)
+                .expect("calculated fluid source IDs must remain present in the catalog");
+            if let Some(fuel_usage) =
+                fluid_source_fuel_rate(catalog, source, step.extraction_rate())?
+            {
+                add_fuel_usage(&mut rates, &fuel_usage)?;
+            }
         }
     }
 
@@ -2344,7 +2587,37 @@ fn aggregate_burner_fuel_demand(
         .collect()
 }
 
+fn add_fuel_usage(
+    rates: &mut BTreeMap<FuelId, FuelUsageAccumulator>,
+    fuel_usage: &FuelUsage,
+) -> Result<(), PlannerError> {
+    let entry = rates
+        .entry(fuel_usage.fuel().clone())
+        .or_insert_with(|| FuelUsageAccumulator {
+            fuel: fuel_usage.fuel().clone(),
+            fuel_item: fuel_usage.fuel_item().clone(),
+            rate_per_second: 0.0,
+            burnt_result: fuel_usage
+                .burnt_result()
+                .map(|rate| rate.commodity().clone()),
+        });
+    debug_assert_eq!(entry.fuel_item, *fuel_usage.fuel_item());
+    debug_assert_eq!(
+        entry.burnt_result.as_ref(),
+        fuel_usage
+            .burnt_result()
+            .map(crate::planner::CommodityRate::commodity)
+    );
+    entry.rate_per_second += fuel_usage.rate_per_second().get();
+    checked_positive(
+        entry.rate_per_second,
+        "aggregated burner fuel rate per second",
+    )?;
+    Ok(())
+}
+
 fn aggregate_logistics_flows(
+    catalog: &Catalog,
     production_steps: &[ProductionStep],
     extraction_steps: &[ExtractionStep],
     external_inputs: &[CommodityRate],
@@ -2375,6 +2648,21 @@ fn aggregate_logistics_flows(
                 product,
                 "aggregated resource logistics flow rate per second",
             )?;
+        }
+        if let ProductionSource::Fluid(source_id) = step.source() {
+            let source = catalog
+                .fluid_source(source_id)
+                .expect("calculated fluid source IDs must remain present in the catalog");
+            if let Some(fuel_usage) =
+                fluid_source_fuel_rate(catalog, source, step.extraction_rate())?
+                && let Some(burnt_result) = fuel_usage.burnt_result()
+            {
+                add_rate(
+                    &mut flows,
+                    burnt_result,
+                    "aggregated fluid source burnt-result logistics flow rate per second",
+                )?;
+            }
         }
     }
     for external_input in external_inputs {

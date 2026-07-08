@@ -319,6 +319,7 @@ fn catalog_indexes_and_looks_up_records_deterministically() {
             BeltId::new("transport-belt").unwrap(),
             positive(15.0),
         )],
+        ..CatalogParts::default()
     })
     .unwrap();
 

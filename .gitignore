@@ -2,3 +2,4 @@
 
 # Actual data dump from factorio, gitignored for copyright safety
 /tests/fixtures/full_data_dump/
+raw_dump/

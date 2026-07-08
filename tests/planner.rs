@@ -1,8 +1,9 @@
 use factorio_planner_tui::catalog::{
-    Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, Fuel,
-    FuelCategory, FuelId, ItemId, Machine, MachineEnergySource, MachineId, Module, ModuleCategory,
-    ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId,
-    ResourceCategory, ResourceSource, ResourceSourceId, UnsupportedEnergySource,
+    Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, FluidSource,
+    FluidSourceId, FluidSourceKind, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine,
+    MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative,
+    Positive, Product, Recipe, RecipeCategory, RecipeId, ResourceCategory, ResourceSource,
+    ResourceSourceId, UnsupportedEnergySource,
 };
 use factorio_planner_tui::planner::{
     DependencyNodeKind, FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit,
@@ -44,6 +45,10 @@ fn belt_id(name: &str) -> BeltId {
 
 fn resource_id(name: &str) -> ResourceSourceId {
     ResourceSourceId::new(name).expect("test resource source ID should be valid")
+}
+
+fn fluid_source_id(name: &str) -> FluidSourceId {
+    FluidSourceId::new(name).expect("test fluid source ID should be valid")
 }
 
 fn positive(value: f64) -> Positive {
@@ -371,6 +376,61 @@ fn catalog_with_resources(
     .unwrap()
 }
 
+fn catalog_with_fluid_sources(
+    commodities: impl IntoIterator<Item = CommodityId>,
+    recipes: Vec<Recipe>,
+    machines: Vec<Machine>,
+    fuels: Vec<Fuel>,
+    fluid_sources: Vec<FluidSource>,
+) -> Catalog {
+    Catalog::try_from_parts(CatalogParts {
+        commodities: commodities
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        recipes,
+        machines,
+        fuels,
+        fluid_sources,
+        ..CatalogParts::default()
+    })
+    .unwrap()
+}
+
+fn offshore_pump_source(name: &str, product: CommodityId, rate: f64) -> FluidSource {
+    FluidSource::new(
+        fluid_source_id(name),
+        FluidSourceKind::OffshorePump,
+        vec![Product::new(product, positive(rate))],
+        vec![],
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+fn burner_boiler_source(
+    name: &str,
+    input: CommodityId,
+    output: CommodityId,
+    rate: f64,
+) -> FluidSource {
+    FluidSource::new(
+        fluid_source_id(name),
+        FluidSourceKind::BoilerSteam,
+        vec![Product::new(output, positive(rate))],
+        vec![Ingredient::new(input, positive(rate))],
+        Some(MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(1.0),
+        }),
+        Some(positive(1_800_000.0)),
+    )
+    .unwrap()
+}
+
 fn resource_source(
     name: &str,
     product: CommodityId,
@@ -453,7 +513,10 @@ fn extracts_resource_targets_without_unexplained_external_inputs() {
     assert_eq!(result.extraction_steps().len(), 1);
     let step = &result.extraction_steps()[0];
     assert_eq!(step.planning_product(), &ore);
-    assert_eq!(step.source(), &resource_id("iron-ore"));
+    assert_eq!(
+        step.source(),
+        &factorio_planner_tui::catalog::ProductionSource::Resource(resource_id("iron-ore"))
+    );
     assert_close(step.required_output_rate().get(), 6.0);
     assert_close(step.extraction_rate().get(), 3.0);
     assert_close(rate_for(step.products(), &ore), 6.0);
@@ -490,6 +553,86 @@ fn resource_required_fluids_expand_as_dependencies() {
     assert_eq!(acid_node.commodity(), &acid);
     assert_eq!(acid_node.kind(), DependencyNodeKind::ExternalInput);
     assert_close(acid_node.required_rate().get(), 20.0);
+}
+
+#[test]
+fn offshore_pump_water_targets_are_not_external_inputs() {
+    let water = fluid("water");
+    let catalog = catalog_with_fluid_sources(
+        [water.clone()],
+        vec![],
+        vec![],
+        vec![],
+        vec![offshore_pump_source(
+            "offshore-pump",
+            water.clone(),
+            1_200.0,
+        )],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(water.clone(), 60.0))).unwrap();
+
+    assert!(result.production_steps().is_empty());
+    assert!(result.external_inputs().is_empty());
+    assert_eq!(result.extraction_steps().len(), 1);
+    let step = &result.extraction_steps()[0];
+    assert_eq!(
+        step.source(),
+        &factorio_planner_tui::catalog::ProductionSource::Fluid(fluid_source_id("offshore-pump"))
+    );
+    assert_close(step.extraction_rate().get(), 0.05);
+    assert_close(rate_for(step.products(), &water), 60.0);
+}
+
+#[test]
+fn burner_boiler_steam_expands_water_and_fuel_dependencies() {
+    let water = fluid("water");
+    let steam = fluid("steam");
+    let coal = item("coal");
+    let fuel = Fuel::new(
+        fuel_id("coal"),
+        item_id("coal"),
+        FuelCategory::new("chemical").unwrap(),
+        positive(8_000_000.0),
+        None,
+    );
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: [water.clone(), steam.clone(), coal.clone()]
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        resource_sources: vec![resource_source("coal", coal.clone(), 1.0, None)],
+        fuels: vec![fuel],
+        fluid_sources: vec![
+            offshore_pump_source("offshore-pump", water.clone(), 1_200.0),
+            burner_boiler_source("boiler", water.clone(), steam.clone(), 60.0),
+        ],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(steam.clone(), 30.0))).unwrap();
+
+    assert!(result.external_inputs().is_empty());
+    assert_eq!(result.extraction_steps().len(), 3);
+    assert_close(rate_for(result.fluid_flows(), &steam), 30.0);
+    assert_close(rate_for(result.fluid_flows(), &water), 30.0);
+    assert_close(
+        result.burner_fuel_demand()[0].rate_per_second().get(),
+        0.1125,
+    );
+    let tree = &result.dependency_trees()[0];
+    assert_eq!(tree.commodity(), &steam);
+    assert!(
+        tree.children()
+            .iter()
+            .any(|child| child.commodity() == &water)
+    );
+    assert!(
+        tree.children()
+            .iter()
+            .any(|child| child.commodity() == &coal)
+    );
 }
 
 #[test]

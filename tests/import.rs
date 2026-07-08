@@ -1,9 +1,9 @@
 use std::io::Cursor;
 
 use factorio_planner_tui::catalog::{
-    BeltId, CommodityId, FluidId, FuelCategory, FuelId, ItemId, MachineEnergySource, MachineId,
-    ModuleCategory, ModuleEffect, ModuleId, Positive, ProductionSource, RecipeCategory, RecipeId,
-    ResourceSourceId, UnsupportedEnergySource,
+    BeltId, CommodityId, FluidId, FluidSourceId, FluidSourceKind, FuelCategory, FuelId, ItemId,
+    MachineEnergySource, MachineId, ModuleCategory, ModuleEffect, ModuleId, Positive,
+    ProductionSource, RecipeCategory, RecipeId, ResourceSourceId, UnsupportedEnergySource,
 };
 use factorio_planner_tui::import::{
     DiagnosticSeverity, ImportError, PrototypeDisposition, parse_data_raw,
@@ -1481,6 +1481,124 @@ fn imports_resource_sources_with_products_and_required_fluids() {
         .unwrap();
     assert!(oil.infinite());
     assert_eq!(oil.products()[0].commodity(), &fluid("crude-oil"));
+}
+
+#[test]
+fn imports_offshore_pumps_and_burner_boiler_fluid_sources() {
+    let report = import(
+        r#"{
+            "item": {
+                "coal": {
+                    "type": "item",
+                    "name": "coal",
+                    "fuel_category": "chemical",
+                    "fuel_value": "8MJ"
+                }
+            },
+            "fluid": {
+                "water": {
+                    "type": "fluid",
+                    "name": "water",
+                    "default_temperature": 15,
+                    "heat_capacity": "0.2kJ"
+                },
+                "steam": {
+                    "type": "fluid",
+                    "name": "steam",
+                    "default_temperature": 100,
+                    "heat_capacity": "0.2kJ"
+                }
+            },
+            "offshore-pump": {
+                "offshore-pump": {
+                    "type": "offshore-pump",
+                    "name": "offshore-pump",
+                    "fluid": "water",
+                    "pumping_speed": 20
+                }
+            },
+            "boiler": {
+                "boiler": {
+                    "type": "boiler",
+                    "name": "boiler",
+                    "energy_consumption": "1.8MW",
+                    "energy_source": {
+                        "type": "burner",
+                        "fuel_categories": ["chemical"],
+                        "effectivity": 1
+                    },
+                    "fluid_box": {"filter": "water"},
+                    "output_fluid_box": {"filter": "steam"},
+                    "target_temperature": 165
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let catalog = report.catalog();
+
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(
+        catalog.sources_for_product(&fluid("water")),
+        &[ProductionSource::Fluid(
+            FluidSourceId::new("offshore-pump").unwrap()
+        )]
+    );
+    let pump = catalog
+        .fluid_source(&FluidSourceId::new("offshore-pump").unwrap())
+        .unwrap();
+    assert_eq!(pump.kind(), FluidSourceKind::OffshorePump);
+    assert_close(pump.products()[0].amount().get(), 1_200.0);
+
+    let boiler = catalog
+        .fluid_source(&FluidSourceId::new("boiler").unwrap())
+        .unwrap();
+    assert_eq!(boiler.kind(), FluidSourceKind::BoilerSteam);
+    assert_eq!(boiler.ingredients()[0].commodity(), &fluid("water"));
+    assert_close(boiler.products()[0].amount().get(), 60.0);
+    assert!(matches!(
+        boiler.energy_source(),
+        Some(MachineEnergySource::Burner { .. })
+    ));
+}
+
+#[test]
+fn warns_and_skips_heat_boiler_fluid_sources() {
+    let report = import(
+        r#"{
+            "fluid": {
+                "water": {"type": "fluid", "name": "water", "default_temperature": 15, "heat_capacity": "0.2kJ"},
+                "steam": {"type": "fluid", "name": "steam", "heat_capacity": "0.2kJ"}
+            },
+            "boiler": {
+                "heat-exchanger": {
+                    "type": "boiler",
+                    "name": "heat-exchanger",
+                    "energy_consumption": "10MW",
+                    "energy_source": {"type": "heat"},
+                    "fluid_box": {"filter": "water"},
+                    "output_fluid_box": {"filter": "steam"},
+                    "target_temperature": 500
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    assert!(
+        report
+            .catalog()
+            .sources_for_product(&fluid("steam"))
+            .is_empty()
+    );
+    assert!(report.diagnostics().iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Warning
+            && diagnostic.prototype_type.as_deref() == Some("boiler")
+            && diagnostic.prototype_id.as_deref() == Some("heat-exchanger")
+            && diagnostic
+                .message
+                .contains("only burner boilers are modeled")
+    }));
 }
 
 #[test]

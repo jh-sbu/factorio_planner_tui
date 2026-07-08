@@ -11,10 +11,10 @@ use thiserror::Error;
 
 use crate::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, DatasetFingerprint, Finite,
-    FluidId, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource,
-    MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive, Product,
-    Recipe, RecipeCategory, RecipeId, ResourceCategory, ResourceSource, ResourceSourceId,
-    UnsupportedEnergySource,
+    FluidId, FluidProperties, FluidSource, FluidSourceId, FluidSourceKind, Fuel, FuelCategory,
+    FuelId, Ingredient, ItemId, Machine, MachineEnergySource, MachineId, Module, ModuleCategory,
+    ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId,
+    ResourceCategory, ResourceSource, ResourceSourceId, UnsupportedEnergySource,
 };
 use crate::import::{
     DiagnosticSeverity, ImportDiagnostic, ImportError, LocaleError, LocalePrototypeKind,
@@ -23,8 +23,8 @@ use crate::import::{
 use crate::planner::{FactoryPlan, RateUnit, Target};
 
 pub const PROFILE_INDEX_SCHEMA_VERSION: u32 = 1;
-pub const CATALOG_SCHEMA_VERSION: u32 = 3;
-pub const IMPORTER_SCHEMA_VERSION: u32 = 3;
+pub const CATALOG_SCHEMA_VERSION: u32 = 4;
+pub const IMPORTER_SCHEMA_VERSION: u32 = 4;
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
 pub const PLAN_FILE_SUFFIX: &str = ".fptplan.json";
 
@@ -1491,9 +1491,13 @@ struct CatalogFile {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CatalogDto {
     commodities: Vec<CommodityDto>,
+    #[serde(default)]
+    fluid_properties: Vec<FluidPropertiesDto>,
     recipes: Vec<RecipeDto>,
     #[serde(default)]
     resource_sources: Vec<ResourceSourceDto>,
+    #[serde(default)]
+    fluid_sources: Vec<FluidSourceDto>,
     machines: Vec<MachineDto>,
     modules: Vec<ModuleDto>,
     fuels: Vec<FuelDto>,
@@ -1504,11 +1508,16 @@ impl From<&Catalog> for CatalogDto {
     fn from(catalog: &Catalog) -> Self {
         Self {
             commodities: catalog.commodities().map(CommodityDto::from).collect(),
+            fluid_properties: catalog
+                .fluid_properties_iter()
+                .map(FluidPropertiesDto::from)
+                .collect(),
             recipes: catalog.recipes().map(RecipeDto::from).collect(),
             resource_sources: catalog
                 .resource_sources()
                 .map(ResourceSourceDto::from)
                 .collect(),
+            fluid_sources: catalog.fluid_sources().map(FluidSourceDto::from).collect(),
             machines: catalog.machines().map(MachineDto::from).collect(),
             modules: catalog.modules().map(ModuleDto::from).collect(),
             fuels: catalog.fuels().map(FuelDto::from).collect(),
@@ -1527,6 +1536,11 @@ impl TryFrom<CatalogDto> for Catalog {
                 .into_iter()
                 .map(CommodityDto::into_record)
                 .collect::<Result<Vec<_>, _>>()?,
+            fluid_properties: catalog
+                .fluid_properties
+                .into_iter()
+                .map(FluidPropertiesDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
             recipes: catalog
                 .recipes
                 .into_iter()
@@ -1536,6 +1550,11 @@ impl TryFrom<CatalogDto> for Catalog {
                 .resource_sources
                 .into_iter()
                 .map(ResourceSourceDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            fluid_sources: catalog
+                .fluid_sources
+                .into_iter()
+                .map(FluidSourceDto::into_record)
                 .collect::<Result<Vec<_>, _>>()?,
             machines: catalog
                 .machines
@@ -1900,6 +1919,33 @@ impl ProductDto {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct FluidPropertiesDto {
+    fluid: String,
+    default_temperature: f64,
+    heat_capacity_joules_per_unit: f64,
+}
+
+impl From<&FluidProperties> for FluidPropertiesDto {
+    fn from(properties: &FluidProperties) -> Self {
+        Self {
+            fluid: properties.fluid().as_str().to_owned(),
+            default_temperature: properties.default_temperature().get(),
+            heat_capacity_joules_per_unit: properties.heat_capacity_joules_per_unit().get(),
+        }
+    }
+}
+
+impl FluidPropertiesDto {
+    fn into_record(self) -> Result<FluidProperties, ProfileError> {
+        Ok(FluidProperties::new(
+            fluid_id(self.fluid)?,
+            non_negative(self.default_temperature)?,
+            positive(self.heat_capacity_joules_per_unit)?,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ResourceSourceDto {
     id: String,
     category: String,
@@ -1937,6 +1983,80 @@ impl ResourceSourceDto {
             self.required_fluid
                 .map(IngredientDto::into_record)
                 .transpose()?,
+        )
+        .map_err(|error| invalid_catalog(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FluidSourceKindDto {
+    OffshorePump,
+    BoilerSteam,
+}
+
+impl From<FluidSourceKind> for FluidSourceKindDto {
+    fn from(kind: FluidSourceKind) -> Self {
+        match kind {
+            FluidSourceKind::OffshorePump => Self::OffshorePump,
+            FluidSourceKind::BoilerSteam => Self::BoilerSteam,
+        }
+    }
+}
+
+impl From<FluidSourceKindDto> for FluidSourceKind {
+    fn from(kind: FluidSourceKindDto) -> Self {
+        match kind {
+            FluidSourceKindDto::OffshorePump => Self::OffshorePump,
+            FluidSourceKindDto::BoilerSteam => Self::BoilerSteam,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FluidSourceDto {
+    id: String,
+    kind: FluidSourceKindDto,
+    products: Vec<ProductDto>,
+    ingredients: Vec<IngredientDto>,
+    energy_source: Option<MachineEnergySourceDto>,
+    energy_usage: Option<f64>,
+}
+
+impl From<&FluidSource> for FluidSourceDto {
+    fn from(source: &FluidSource) -> Self {
+        Self {
+            id: source.id().as_str().to_owned(),
+            kind: source.kind().into(),
+            products: source.products().iter().map(ProductDto::from).collect(),
+            ingredients: source
+                .ingredients()
+                .iter()
+                .map(IngredientDto::from)
+                .collect(),
+            energy_source: source.energy_source().map(MachineEnergySourceDto::from),
+            energy_usage: source.energy_usage().map(Positive::get),
+        }
+    }
+}
+
+impl FluidSourceDto {
+    fn into_record(self) -> Result<FluidSource, ProfileError> {
+        FluidSource::new(
+            FluidSourceId::new(self.id).map_err(|error| invalid_catalog(error.to_string()))?,
+            self.kind.into(),
+            self.products
+                .into_iter()
+                .map(ProductDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            self.ingredients
+                .into_iter()
+                .map(IngredientDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            self.energy_source
+                .map(MachineEnergySourceDto::into_source)
+                .transpose()?,
+            self.energy_usage.map(positive).transpose()?,
         )
         .map_err(|error| invalid_catalog(error.to_string()))
     }
@@ -2580,6 +2700,10 @@ fn module_category(value: String) -> Result<ModuleCategory, ProfileError> {
 
 fn fuel_category(value: String) -> Result<FuelCategory, ProfileError> {
     FuelCategory::new(value).map_err(|error| invalid_catalog(error.to_string()))
+}
+
+fn fluid_id(value: String) -> Result<FluidId, ProfileError> {
+    FluidId::new(value).map_err(|error| invalid_catalog(error.to_string()))
 }
 
 fn positive(value: f64) -> Result<Positive, ProfileError> {

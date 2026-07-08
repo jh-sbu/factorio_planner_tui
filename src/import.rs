@@ -7,10 +7,11 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::catalog::{
-    Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, Fuel,
-    FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource, MachineId, Module,
-    ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory,
-    RecipeId, ResourceCategory, ResourceSource, ResourceSourceId, UnsupportedEnergySource,
+    Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, FluidProperties,
+    FluidSource, FluidSourceId, FluidSourceKind, Fuel, FuelCategory, FuelId, Ingredient, ItemId,
+    Machine, MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId,
+    NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId, ResourceCategory,
+    ResourceSource, ResourceSourceId, UnsupportedEnergySource,
 };
 
 const DEFAULT_RECIPE_CATEGORY: &str = "crafting";
@@ -136,6 +137,9 @@ struct RelevantCollections {
     module: Option<Value>,
     recipe: Option<Value>,
     resource: Option<Value>,
+    #[serde(rename = "offshore-pump")]
+    offshore_pump: Option<Value>,
+    boiler: Option<Value>,
     #[serde(rename = "assembling-machine")]
     assembling_machine: Option<Value>,
     furnace: Option<Value>,
@@ -398,14 +402,8 @@ fn parse_data_raw_inner(
         &mut diagnostics,
         locale,
     );
-    parse_commodity_collection(
-        "fluid",
-        raw.fluid,
-        CommodityKind::Fluid,
-        &mut commodities,
-        &mut diagnostics,
-        locale,
-    );
+    let fluid_properties =
+        parse_fluid_collection(raw.fluid, &mut commodities, &mut diagnostics, locale);
     let modules = parse_module_collection(
         raw.module,
         &mut commodities,
@@ -423,6 +421,18 @@ fn parse_data_raw_inner(
     let recipes = parse_recipe_collection(raw.recipe, &commodity_ids, &mut diagnostics, locale);
     let resource_sources =
         parse_resource_collection(raw.resource, &commodity_ids, &mut diagnostics);
+    let fluid_property_map = fluid_properties
+        .iter()
+        .map(|properties| (properties.fluid().clone(), properties.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut fluid_sources =
+        parse_offshore_pump_collection(raw.offshore_pump, &commodity_ids, &mut diagnostics);
+    fluid_sources.extend(parse_boiler_collection(
+        raw.boiler,
+        &commodity_ids,
+        &fluid_property_map,
+        &mut diagnostics,
+    ));
     let mut machines = parse_machine_collection(
         "assembling-machine",
         raw.assembling_machine,
@@ -443,8 +453,10 @@ fn parse_data_raw_inner(
 
     let catalog = Catalog::try_from_parts(CatalogParts {
         commodities,
+        fluid_properties,
         recipes,
         resource_sources,
+        fluid_sources,
         machines,
         modules,
         fuels,
@@ -1246,6 +1258,148 @@ fn parse_commodity_collection(
     }
 }
 
+fn parse_fluid_collection(
+    collection: Option<Value>,
+    commodities: &mut Vec<Commodity>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
+) -> Vec<FluidProperties> {
+    let Some(collection) = collection else {
+        return Vec::new();
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("fluid"),
+            None,
+            "/fluid".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return Vec::new();
+    };
+
+    let mut properties = Vec::new();
+    for (id, prototype) in prototypes {
+        let prototype_path = format!("/fluid/{}", pointer_segment(&id));
+        let Value::Object(fields) = prototype else {
+            diagnostics.push(error_diagnostic(
+                Some("fluid"),
+                Some(&id),
+                prototype_path,
+                "prototype must be a JSON object",
+            ));
+            continue;
+        };
+
+        let initial_errors = error_count(diagnostics);
+        validate_prototype_identity(&fields, "fluid", &id, &prototype_path, diagnostics);
+        let fluid_id = FluidId::new(id.clone()).map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    "fluid",
+                    &id,
+                    format!("{prototype_path}/name"),
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        );
+        let default_temperature = parse_optional_fluid_non_negative_number(
+            &fields,
+            "default_temperature",
+            25.0,
+            "fluid",
+            &id,
+            &prototype_path,
+            diagnostics,
+        );
+        let heat_capacity = parse_fluid_heat_capacity(&fields, &id, &prototype_path, diagnostics);
+
+        if error_count(diagnostics) == initial_errors
+            && let (Some(fluid_id), Some(default_temperature), Some(heat_capacity)) =
+                (fluid_id, default_temperature, heat_capacity)
+        {
+            commodities.push(Commodity::new(
+                CommodityId::Fluid(fluid_id.clone()),
+                locale_name(locale, LocalePrototypeKind::Fluid, &id),
+            ));
+            properties.push(FluidProperties::new(
+                fluid_id,
+                default_temperature,
+                heat_capacity,
+            ));
+        }
+    }
+    properties
+}
+
+fn parse_optional_fluid_non_negative_number(
+    fields: &Map<String, Value>,
+    field: &str,
+    default: f64,
+    prototype_type: &str,
+    prototype_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<NonNegative> {
+    let Some(value) = fields.get(field) else {
+        return Some(NonNegative::new(default).expect("default non-negative value is valid"));
+    };
+    let path = format!("{prototype_path}/{field}");
+    let Value::Number(number) = value else {
+        prototype_error(
+            diagnostics,
+            prototype_type,
+            prototype_id,
+            path,
+            format!("{field} must be a number"),
+        );
+        return None;
+    };
+    let value = number.as_f64().unwrap_or(f64::NAN);
+    NonNegative::new(value).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                prototype_type,
+                prototype_id,
+                path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_fluid_heat_capacity(
+    fields: &Map<String, Value>,
+    fluid_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Positive> {
+    let Some(value) = fields.get("heat_capacity") else {
+        return Positive::new(1_000.0).ok();
+    };
+    let path = format!("{prototype_path}/heat_capacity");
+    parse_energy_value(value, EnergyNormalization::Joules)
+        .and_then(|joules| Positive::new(joules).map_err(|error| error.to_string()))
+        .map_or_else(
+            |message| {
+                prototype_error(
+                    diagnostics,
+                    "fluid",
+                    fluid_id,
+                    path,
+                    format!("invalid heat_capacity: {message}"),
+                );
+                None
+            },
+            Some,
+        )
+}
+
 fn parse_item_like_collection(
     collection_name: &str,
     collection: Option<Value>,
@@ -1750,6 +1904,399 @@ fn parse_resource_required_fluid(
     } else {
         Some(Some(Ingredient::new(commodity?, amount?)))
     }
+}
+
+fn parse_offshore_pump_collection(
+    collection: Option<Value>,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<FluidSource> {
+    let Some(collection) = collection else {
+        return Vec::new();
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("offshore-pump"),
+            None,
+            "/offshore-pump".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return Vec::new();
+    };
+    prototypes
+        .into_iter()
+        .filter_map(|(id, prototype)| parse_offshore_pump(&id, prototype, commodities, diagnostics))
+        .collect()
+}
+
+fn parse_offshore_pump(
+    id: &str,
+    prototype: Value,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<FluidSource> {
+    let prototype_path = format!("/offshore-pump/{}", pointer_segment(id));
+    let Value::Object(fields) = prototype else {
+        diagnostics.push(error_diagnostic(
+            Some("offshore-pump"),
+            Some(id),
+            prototype_path,
+            "prototype must be a JSON object",
+        ));
+        return None;
+    };
+    let initial_errors = error_count(diagnostics);
+    validate_prototype_identity(&fields, "offshore-pump", id, &prototype_path, diagnostics);
+    let source_id = FluidSourceId::new(id).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "offshore-pump",
+                id,
+                format!("{prototype_path}/name"),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    );
+    let fluid = parse_filtered_fluid(
+        &fields,
+        "fluid",
+        "offshore-pump",
+        id,
+        &prototype_path,
+        commodities,
+        diagnostics,
+    );
+    let pumping_speed = parse_positive_number_field(
+        &fields,
+        "pumping_speed",
+        "offshore-pump",
+        id,
+        &prototype_path,
+        diagnostics,
+    );
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+    let product_amount = Positive::new(pumping_speed?.get() * TICKS_PER_SECOND)
+        .expect("positive pumping speed has positive per-second output");
+    FluidSource::new(
+        source_id?,
+        FluidSourceKind::OffshorePump,
+        vec![Product::new(fluid?, product_amount)],
+        Vec::new(),
+        None,
+        None,
+    )
+    .map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "offshore-pump",
+                id,
+                prototype_path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_boiler_collection(
+    collection: Option<Value>,
+    commodities: &BTreeSet<CommodityId>,
+    fluid_properties: &BTreeMap<FluidId, FluidProperties>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<FluidSource> {
+    let Some(collection) = collection else {
+        return Vec::new();
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("boiler"),
+            None,
+            "/boiler".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return Vec::new();
+    };
+    prototypes
+        .into_iter()
+        .filter_map(|(id, prototype)| {
+            parse_boiler(&id, prototype, commodities, fluid_properties, diagnostics)
+        })
+        .collect()
+}
+
+fn parse_boiler(
+    id: &str,
+    prototype: Value,
+    commodities: &BTreeSet<CommodityId>,
+    fluid_properties: &BTreeMap<FluidId, FluidProperties>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<FluidSource> {
+    let prototype_path = format!("/boiler/{}", pointer_segment(id));
+    let Value::Object(fields) = prototype else {
+        diagnostics.push(error_diagnostic(
+            Some("boiler"),
+            Some(id),
+            prototype_path,
+            "prototype must be a JSON object",
+        ));
+        return None;
+    };
+    let initial_errors = error_count(diagnostics);
+    validate_prototype_identity(&fields, "boiler", id, &prototype_path, diagnostics);
+    let source_id = FluidSourceId::new(id).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "boiler",
+                id,
+                format!("{prototype_path}/name"),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    );
+    let input_fluid = parse_fluid_box_filter(
+        &fields,
+        "fluid_box",
+        "boiler",
+        id,
+        &prototype_path,
+        commodities,
+        diagnostics,
+    );
+    let output_fluid = parse_fluid_box_filter(
+        &fields,
+        "output_fluid_box",
+        "boiler",
+        id,
+        &prototype_path,
+        commodities,
+        diagnostics,
+    );
+    let target_temperature = parse_positive_number_field(
+        &fields,
+        "target_temperature",
+        "boiler",
+        id,
+        &prototype_path,
+        diagnostics,
+    );
+    let energy_usage = parse_boiler_energy_consumption(&fields, id, &prototype_path, diagnostics);
+    let energy_source = parse_machine_energy_source(
+        &fields,
+        energy_usage,
+        "boiler",
+        id,
+        &prototype_path,
+        diagnostics,
+    );
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+    let energy_source = energy_source?;
+    if !matches!(energy_source, MachineEnergySource::Burner { .. }) {
+        diagnostics.push(warning_diagnostic(
+            "boiler",
+            id,
+            format!("{prototype_path}/energy_source/type"),
+            "boiler steam source is unsupported because only burner boilers are modeled",
+        ));
+        return None;
+    }
+    let input_fluid = input_fluid?;
+    let output_fluid = output_fluid?;
+    let CommodityId::Fluid(input_fluid_id) = input_fluid.clone() else {
+        unreachable!("parse_fluid_box_filter only returns fluids")
+    };
+    let properties = fluid_properties.get(&input_fluid_id).expect(
+        "fluid properties are parsed for every imported fluid commodity before boiler sources",
+    );
+    let delta_temperature = target_temperature?.get() - properties.default_temperature().get();
+    let Ok(delta_temperature) = Positive::new(delta_temperature) else {
+        prototype_error(
+            diagnostics,
+            "boiler",
+            id,
+            format!("{prototype_path}/target_temperature"),
+            "target_temperature must be greater than the input fluid default_temperature",
+        );
+        return None;
+    };
+    let energy_per_unit =
+        properties.heat_capacity_joules_per_unit().get() * delta_temperature.get();
+    let output_rate = Positive::new(energy_usage?.get() / energy_per_unit)
+        .expect("positive energy and temperature delta have positive output rate");
+    FluidSource::new(
+        source_id?,
+        FluidSourceKind::BoilerSteam,
+        vec![Product::new(output_fluid, output_rate)],
+        vec![Ingredient::new(input_fluid, output_rate)],
+        Some(energy_source),
+        Some(energy_usage?),
+    )
+    .map_or_else(
+        |error| {
+            prototype_error(diagnostics, "boiler", id, prototype_path, error.to_string());
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_boiler_energy_consumption(
+    fields: &Map<String, Value>,
+    boiler_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Positive> {
+    let path = format!("{prototype_path}/energy_consumption");
+    let Some(value) = fields.get("energy_consumption") else {
+        prototype_error(
+            diagnostics,
+            "boiler",
+            boiler_id,
+            path,
+            "missing required energy_consumption",
+        );
+        return None;
+    };
+    parse_energy_value(value, EnergyNormalization::Watts)
+        .and_then(|watts| Positive::new(watts).map_err(|error| error.to_string()))
+        .map_or_else(
+            |message| {
+                prototype_error(
+                    diagnostics,
+                    "boiler",
+                    boiler_id,
+                    path,
+                    format!("invalid energy_consumption: {message}"),
+                );
+                None
+            },
+            Some,
+        )
+}
+
+fn parse_fluid_box_filter(
+    fields: &Map<String, Value>,
+    field: &str,
+    prototype_type: &str,
+    prototype_id: &str,
+    prototype_path: &str,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<CommodityId> {
+    let path = format!("{prototype_path}/{field}");
+    let Some(Value::Object(fluid_box)) = fields.get(field) else {
+        prototype_error(
+            diagnostics,
+            prototype_type,
+            prototype_id,
+            path,
+            format!("missing required {field} object"),
+        );
+        return None;
+    };
+    parse_filtered_fluid(
+        fluid_box,
+        "filter",
+        prototype_type,
+        prototype_id,
+        &path,
+        commodities,
+        diagnostics,
+    )
+}
+
+fn parse_filtered_fluid(
+    fields: &Map<String, Value>,
+    field: &str,
+    prototype_type: &str,
+    prototype_id: &str,
+    prototype_path: &str,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<CommodityId> {
+    let path = format!("{prototype_path}/{field}");
+    let Some(Value::String(fluid)) = fields.get(field) else {
+        prototype_error(
+            diagnostics,
+            prototype_type,
+            prototype_id,
+            path,
+            format!("missing required {field} fluid"),
+        );
+        return None;
+    };
+    let commodity = FluidId::new(fluid.clone())
+        .map(CommodityId::Fluid)
+        .map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    prototype_type,
+                    prototype_id,
+                    path.clone(),
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        )?;
+    if !commodities.contains(&commodity) {
+        prototype_error(
+            diagnostics,
+            prototype_type,
+            prototype_id,
+            path,
+            format!("references missing fluid {fluid:?}"),
+        );
+        return None;
+    }
+    Some(commodity)
+}
+
+fn parse_positive_number_field(
+    fields: &Map<String, Value>,
+    field: &str,
+    prototype_type: &str,
+    prototype_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<Positive> {
+    let path = format!("{prototype_path}/{field}");
+    let Some(Value::Number(number)) = fields.get(field) else {
+        prototype_error(
+            diagnostics,
+            prototype_type,
+            prototype_id,
+            path,
+            format!("missing required {field} number"),
+        );
+        return None;
+    };
+    let value = number.as_f64().unwrap_or(f64::NAN);
+    Positive::new(value).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                prototype_type,
+                prototype_id,
+                path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
 }
 
 fn is_parameter_recipe(prototype: &Value) -> bool {

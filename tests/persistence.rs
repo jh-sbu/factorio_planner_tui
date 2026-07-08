@@ -1,6 +1,6 @@
 use std::fs;
 
-use factorio_planner_tui::catalog::{CommodityId, ItemId};
+use factorio_planner_tui::catalog::{CommodityId, FluidId, FluidSourceId, ItemId};
 use factorio_planner_tui::import::{DiagnosticSeverity, LocalePrototypeKind};
 use factorio_planner_tui::persistence::{
     CATALOG_SCHEMA_VERSION, ProfileError, ProfileImportRequest, ProfileName, ProfileStore,
@@ -35,6 +35,40 @@ fn minimal_data(result_name: &str) -> String {
             }}
         }}"#
     )
+}
+
+fn fluid_source_data() -> &'static str {
+    r#"{
+        "item": {
+            "coal": {
+                "type": "item",
+                "name": "coal",
+                "fuel_category": "chemical",
+                "fuel_value": "8MJ"
+            }
+        },
+        "fluid": {
+            "water": {
+                "type": "fluid",
+                "name": "water",
+                "default_temperature": 15,
+                "heat_capacity": "0.2kJ"
+            },
+            "steam": {
+                "type": "fluid",
+                "name": "steam",
+                "heat_capacity": "0.2kJ"
+            }
+        },
+        "offshore-pump": {
+            "offshore-pump": {
+                "type": "offshore-pump",
+                "name": "offshore-pump",
+                "fluid": "water",
+                "pumping_speed": 20
+            }
+        }
+    }"#
 }
 
 #[test]
@@ -126,6 +160,35 @@ fn creates_lists_selects_replaces_deletes_and_reopens_profiles() {
         Err(ProfileError::ProfileNotFound { .. })
     ));
     assert_eq!(store.list().unwrap().len(), 1);
+}
+
+#[test]
+fn profile_round_trip_preserves_fluid_sources() {
+    let directory = TempDir::new().unwrap();
+    let source_directory = TempDir::new().unwrap();
+    let store = ProfileStore::new(directory.path());
+    let data = write_data(&source_directory, "fluids.json", fluid_source_data());
+
+    let created = store
+        .create(&ProfileImportRequest::new(profile_name("fluids"), &data))
+        .unwrap();
+    let reopened = ProfileStore::new(directory.path())
+        .open(&profile_name("fluids"))
+        .unwrap();
+
+    assert_eq!(reopened.catalog(), created.catalog());
+    assert!(
+        reopened
+            .catalog()
+            .fluid_properties(&FluidId::new("water").unwrap())
+            .is_some()
+    );
+    assert!(
+        reopened
+            .catalog()
+            .fluid_source(&FluidSourceId::new("offshore-pump").unwrap())
+            .is_some()
+    );
 }
 
 #[test]

@@ -25,7 +25,8 @@ use crate::app::{
     SelectionKind, TextPromptKind, WorkspaceView,
 };
 use crate::catalog::{
-    BeltId, Catalog, CommodityId, FuelId, MachineId, ModuleId, Positive, RecipeId,
+    BeltId, Catalog, CommodityId, FluidSourceKind, FuelId, MachineId, ModuleId, Positive,
+    ProductionSource, RecipeId,
 };
 use crate::import::DiagnosticSeverity;
 use crate::persistence::{PlanFileStore, ProfileStore};
@@ -886,6 +887,30 @@ fn aggregated_table_lines(app: &App) -> Vec<Line<'static>> {
             step_energy_summary(step.energy()),
         )));
     }
+    let production_count = calculation.production_steps().len();
+    for (offset, step) in calculation.extraction_steps().iter().enumerate() {
+        let index = production_count + offset;
+        let marker = if index == app.selected_result_index() {
+            ">"
+        } else {
+            " "
+        };
+        let belt = calculation
+            .belt_equivalents()
+            .iter()
+            .find(|equivalent| equivalent.commodity() == step.planning_product())
+            .map_or_else(
+                || "-".to_owned(),
+                |equivalent| format!("{} belts", format_quantity(equivalent.exact_belts().get())),
+            );
+        lines.push(Line::from(format!(
+            "{marker} {} | {} | {} | - | {} | - | {belt}",
+            commodity_label(catalog, step.planning_product()),
+            format_rate(step.required_output_rate(), unit),
+            source_label(catalog, step.source()),
+            format_quantity(step.extraction_rate().get()),
+        )));
+    }
     lines
 }
 
@@ -1298,6 +1323,22 @@ fn belt_label(catalog: Option<&Catalog>, id: &BeltId) -> String {
         || id.to_string(),
         |belt| label_with_id(id.as_str(), belt.localized_name()),
     )
+}
+
+fn source_label(catalog: Option<&Catalog>, source: &ProductionSource) -> String {
+    match source {
+        ProductionSource::Recipe(recipe) => recipe_label(catalog, recipe),
+        ProductionSource::Resource(resource) => format!("resource: {resource}"),
+        ProductionSource::Fluid(source_id) => catalog
+            .and_then(|catalog| catalog.fluid_source(source_id))
+            .map_or_else(
+                || format!("fluid source: {source_id}"),
+                |source| match source.kind() {
+                    FluidSourceKind::OffshorePump => "offshore pump".to_owned(),
+                    FluidSourceKind::BoilerSteam => "boiler steam".to_owned(),
+                },
+            ),
+    }
 }
 
 fn module_list_label(catalog: Option<&Catalog>, modules: &[ModuleId]) -> String {

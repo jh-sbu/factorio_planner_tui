@@ -6,7 +6,7 @@ use factorio_planner_tui::app::{
     Action, App, ExitState, FocusTarget, MoveDirection, Overlay, OverlayKind, Screen,
     TextPromptKind, WorkspaceView,
 };
-use factorio_planner_tui::catalog::{CommodityId, ItemId, MachineId, RecipeId};
+use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, MachineId, RecipeId};
 use factorio_planner_tui::cli::StartupMode;
 use factorio_planner_tui::persistence::{
     PlanDocument, PlanFileStore, PlanName, ProfileImportRequest, ProfileName, ProfileStore,
@@ -47,6 +47,10 @@ fn plan_name(name: &str) -> PlanName {
 
 fn item(name: &str) -> CommodityId {
     CommodityId::Item(ItemId::new(name).expect("test item ID should be valid"))
+}
+
+fn fluid(name: &str) -> CommodityId {
+    CommodityId::Fluid(FluidId::new(name).expect("test fluid ID should be valid"))
 }
 
 fn recipe_id(name: &str) -> RecipeId {
@@ -260,6 +264,27 @@ fn workspace_data() -> &'static str {
                 "type": "transport-belt",
                 "name": "transport-belt",
                 "speed": 0.03125
+            }
+        }
+    }"#
+}
+
+fn water_source_data() -> &'static str {
+    r#"{
+        "fluid": {
+            "water": {
+                "type": "fluid",
+                "name": "water",
+                "default_temperature": 15,
+                "heat_capacity": "0.2kJ"
+            }
+        },
+        "offshore-pump": {
+            "offshore-pump": {
+                "type": "offshore-pump",
+                "name": "offshore-pump",
+                "fluid": "water",
+                "pumping_speed": 20
             }
         }
     }"#
@@ -745,6 +770,35 @@ fn renders_planning_workspace_table_and_selected_step_details() {
     assert!(screen.contains("External Inputs"));
     assert!(screen.contains("iron-ore"));
     assert!(screen.contains("Belt"));
+}
+
+#[test]
+fn renders_non_recipe_source_rows_in_the_aggregated_table() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "water.json", water_source_data());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("water.fptplan.json");
+    let plan = FactoryPlan::new(target(fluid("water"), 60.0));
+    let mut document = PlanDocument::new(
+        plan_name("Water"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        plan,
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let app = App::start(
+        StartupMode::OpenPlan { path },
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 120, 24);
+
+    assert!(screen.contains("water"));
+    assert!(screen.contains("offshore pump"));
+    assert!(!screen.contains("Required External Inputs  water"));
 }
 
 #[test]
