@@ -1498,6 +1498,36 @@ impl<'a> SourceResolver<'a> {
             return Ok(Some(ProductionSource::Recipe(recipe.id().clone())));
         }
 
+        let fluid_source =
+            self.catalog
+                .sources_for_product(commodity)
+                .iter()
+                .find_map(|source| match source {
+                    ProductionSource::Fluid(source_id) => {
+                        Some(ProductionSource::Fluid(source_id.clone()))
+                    }
+                    ProductionSource::Recipe(_) => None,
+                    ProductionSource::Resource(_) => None,
+                });
+        if fluid_source.is_some() {
+            return Ok(fluid_source);
+        }
+
+        let resource_source =
+            self.catalog
+                .sources_for_product(commodity)
+                .iter()
+                .find_map(|source| match source {
+                    ProductionSource::Recipe(_) => None,
+                    ProductionSource::Resource(resource_id) => {
+                        Some(ProductionSource::Resource(resource_id.clone()))
+                    }
+                    ProductionSource::Fluid(_) => None,
+                });
+        if resource_source.is_some() {
+            return Ok(resource_source);
+        }
+
         if let Some(recipe) = self
             .catalog
             .sources_for_product(commodity)
@@ -1516,31 +1546,7 @@ impl<'a> SourceResolver<'a> {
             return Ok(Some(ProductionSource::Recipe(recipe.id().clone())));
         }
 
-        let resource_source =
-            self.catalog
-                .sources_for_product(commodity)
-                .iter()
-                .find_map(|source| match source {
-                    ProductionSource::Recipe(_) => None,
-                    ProductionSource::Resource(resource_id) => {
-                        Some(ProductionSource::Resource(resource_id.clone()))
-                    }
-                    ProductionSource::Fluid(_) => None,
-                });
-        if resource_source.is_some() {
-            return Ok(resource_source);
-        }
-
-        Ok(self
-            .catalog
-            .sources_for_product(commodity)
-            .iter()
-            .find_map(|source| match source {
-                ProductionSource::Fluid(source_id) => {
-                    Some(ProductionSource::Fluid(source_id.clone()))
-                }
-                ProductionSource::Recipe(_) | ProductionSource::Resource(_) => None,
-            }))
+        Ok(None)
     }
 }
 

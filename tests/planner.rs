@@ -556,6 +556,46 @@ fn resource_required_fluids_expand_as_dependencies() {
 }
 
 #[test]
+fn resource_sources_take_priority_over_recipes_for_default_source_selection() {
+    let crude_oil = fluid("crude-oil");
+    let crude_oil_barrel = item("crude-oil-barrel");
+    let crafting = RecipeCategory::new("crafting-with-fluid").unwrap();
+    let catalog = catalog_with_resources(
+        [crude_oil.clone(), crude_oil_barrel.clone()],
+        vec![
+            recipe(
+                "empty-crude-oil-barrel",
+                &crafting,
+                1.0,
+                vec![(crude_oil_barrel.clone(), 1.0)],
+                crude_oil.clone(),
+                50.0,
+            ),
+            recipe(
+                "fill-crude-oil-barrel",
+                &crafting,
+                1.0,
+                vec![(crude_oil.clone(), 50.0)],
+                crude_oil_barrel,
+                1.0,
+            ),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+        vec![resource_source("crude-oil", crude_oil.clone(), 10.0, None)],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(crude_oil.clone(), 60.0))).unwrap();
+
+    assert!(result.production_steps().is_empty());
+    assert!(result.external_inputs().is_empty());
+    assert_eq!(result.extraction_steps().len(), 1);
+    assert_eq!(
+        result.extraction_steps()[0].source(),
+        &factorio_planner_tui::catalog::ProductionSource::Resource(resource_id("crude-oil"))
+    );
+}
+
+#[test]
 fn offshore_pump_water_targets_are_not_external_inputs() {
     let water = fluid("water");
     let catalog = catalog_with_fluid_sources(
@@ -582,6 +622,51 @@ fn offshore_pump_water_targets_are_not_external_inputs() {
     );
     assert_close(step.extraction_rate().get(), 0.05);
     assert_close(rate_for(step.products(), &water), 60.0);
+}
+
+#[test]
+fn fluid_sources_take_priority_over_recipes_for_default_source_selection() {
+    let water = fluid("water");
+    let water_barrel = item("water-barrel");
+    let crafting = RecipeCategory::new("crafting-with-fluid").unwrap();
+    let catalog = catalog_with_fluid_sources(
+        [water.clone(), water_barrel.clone()],
+        vec![
+            recipe(
+                "empty-water-barrel",
+                &crafting,
+                1.0,
+                vec![(water_barrel.clone(), 1.0)],
+                water.clone(),
+                50.0,
+            ),
+            recipe(
+                "fill-water-barrel",
+                &crafting,
+                1.0,
+                vec![(water.clone(), 50.0)],
+                water_barrel,
+                1.0,
+            ),
+        ],
+        vec![machine("assembler", [crafting], 1.0)],
+        vec![],
+        vec![offshore_pump_source(
+            "offshore-pump",
+            water.clone(),
+            1_200.0,
+        )],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(water.clone(), 60.0))).unwrap();
+
+    assert!(result.production_steps().is_empty());
+    assert!(result.external_inputs().is_empty());
+    assert_eq!(result.extraction_steps().len(), 1);
+    assert_eq!(
+        result.extraction_steps()[0].source(),
+        &factorio_planner_tui::catalog::ProductionSource::Fluid(fluid_source_id("offshore-pump"))
+    );
 }
 
 #[test]
