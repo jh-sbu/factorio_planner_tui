@@ -1513,8 +1513,10 @@ fn imports_offshore_pumps_and_burner_boiler_fluid_sources() {
                 "offshore-pump": {
                     "type": "offshore-pump",
                     "name": "offshore-pump",
-                    "fluid": "water",
-                    "pumping_speed": 20
+                    "pumping_speed": 20,
+                    "fluid_box": {
+                        "production_type": "output"
+                    }
                 }
             },
             "boiler": {

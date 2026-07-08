@@ -1960,15 +1960,7 @@ fn parse_offshore_pump(
         },
         Some,
     );
-    let fluid = parse_filtered_fluid(
-        &fields,
-        "fluid",
-        "offshore-pump",
-        id,
-        &prototype_path,
-        commodities,
-        diagnostics,
-    );
+    let fluid = parse_offshore_pump_fluid(&fields, id, &prototype_path, commodities, diagnostics);
     let pumping_speed = parse_positive_number_field(
         &fields,
         "pumping_speed",
@@ -2003,6 +1995,53 @@ fn parse_offshore_pump(
         },
         Some,
     )
+}
+
+fn parse_offshore_pump_fluid(
+    fields: &Map<String, Value>,
+    pump_id: &str,
+    prototype_path: &str,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<CommodityId> {
+    if matches!(fields.get("fluid"), Some(Value::String(_))) {
+        return parse_filtered_fluid(
+            fields,
+            "fluid",
+            "offshore-pump",
+            pump_id,
+            prototype_path,
+            commodities,
+            diagnostics,
+        );
+    }
+    if let Some(Value::Object(fluid_box)) = fields.get("fluid_box")
+        && matches!(fluid_box.get("filter"), Some(Value::String(_)))
+    {
+        return parse_filtered_fluid(
+            fluid_box,
+            "filter",
+            "offshore-pump",
+            pump_id,
+            &format!("{prototype_path}/fluid_box"),
+            commodities,
+            diagnostics,
+        );
+    }
+
+    let water = CommodityId::Fluid(FluidId::new("water").expect("water is a valid fluid ID"));
+    if commodities.contains(&water) {
+        return Some(water);
+    }
+
+    prototype_error(
+        diagnostics,
+        "offshore-pump",
+        pump_id,
+        format!("{prototype_path}/fluid"),
+        "missing required fluid, fluid_box.filter, or water fluid commodity",
+    );
+    None
 }
 
 fn parse_boiler_collection(
