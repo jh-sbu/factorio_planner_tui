@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use factorio_planner_tui::app::{
     Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, WorkspaceView,
 };
-use factorio_planner_tui::catalog::{CommodityId, ItemId, MachineId, RecipeId};
+use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, MachineId, RecipeId};
 use factorio_planner_tui::cli::{StartupInputError, StartupMode, StartupRequest};
 use factorio_planner_tui::persistence::{
     PlanDocument, PlanFileStore, PlanName, ProfileImportRequest, ProfileName, ProfileStore,
@@ -22,6 +22,10 @@ fn plan_name(name: &str) -> PlanName {
 
 fn item(name: &str) -> CommodityId {
     CommodityId::Item(ItemId::new(name).expect("test item ID should be valid"))
+}
+
+fn fluid(name: &str) -> CommodityId {
+    CommodityId::Fluid(FluidId::new(name).expect("test fluid ID should be valid"))
 }
 
 fn recipe_id(name: &str) -> RecipeId {
@@ -110,6 +114,27 @@ fn cyclic_data() -> &'static str {
                 "crafting_speed": 1,
                 "energy_usage": "90kW",
                 "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        }
+    }"#
+}
+
+fn water_source_data() -> &'static str {
+    r#"{
+        "fluid": {
+            "water": {
+                "type": "fluid",
+                "name": "water",
+                "default_temperature": 15,
+                "heat_capacity": "0.2kJ"
+            }
+        },
+        "offshore-pump": {
+            "offshore-pump": {
+                "type": "offshore-pump",
+                "name": "offshore-pump",
+                "fluid": "water",
+                "pumping_speed": 20
             }
         }
     }"#
@@ -697,6 +722,44 @@ fn cycle_error_members_remain_selectable_for_recipe_changes() {
         Some(&Overlay::Selection(SelectionKind::Recipe {
             commodity: item("b")
         }))
+    );
+}
+
+#[test]
+fn non_recipe_results_are_selectable_without_recipe_choices() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "water.json", water_source_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("water.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Water"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(fluid("water"), 60.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::MoveFocus(factorio_planner_tui::app::FocusTarget::Results),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::OpenRecipeSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert_eq!(app.selected_result_index(), 0);
+    assert!(app.overlay().is_none());
+    assert_eq!(
+        app.status_message(),
+        Some("No recipe choices available for water")
     );
 }
 

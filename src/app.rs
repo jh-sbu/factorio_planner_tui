@@ -906,10 +906,15 @@ impl App {
     }
 
     fn open_recipe_selection_for_selected(&mut self) {
-        if let Some(commodity) = self.current_workspace_commodity() {
+        let Some(commodity) = self.current_workspace_commodity() else {
+            return;
+        };
+        if self.has_supported_recipe_choices(&commodity) {
             self.selector_index = 0;
             self.selection_query.clear();
             self.overlay = Some(Overlay::Selection(SelectionKind::Recipe { commodity }));
+        } else {
+            self.status_message = Some(format!("No recipe choices available for {commodity}"));
         }
     }
 
@@ -948,12 +953,18 @@ impl App {
                 .calculation
                 .as_ref()
                 .and_then(|calculation| {
+                    let production_len = calculation.production_steps().len();
                     calculation
                         .production_steps()
                         .get(self.selected_result_index)
-                        .or_else(|| calculation.production_steps().first())
+                        .map(|step| step.planning_product().clone())
+                        .or_else(|| {
+                            self.selected_result_index
+                                .checked_sub(production_len)
+                                .and_then(|index| calculation.extraction_steps().get(index))
+                                .map(|step| step.planning_product().clone())
+                        })
                 })
-                .map(|step| step.planning_product().clone())
                 .or_else(|| {
                     self.cycle_error_commodities()
                         .get(self.selected_result_index)
@@ -970,7 +981,6 @@ impl App {
                 calculation
                     .production_steps()
                     .get(self.selected_result_index)
-                    .or_else(|| calculation.production_steps().first())
             })
             .map(|step| step.recipe().clone())
     }
@@ -978,8 +988,24 @@ impl App {
     fn workspace_result_len(&self) -> usize {
         self.calculation.as_ref().map_or_else(
             || self.cycle_error_commodities().len(),
-            |calculation| calculation.production_steps().len(),
+            |calculation| {
+                calculation.production_steps().len() + calculation.extraction_steps().len()
+            },
         )
+    }
+
+    fn has_supported_recipe_choices(&self, commodity: &CommodityId) -> bool {
+        self.active_profile.as_ref().is_some_and(|profile| {
+            let catalog = profile.catalog();
+            catalog
+                .recipes_for_product(commodity)
+                .iter()
+                .any(|recipe_id| {
+                    catalog
+                        .recipe(recipe_id)
+                        .is_some_and(crate::catalog::Recipe::supported)
+                })
+        })
     }
 
     fn selection_option_count(&self) -> usize {

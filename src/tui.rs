@@ -860,7 +860,7 @@ fn aggregated_table_lines(app: &App) -> Vec<Line<'static>> {
     let unit = calculation.display_rate_unit();
     let mut lines = vec![Line::from("Aggregated Table")];
     lines.push(Line::from(
-        "Product | Rate | Recipe | Machine | Machines | Energy | Belt",
+        "Product | Rate | Source | Machine | Machines | Energy | Belt",
     ));
     for (index, step) in calculation.production_steps().iter().enumerate() {
         let marker = if index == app.selected_result_index() {
@@ -989,14 +989,79 @@ fn selected_step_detail_lines(app: &App) -> Vec<Line<'static>> {
         }
         return vec![Line::from("No selected step")];
     };
-    let Some(step) = calculation
+    if let Some(step) = calculation
         .production_steps()
         .get(app.selected_result_index())
-        .or_else(|| calculation.production_steps().first())
-    else {
-        return vec![Line::from("No production steps")];
-    };
+    {
+        let mut lines = vec![
+            Line::from("Selected Step"),
+            Line::from(format!(
+                "Product: {}",
+                commodity_label(catalog, step.planning_product())
+            )),
+            Line::from(format!(
+                "Required: {}",
+                format_rate(step.required_output_rate(), calculation.display_rate_unit())
+            )),
+            Line::from(format!("Recipe: {}", recipe_label(catalog, step.recipe()))),
+            Line::from(format!(
+                "Machine: {}",
+                machine_label(catalog, step.machine())
+            )),
+            Line::from(format!(
+                "Machines: {} fractional / {} installed",
+                format_quantity(step.fractional_machine_count().get()),
+                step.installed_machine_count()
+            )),
+            Line::from(format!(
+                "Modules: {}",
+                module_list_label(catalog, step.modules())
+            )),
+            Line::from(format!("Energy: {}", step_energy_summary(step.energy()))),
+            Line::from(""),
+            Line::from("Ingredients"),
+        ];
+        push_rate_lines(
+            catalog,
+            step.ingredients(),
+            calculation.display_rate_unit(),
+            &mut lines,
+        );
+        lines.push(Line::from(""));
+        lines.push(Line::from("Products"));
+        push_rate_lines(
+            catalog,
+            step.products(),
+            calculation.display_rate_unit(),
+            &mut lines,
+        );
 
+        let belt = calculation
+            .belt_equivalents()
+            .iter()
+            .find(|equivalent| equivalent.commodity() == step.planning_product())
+            .map_or_else(
+                || "Belt: none".to_owned(),
+                |equivalent| {
+                    format!(
+                        "Belt: {} exact / {} installed",
+                        format_quantity(equivalent.exact_belts().get()),
+                        equivalent.installed_belts()
+                    )
+                },
+            );
+        lines.push(Line::from(""));
+        lines.push(Line::from(belt));
+        return lines;
+    }
+
+    let extraction_index = app
+        .selected_result_index()
+        .checked_sub(calculation.production_steps().len());
+    let Some(step) = extraction_index.and_then(|index| calculation.extraction_steps().get(index))
+    else {
+        return vec![Line::from("No selected step")];
+    };
     let mut lines = vec![
         Line::from("Selected Step"),
         Line::from(format!(
@@ -1007,27 +1072,17 @@ fn selected_step_detail_lines(app: &App) -> Vec<Line<'static>> {
             "Required: {}",
             format_rate(step.required_output_rate(), calculation.display_rate_unit())
         )),
-        Line::from(format!("Recipe: {}", recipe_label(catalog, step.recipe()))),
+        Line::from(format!("Source: {}", source_label(catalog, step.source()))),
         Line::from(format!(
-            "Machine: {}",
-            machine_label(catalog, step.machine())
+            "Extraction rate: {}",
+            format_rate(step.extraction_rate(), calculation.display_rate_unit())
         )),
-        Line::from(format!(
-            "Machines: {} fractional / {} installed",
-            format_quantity(step.fractional_machine_count().get()),
-            step.installed_machine_count()
-        )),
-        Line::from(format!(
-            "Modules: {}",
-            module_list_label(catalog, step.modules())
-        )),
-        Line::from(format!("Energy: {}", step_energy_summary(step.energy()))),
         Line::from(""),
-        Line::from("Ingredients"),
+        Line::from("Required fluids"),
     ];
     push_rate_lines(
         catalog,
-        step.ingredients(),
+        step.required_fluids(),
         calculation.display_rate_unit(),
         &mut lines,
     );
@@ -1039,23 +1094,6 @@ fn selected_step_detail_lines(app: &App) -> Vec<Line<'static>> {
         calculation.display_rate_unit(),
         &mut lines,
     );
-
-    let belt = calculation
-        .belt_equivalents()
-        .iter()
-        .find(|equivalent| equivalent.commodity() == step.planning_product())
-        .map_or_else(
-            || "Belt: none".to_owned(),
-            |equivalent| {
-                format!(
-                    "Belt: {} exact / {} installed",
-                    format_quantity(equivalent.exact_belts().get()),
-                    equivalent.installed_belts()
-                )
-            },
-        );
-    lines.push(Line::from(""));
-    lines.push(Line::from(belt));
     lines
 }
 

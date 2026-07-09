@@ -802,6 +802,38 @@ fn renders_non_recipe_source_rows_in_the_aggregated_table() {
 }
 
 #[test]
+fn renders_selected_non_recipe_source_details() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "water.json", water_source_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("water.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Water"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(fluid("water"), 60.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+    app.dispatch(
+        Action::MoveFocus(factorio_planner_tui::app::FocusTarget::StepConfiguration),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 120, 24);
+
+    assert!(screen.contains("Source: offshore pump"));
+    assert!(screen.contains("Extraction rate:"));
+    assert!(screen.contains("Products"));
+    assert!(screen.contains("water 60/s"));
+    assert!(!screen.contains("No production steps"));
+}
+
+#[test]
 fn workspace_styles_the_focused_section() {
     let root = TempDir::new().unwrap();
     let sources = TempDir::new().unwrap();
