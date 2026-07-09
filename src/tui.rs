@@ -1236,6 +1236,13 @@ fn selection_option_labels(app: &App, kind: &SelectionKind) -> Vec<String> {
             })
             .map(|commodity| commodity_label(Some(catalog), commodity.id()))
             .collect(),
+        SelectionKind::Source { commodity } => catalog
+            .sources_for_product(commodity)
+            .iter()
+            .filter(|source| source_is_selectable(catalog, source))
+            .map(|source| source_label(Some(catalog), source))
+            .filter(|label| query.is_empty() || label.to_lowercase().contains(&query))
+            .collect(),
         SelectionKind::Recipe { commodity } => catalog
             .recipes_for_product(commodity)
             .iter()
@@ -1385,6 +1392,19 @@ fn source_label(catalog: Option<&Catalog>, source: &ProductionSource) -> String 
     }
 }
 
+fn source_is_selectable(catalog: &Catalog, source: &ProductionSource) -> bool {
+    match source {
+        ProductionSource::Recipe(recipe) => catalog
+            .recipe(recipe)
+            .is_some_and(crate::catalog::Recipe::supported),
+        ProductionSource::Resource(resource) => catalog.resource_source(resource).is_some(),
+        ProductionSource::Fluid(fluid_source) => catalog.fluid_source(fluid_source).is_some(),
+        ProductionSource::RocketLaunch(rocket_launch) => {
+            catalog.rocket_launch_source(rocket_launch).is_some()
+        }
+    }
+}
+
 fn module_list_label(catalog: Option<&Catalog>, modules: &[ModuleId]) -> String {
     if modules.is_empty() {
         return "none".to_owned();
@@ -1462,6 +1482,7 @@ fn format_power(watts: f64) -> String {
 fn selection_kind_title(kind: &SelectionKind) -> &'static str {
     match kind {
         SelectionKind::Commodity => "Commodity",
+        SelectionKind::Source { .. } => "Source",
         SelectionKind::Recipe { .. } => "Recipe",
         SelectionKind::Machine { .. } => "Machine",
         SelectionKind::Modules { .. } => "Modules",

@@ -5,7 +5,7 @@ use factorio_planner_tui::app::{
     Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, WorkspaceView,
 };
 use factorio_planner_tui::catalog::{
-    CommodityId, FluidId, ItemId, MachineId, ProductionSource, RecipeId,
+    CommodityId, FluidId, ItemId, MachineId, ProductionSource, RecipeId, ResourceSourceId,
 };
 use factorio_planner_tui::cli::{StartupInputError, StartupMode, StartupRequest};
 use factorio_planner_tui::persistence::{
@@ -32,6 +32,10 @@ fn fluid(name: &str) -> CommodityId {
 
 fn recipe_id(name: &str) -> RecipeId {
     RecipeId::new(name).expect("test recipe ID should be valid")
+}
+
+fn resource_id(name: &str) -> ResourceSourceId {
+    ResourceSourceId::new(name).expect("test resource source ID should be valid")
 }
 
 fn machine_id(name: &str) -> MachineId {
@@ -137,6 +141,45 @@ fn water_source_data() -> &'static str {
                 "name": "offshore-pump",
                 "fluid": "water",
                 "pumping_speed": 20
+            }
+        }
+    }"#
+}
+
+fn mixed_source_data() -> &'static str {
+    r#"{
+        "item": {
+            "iron-ore": {"type": "item", "name": "iron-ore"},
+            "stone": {"type": "item", "name": "stone"}
+        },
+        "recipe": {
+            "synthetic-iron-ore": {
+                "type": "recipe",
+                "name": "synthetic-iron-ore",
+                "category": "crafting",
+                "energy_required": 1,
+                "ingredients": [{"type": "item", "name": "stone", "amount": 1}],
+                "results": [{"type": "item", "name": "iron-ore", "amount": 1}]
+            }
+        },
+        "resource": {
+            "iron-ore": {
+                "type": "resource",
+                "name": "iron-ore",
+                "minable": {
+                    "mining_time": 1,
+                    "result": "iron-ore"
+                }
+            }
+        },
+        "assembling-machine": {
+            "assembler": {
+                "type": "assembling-machine",
+                "name": "assembler",
+                "crafting_categories": ["crafting"],
+                "crafting_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
             }
         }
     }"#
@@ -712,6 +755,100 @@ fn source_choice_actions_mark_the_plan_dirty_and_recalculate() {
             .plan()
             .source_choice(&item("iron-plate")),
         None
+    );
+}
+
+#[test]
+fn recipe_key_opens_source_selector_for_mixed_source_commodities() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "mixed.json", mixed_source_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-ore"), 2.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::OpenRecipeSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert_eq!(
+        app.overlay(),
+        Some(&Overlay::Selection(SelectionKind::Source {
+            commodity: item("iron-ore")
+        }))
+    );
+
+    app.dispatch(
+        Action::SetSelectionQuery("synthetic".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+
+    let plan = app.plan().unwrap().plan();
+    assert_eq!(
+        plan.source_choice(&item("iron-ore")),
+        Some(&ProductionSource::Recipe(recipe_id("synthetic-iron-ore")))
+    );
+    assert_eq!(
+        app.calculation().unwrap().production_steps()[0].recipe(),
+        &recipe_id("synthetic-iron-ore")
+    );
+    assert!(app.plan().unwrap().is_dirty());
+}
+
+#[test]
+fn source_selector_can_choose_non_recipe_sources() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "mixed.json", mixed_source_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-ore"), 2.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::OpenRecipeSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("resource".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+
+    assert_eq!(
+        app.plan().unwrap().plan().source_choice(&item("iron-ore")),
+        Some(&ProductionSource::Resource(resource_id("iron-ore")))
+    );
+    assert_eq!(
+        app.calculation().unwrap().extraction_steps()[0].source(),
+        &ProductionSource::Resource(resource_id("iron-ore"))
     );
 }
 

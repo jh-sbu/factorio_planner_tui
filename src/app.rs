@@ -102,6 +102,7 @@ impl From<&Overlay> for OverlayKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
     Commodity,
+    Source { commodity: CommodityId },
     Recipe { commodity: CommodityId },
     Machine { recipe: RecipeId },
     Modules { commodity: CommodityId },
@@ -923,7 +924,12 @@ impl App {
         let Some(commodity) = self.current_workspace_commodity() else {
             return;
         };
-        if self.has_supported_recipe_choices(&commodity) {
+        let source_choice_count = self.source_choice_count(&commodity);
+        if source_choice_count > 1 {
+            self.selector_index = 0;
+            self.selection_query.clear();
+            self.overlay = Some(Overlay::Selection(SelectionKind::Source { commodity }));
+        } else if self.has_supported_recipe_choices(&commodity) {
             self.selector_index = 0;
             self.selection_query.clear();
             self.overlay = Some(Overlay::Selection(SelectionKind::Recipe { commodity }));
@@ -1022,6 +1028,12 @@ impl App {
         })
     }
 
+    fn source_choice_count(&self, commodity: &CommodityId) -> usize {
+        self.active_profile.as_ref().map_or(0, |profile| {
+            selectable_sources(profile.catalog(), commodity, "").len()
+        })
+    }
+
     fn selection_option_count(&self) -> usize {
         let Some(Overlay::Selection(kind)) = self.overlay.as_ref() else {
             return 0;
@@ -1054,6 +1066,9 @@ impl App {
                     return Ok(());
                 }
                 self.status_message = Some(format!("selected commodity {commodity}"));
+            }
+            (SelectionKind::Source { commodity }, SelectionValue::Source(source)) => {
+                self.dispatch_plan_action(Action::SetSourceChoice { commodity, source })?;
             }
             (SelectionKind::Recipe { commodity }, SelectionValue::Recipe(recipe)) => {
                 self.dispatch_plan_action(Action::SetRecipeChoice { commodity, recipe })?;
@@ -1168,6 +1183,10 @@ impl App {
                     selection_matches(&query, commodity.id().as_str(), commodity.localized_name())
                 })
                 .map(|commodity| SelectionValue::Commodity(commodity.id().clone()))
+                .collect(),
+            SelectionKind::Source { commodity } => selectable_sources(catalog, commodity, &query)
+                .into_iter()
+                .map(SelectionValue::Source)
                 .collect(),
             SelectionKind::Recipe { commodity } => catalog
                 .recipes_for_product(commodity)
@@ -1345,6 +1364,7 @@ fn pluralize(count: usize, unit: &str) -> String {
 #[derive(Clone, Debug, PartialEq)]
 enum SelectionValue {
     Commodity(CommodityId),
+    Source(ProductionSource),
     Recipe(RecipeId),
     Machine(MachineId),
     Module(ModuleId),
@@ -1356,6 +1376,92 @@ fn selection_matches(query: &str, id: &str, localized_name: Option<&str>) -> boo
     query.is_empty()
         || id.to_lowercase().contains(query)
         || localized_name.is_some_and(|name| name.to_lowercase().contains(query))
+}
+
+fn selectable_sources(
+    catalog: &crate::catalog::Catalog,
+    commodity: &CommodityId,
+    query: &str,
+) -> Vec<ProductionSource> {
+    catalog
+        .sources_for_product(commodity)
+        .iter()
+        .filter(|source| source_is_selectable(catalog, commodity, source))
+        .filter(|source| source_matches(catalog, query, source))
+        .cloned()
+        .collect()
+}
+
+fn source_is_selectable(
+    catalog: &crate::catalog::Catalog,
+    commodity: &CommodityId,
+    source: &ProductionSource,
+) -> bool {
+    match source {
+        ProductionSource::Recipe(recipe_id) => catalog.recipe(recipe_id).is_some_and(|recipe| {
+            recipe.supported()
+                && recipe
+                    .products()
+                    .iter()
+                    .any(|product| product.commodity() == commodity)
+        }),
+        ProductionSource::Resource(resource_id) => catalog
+            .resource_source(resource_id)
+            .is_some_and(|source| products_include(source.products(), commodity)),
+        ProductionSource::Fluid(fluid_source_id) => catalog
+            .fluid_source(fluid_source_id)
+            .is_some_and(|source| products_include(source.products(), commodity)),
+        ProductionSource::RocketLaunch(rocket_launch_id) => catalog
+            .rocket_launch_source(rocket_launch_id)
+            .is_some_and(|source| products_include(source.products(), commodity)),
+    }
+}
+
+fn source_matches(
+    catalog: &crate::catalog::Catalog,
+    query: &str,
+    source: &ProductionSource,
+) -> bool {
+    match source {
+        ProductionSource::Recipe(recipe_id) => catalog.recipe(recipe_id).is_some_and(|recipe| {
+            selection_matches(query, recipe.id().as_str(), recipe.localized_name())
+        }),
+        ProductionSource::Resource(resource_id) => {
+            selection_matches(query, resource_id.as_str(), Some("resource"))
+        }
+        ProductionSource::Fluid(fluid_source_id) => {
+            catalog.fluid_source(fluid_source_id).is_some_and(|source| {
+                selection_matches(
+                    query,
+                    fluid_source_id.as_str(),
+                    Some(fluid_source_kind_label(source.kind())),
+                )
+            })
+        }
+        ProductionSource::RocketLaunch(rocket_launch_id) => catalog
+            .rocket_launch_source(rocket_launch_id)
+            .is_some_and(|source| {
+                selection_matches(
+                    query,
+                    rocket_launch_id.as_str(),
+                    Some(source.launched_item().as_str()),
+                ) || query.is_empty()
+                    || "rocket launch".contains(query)
+            }),
+    }
+}
+
+fn fluid_source_kind_label(kind: crate::catalog::FluidSourceKind) -> &'static str {
+    match kind {
+        crate::catalog::FluidSourceKind::OffshorePump => "offshore pump",
+        crate::catalog::FluidSourceKind::BoilerSteam => "boiler steam",
+    }
+}
+
+fn products_include(products: &[crate::catalog::Product], commodity: &CommodityId) -> bool {
+    products
+        .iter()
+        .any(|product| product.commodity() == commodity)
 }
 
 fn move_index(index: &mut usize, len: usize, direction: MoveDirection) {

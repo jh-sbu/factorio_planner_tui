@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use factorio_planner_tui::app::{
     Action, App, ExitState, FocusTarget, MoveDirection, Overlay, OverlayKind, Screen,
-    TextPromptKind, WorkspaceView,
+    SelectionKind, TextPromptKind, WorkspaceView,
 };
 use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, MachineId, RecipeId};
 use factorio_planner_tui::cli::StartupMode;
@@ -285,6 +285,45 @@ fn water_source_data() -> &'static str {
                 "name": "offshore-pump",
                 "fluid": "water",
                 "pumping_speed": 20
+            }
+        }
+    }"#
+}
+
+fn mixed_source_data() -> &'static str {
+    r#"{
+        "item": {
+            "iron-ore": {"type": "item", "name": "iron-ore"},
+            "stone": {"type": "item", "name": "stone"}
+        },
+        "recipe": {
+            "synthetic-iron-ore": {
+                "type": "recipe",
+                "name": "synthetic-iron-ore",
+                "category": "crafting",
+                "energy_required": 1,
+                "ingredients": [{"type": "item", "name": "stone", "amount": 1}],
+                "results": [{"type": "item", "name": "iron-ore", "amount": 1}]
+            }
+        },
+        "resource": {
+            "iron-ore": {
+                "type": "resource",
+                "name": "iron-ore",
+                "minable": {
+                    "mining_time": 1,
+                    "result": "iron-ore"
+                }
+            }
+        },
+        "assembling-machine": {
+            "assembler": {
+                "type": "assembling-machine",
+                "name": "assembler",
+                "crafting_categories": ["crafting"],
+                "crafting_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
             }
         }
     }"#
@@ -831,6 +870,38 @@ fn renders_selected_non_recipe_source_details() {
     assert!(screen.contains("Products"));
     assert!(screen.contains("water 60/s"));
     assert!(!screen.contains("No production steps"));
+}
+
+#[test]
+fn renders_source_selection_overlay() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "mixed.json", mixed_source_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("mixed.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Mixed"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-ore"), 2.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+    app.dispatch(
+        Action::OpenOverlay(Overlay::Selection(SelectionKind::Source {
+            commodity: item("iron-ore"),
+        })),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 120, 24);
+
+    assert!(screen.contains("Selection: Source"));
+    assert!(screen.contains("synthetic-iron-ore"));
+    assert!(screen.contains("resource: iron-ore"));
 }
 
 #[test]
