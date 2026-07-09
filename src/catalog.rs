@@ -46,6 +46,7 @@ string_id!(ItemId);
 string_id!(FluidId);
 string_id!(RecipeId);
 string_id!(MachineId);
+string_id!(MiningMachineId);
 string_id!(ModuleId);
 string_id!(FuelId);
 string_id!(BeltId);
@@ -624,6 +625,116 @@ impl Machine {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct MiningMachine {
+    id: MiningMachineId,
+    localized_name: Option<String>,
+    resource_categories: BTreeSet<ResourceCategory>,
+    mining_speed: Positive,
+    module_slots: u16,
+    allowed_effects: BTreeSet<ModuleEffect>,
+    allowed_module_categories: Option<BTreeSet<ModuleCategory>>,
+    energy_usage: Positive,
+    energy_source: MachineEnergySource,
+}
+
+impl MiningMachine {
+    /// Creates a mining machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::MiningMachineHasNoResourceCategories`] when no
+    /// resource category is supplied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: MiningMachineId,
+        resource_categories: impl IntoIterator<Item = ResourceCategory>,
+        mining_speed: Positive,
+        module_slots: u16,
+        allowed_effects: impl IntoIterator<Item = ModuleEffect>,
+        allowed_module_categories: Option<BTreeSet<ModuleCategory>>,
+        energy_usage: Positive,
+        energy_source: MachineEnergySource,
+    ) -> Result<Self, RecordError> {
+        let resource_categories = resource_categories.into_iter().collect::<BTreeSet<_>>();
+        if resource_categories.is_empty() {
+            return Err(RecordError::MiningMachineHasNoResourceCategories { mining_machine: id });
+        }
+        Ok(Self {
+            id,
+            localized_name: None,
+            resource_categories,
+            mining_speed,
+            module_slots,
+            allowed_effects: allowed_effects.into_iter().collect(),
+            allowed_module_categories,
+            energy_usage,
+            energy_source,
+        })
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &MiningMachineId {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn with_localized_name(mut self, localized_name: Option<String>) -> Self {
+        self.localized_name = localized_name;
+        self
+    }
+
+    #[must_use]
+    pub fn localized_name(&self) -> Option<&str> {
+        self.localized_name.as_deref()
+    }
+
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.localized_name().unwrap_or_else(|| self.id.as_str())
+    }
+
+    #[must_use]
+    pub const fn resource_categories(&self) -> &BTreeSet<ResourceCategory> {
+        &self.resource_categories
+    }
+
+    #[must_use]
+    pub const fn mining_speed(&self) -> Positive {
+        self.mining_speed
+    }
+
+    #[must_use]
+    pub const fn module_slots(&self) -> u16 {
+        self.module_slots
+    }
+
+    #[must_use]
+    pub const fn allowed_effects(&self) -> &BTreeSet<ModuleEffect> {
+        &self.allowed_effects
+    }
+
+    #[must_use]
+    pub const fn allowed_module_categories(&self) -> Option<&BTreeSet<ModuleCategory>> {
+        self.allowed_module_categories.as_ref()
+    }
+
+    #[must_use]
+    pub const fn energy_usage(&self) -> Positive {
+        self.energy_usage
+    }
+
+    #[must_use]
+    pub const fn energy_source(&self) -> &MachineEnergySource {
+        &self.energy_source
+    }
+
+    #[must_use]
+    pub fn supports_resource_category(&self, category: &ResourceCategory) -> bool {
+        self.resource_categories.contains(category)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     id: ModuleId,
     localized_name: Option<String>,
@@ -1054,6 +1165,8 @@ pub enum RecordError {
     },
     #[error("machine {machine} has no crafting categories")]
     MachineHasNoCraftingCategories { machine: MachineId },
+    #[error("mining machine {mining_machine} has no resource categories")]
+    MiningMachineHasNoResourceCategories { mining_machine: MiningMachineId },
     #[error("resource source {resource} has no products")]
     ResourceHasNoProducts { resource: ResourceSourceId },
     #[error("fluid source {fluid_source} has no products")]
@@ -1075,6 +1188,7 @@ pub struct CatalogParts {
     pub fluid_sources: Vec<FluidSource>,
     pub rocket_launch_sources: Vec<RocketLaunchSource>,
     pub machines: Vec<Machine>,
+    pub mining_machines: Vec<MiningMachine>,
     pub modules: Vec<Module>,
     pub fuels: Vec<Fuel>,
     pub belts: Vec<Belt>,
@@ -1089,12 +1203,14 @@ pub struct Catalog {
     fluid_sources: BTreeMap<FluidSourceId, FluidSource>,
     rocket_launch_sources: BTreeMap<RocketLaunchSourceId, RocketLaunchSource>,
     machines: BTreeMap<MachineId, Machine>,
+    mining_machines: BTreeMap<MiningMachineId, MiningMachine>,
     modules: BTreeMap<ModuleId, Module>,
     fuels: BTreeMap<FuelId, Fuel>,
     belts: BTreeMap<BeltId, Belt>,
     sources_by_product: BTreeMap<CommodityId, Vec<ProductionSource>>,
     recipes_by_product: BTreeMap<CommodityId, Vec<RecipeId>>,
     machines_by_category: BTreeMap<RecipeCategory, Vec<MachineId>>,
+    mining_machines_by_resource_category: BTreeMap<ResourceCategory, Vec<MiningMachineId>>,
 }
 
 impl Catalog {
@@ -1127,6 +1243,9 @@ impl Catalog {
             })?;
         let machines = collect_unique(parts.machines, Machine::id, |id| {
             CatalogError::DuplicateMachine { id }
+        })?;
+        let mining_machines = collect_unique(parts.mining_machines, MiningMachine::id, |id| {
+            CatalogError::DuplicateMiningMachine { id }
         })?;
         let modules = collect_unique(parts.modules, Module::id, |id| {
             CatalogError::DuplicateModule { id }
@@ -1210,6 +1329,18 @@ impl Catalog {
                     .push(machine_id.clone());
             }
         }
+        let mut mining_machines_by_resource_category: BTreeMap<
+            ResourceCategory,
+            Vec<MiningMachineId>,
+        > = BTreeMap::new();
+        for (mining_machine_id, mining_machine) in &mining_machines {
+            for category in mining_machine.resource_categories() {
+                mining_machines_by_resource_category
+                    .entry(category.clone())
+                    .or_default()
+                    .push(mining_machine_id.clone());
+            }
+        }
 
         Ok(Self {
             commodities,
@@ -1219,12 +1350,14 @@ impl Catalog {
             fluid_sources,
             rocket_launch_sources,
             machines,
+            mining_machines,
             modules,
             fuels,
             belts,
             sources_by_product,
             recipes_by_product,
             machines_by_category,
+            mining_machines_by_resource_category,
         })
     }
 
@@ -1264,6 +1397,11 @@ impl Catalog {
     }
 
     #[must_use]
+    pub fn mining_machine(&self, id: &MiningMachineId) -> Option<&MiningMachine> {
+        self.mining_machines.get(id)
+    }
+
+    #[must_use]
     pub fn module(&self, id: &ModuleId) -> Option<&Module> {
         self.modules.get(id)
     }
@@ -1291,6 +1429,16 @@ impl Catalog {
     #[must_use]
     pub fn machines_for_category(&self, category: &RecipeCategory) -> &[MachineId] {
         self.machines_by_category
+            .get(category)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn mining_machines_for_resource_category(
+        &self,
+        category: &ResourceCategory,
+    ) -> &[MiningMachineId] {
+        self.mining_machines_by_resource_category
             .get(category)
             .map_or(&[], Vec::as_slice)
     }
@@ -1328,6 +1476,11 @@ impl Catalog {
     #[must_use]
     pub fn machines(&self) -> impl ExactSizeIterator<Item = &Machine> {
         self.machines.values()
+    }
+
+    #[must_use]
+    pub fn mining_machines(&self) -> impl ExactSizeIterator<Item = &MiningMachine> {
+        self.mining_machines.values()
     }
 
     #[must_use]
@@ -1372,6 +1525,21 @@ impl Catalog {
             .values()
             .filter(|machine| {
                 search_matches(&query, machine.id().as_str(), machine.localized_name())
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn search_mining_machines(&self, query: &str) -> Vec<&MiningMachine> {
+        let query = query.to_lowercase();
+        self.mining_machines
+            .values()
+            .filter(|mining_machine| {
+                search_matches(
+                    &query,
+                    mining_machine.id().as_str(),
+                    mining_machine.localized_name(),
+                )
             })
             .collect()
     }
@@ -1579,6 +1747,8 @@ pub enum CatalogError {
     DuplicateRocketLaunchSource { id: RocketLaunchSourceId },
     #[error("duplicate machine ID {id}")]
     DuplicateMachine { id: MachineId },
+    #[error("duplicate mining machine ID {id}")]
+    DuplicateMiningMachine { id: MiningMachineId },
     #[error("duplicate module ID {id}")]
     DuplicateModule { id: ModuleId },
     #[error("duplicate fuel ID {id}")]

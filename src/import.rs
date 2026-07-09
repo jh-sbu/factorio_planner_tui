@@ -9,10 +9,10 @@ use thiserror::Error;
 use crate::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, FluidProperties,
     FluidSource, FluidSourceId, FluidSourceKind, Fuel, FuelCategory, FuelId, Ingredient, ItemId,
-    Machine, MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId,
-    NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId, ResourceCategory,
-    ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
-    UnsupportedEnergySource,
+    Machine, MachineEnergySource, MachineId, MiningMachine, MiningMachineId, Module,
+    ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory,
+    RecipeId, ResourceCategory, ResourceSource, ResourceSourceId, RocketLaunchSource,
+    RocketLaunchSourceId, UnsupportedEnergySource,
 };
 
 const DEFAULT_RECIPE_CATEGORY: &str = "crafting";
@@ -146,6 +146,8 @@ struct RelevantCollections {
     #[serde(rename = "assembling-machine")]
     assembling_machine: Option<Value>,
     furnace: Option<Value>,
+    #[serde(rename = "mining-drill")]
+    mining_drill: Option<Value>,
     #[serde(rename = "transport-belt")]
     transport_belt: Option<Value>,
 }
@@ -491,6 +493,8 @@ fn parse_data_raw_inner(
         &mut diagnostics,
         locale,
     ));
+    let mining_machines =
+        parse_mining_machine_collection(raw.mining_drill, &mut diagnostics, locale);
     let belts = parse_belt_collection(raw.transport_belt, &mut diagnostics, locale);
 
     if has_errors(&diagnostics) {
@@ -505,6 +509,7 @@ fn parse_data_raw_inner(
         fluid_sources,
         rocket_launch_sources,
         machines,
+        mining_machines,
         modules,
         fuels,
         belts,
@@ -2752,6 +2757,218 @@ fn parse_machine(
             None
         }
     }
+}
+
+fn parse_mining_machine_collection(
+    collection: Option<Value>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
+) -> Vec<MiningMachine> {
+    let Some(collection) = collection else {
+        return Vec::new();
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("mining-drill"),
+            None,
+            "/mining-drill".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return Vec::new();
+    };
+
+    prototypes
+        .into_iter()
+        .filter_map(|(id, prototype)| parse_mining_machine(&id, prototype, diagnostics, locale))
+        .collect()
+}
+
+fn parse_mining_machine(
+    id: &str,
+    prototype: Value,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    locale: Option<&PrototypeLocale>,
+) -> Option<MiningMachine> {
+    let prototype_type = "mining-drill";
+    let prototype_path = format!("/{prototype_type}/{}", pointer_segment(id));
+    let Value::Object(fields) = prototype else {
+        diagnostics.push(error_diagnostic(
+            Some(prototype_type),
+            Some(id),
+            prototype_path,
+            "prototype must be a JSON object",
+        ));
+        return None;
+    };
+
+    let initial_errors = error_count(diagnostics);
+    validate_prototype_identity(&fields, prototype_type, id, &prototype_path, diagnostics);
+
+    let mining_machine_id = parse_mining_machine_id(id, &prototype_path, diagnostics);
+    let resource_categories =
+        parse_mining_machine_resource_categories(&fields, id, &prototype_path, diagnostics);
+    let mining_speed = parse_machine_positive_number(
+        &fields,
+        "mining_speed",
+        prototype_type,
+        id,
+        &prototype_path,
+        diagnostics,
+    );
+    let module_slots =
+        parse_module_slots(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let allowed_effects =
+        parse_allowed_effects(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let allowed_module_categories =
+        parse_allowed_module_categories(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let energy_usage =
+        parse_machine_energy_usage(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let energy_source = parse_machine_energy_source(
+        &fields,
+        energy_usage,
+        prototype_type,
+        id,
+        &prototype_path,
+        diagnostics,
+    );
+
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+
+    match MiningMachine::new(
+        mining_machine_id?,
+        resource_categories?,
+        mining_speed?,
+        module_slots?,
+        allowed_effects?,
+        allowed_module_categories?.into_restriction(),
+        energy_usage?,
+        energy_source?,
+    ) {
+        Ok(mining_machine) => Some(mining_machine.with_localized_name(locale_name(
+            locale,
+            LocalePrototypeKind::Entity,
+            id,
+        ))),
+        Err(error) => {
+            machine_error(
+                diagnostics,
+                prototype_type,
+                id,
+                prototype_path,
+                error.to_string(),
+            );
+            None
+        }
+    }
+}
+
+fn parse_mining_machine_id(
+    mining_machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<MiningMachineId> {
+    MiningMachineId::new(mining_machine_id).map_or_else(
+        |error| {
+            machine_error(
+                diagnostics,
+                "mining-drill",
+                mining_machine_id,
+                format!("{prototype_path}/name"),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
+}
+
+fn parse_mining_machine_resource_categories(
+    fields: &Map<String, Value>,
+    mining_machine_id: &str,
+    prototype_path: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<BTreeSet<ResourceCategory>> {
+    let path = format!("{prototype_path}/resource_categories");
+    let Some(value) = fields.get("resource_categories") else {
+        machine_error(
+            diagnostics,
+            "mining-drill",
+            mining_machine_id,
+            path,
+            "missing required resource_categories",
+        );
+        return None;
+    };
+    let Value::Array(values) = value else {
+        machine_error(
+            diagnostics,
+            "mining-drill",
+            mining_machine_id,
+            path,
+            "resource_categories must be an array",
+        );
+        return None;
+    };
+    if values.is_empty() {
+        machine_error(
+            diagnostics,
+            "mining-drill",
+            mining_machine_id,
+            path,
+            "resource_categories must contain at least one category",
+        );
+        return None;
+    }
+
+    let initial_errors = error_count(diagnostics);
+    let categories = values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            parse_resource_category_id(
+                value,
+                mining_machine_id,
+                format!("{path}/{index}"),
+                diagnostics,
+            )
+        })
+        .collect();
+
+    (error_count(diagnostics) == initial_errors).then_some(categories)
+}
+
+fn parse_resource_category_id(
+    value: &Value,
+    mining_machine_id: &str,
+    path: String,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<ResourceCategory> {
+    let Value::String(category) = value else {
+        machine_error(
+            diagnostics,
+            "mining-drill",
+            mining_machine_id,
+            path,
+            "resource category must be a string",
+        );
+        return None;
+    };
+
+    ResourceCategory::new(category).map_or_else(
+        |error| {
+            machine_error(
+                diagnostics,
+                "mining-drill",
+                mining_machine_id,
+                path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
 }
 
 fn parse_machine_id(

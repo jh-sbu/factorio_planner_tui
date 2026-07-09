@@ -1,6 +1,9 @@
 use std::fs;
 
-use factorio_planner_tui::catalog::{CommodityId, FluidId, FluidSourceId, ItemId};
+use factorio_planner_tui::catalog::{
+    CommodityId, FluidId, FluidSourceId, ItemId, MachineEnergySource, MiningMachineId,
+    ResourceCategory,
+};
 use factorio_planner_tui::import::{DiagnosticSeverity, LocalePrototypeKind};
 use factorio_planner_tui::persistence::{
     CATALOG_SCHEMA_VERSION, ProfileError, ProfileImportRequest, ProfileName, ProfileStore,
@@ -430,6 +433,53 @@ fn round_trips_every_normalized_catalog_record_and_rebuilds_indexes() {
         reopened.catalog().machines_for_category(&smelting),
         created.catalog().machines_for_category(&smelting)
     );
+}
+
+#[test]
+fn profile_round_trip_preserves_mining_machines() {
+    let directory = TempDir::new().unwrap();
+    let source_directory = TempDir::new().unwrap();
+    let store = ProfileStore::new(directory.path());
+    let data = write_data(
+        &source_directory,
+        "miners.json",
+        r#"{
+            "mining-drill": {
+                "electric-mining-drill": {
+                    "type": "mining-drill",
+                    "name": "electric-mining-drill",
+                    "resource_categories": ["basic-solid"],
+                    "mining_speed": 0.5,
+                    "module_slots": 3,
+                    "allowed_effects": ["speed", "productivity", "consumption"],
+                    "energy_usage": "90kW",
+                    "energy_source": {"type": "electric", "drain": "3kW"}
+                }
+            }
+        }"#,
+    );
+    let created = store
+        .create(&ProfileImportRequest::new(profile_name("miners"), &data))
+        .unwrap();
+    let reopened = store.open(&profile_name("miners")).unwrap();
+
+    assert_eq!(reopened.catalog(), created.catalog());
+    let category = ResourceCategory::new("basic-solid").unwrap();
+    assert_eq!(
+        reopened
+            .catalog()
+            .mining_machines_for_resource_category(&category),
+        &[MiningMachineId::new("electric-mining-drill").unwrap()]
+    );
+    let miner = reopened
+        .catalog()
+        .mining_machine(&MiningMachineId::new("electric-mining-drill").unwrap())
+        .unwrap();
+    assert_eq!(miner.module_slots(), 3);
+    assert!(matches!(
+        miner.energy_source(),
+        MachineEnergySource::Electric { drain } if (drain.get() - 3_000.0).abs() < f64::EPSILON
+    ));
 }
 
 #[test]

@@ -2,9 +2,9 @@ use std::io::Cursor;
 
 use factorio_planner_tui::catalog::{
     BeltId, CommodityId, FluidId, FluidSourceId, FluidSourceKind, FuelCategory, FuelId, ItemId,
-    MachineEnergySource, MachineId, ModuleCategory, ModuleEffect, ModuleId, Positive,
-    ProductionSource, RecipeCategory, RecipeId, ResourceSourceId, RocketLaunchSourceId,
-    UnsupportedEnergySource,
+    MachineEnergySource, MachineId, MiningMachineId, ModuleCategory, ModuleEffect, ModuleId,
+    Positive, ProductionSource, RecipeCategory, RecipeId, ResourceCategory, ResourceSourceId,
+    RocketLaunchSourceId, UnsupportedEnergySource,
 };
 use factorio_planner_tui::import::{
     DiagnosticSeverity, ImportError, PrototypeDisposition, parse_data_raw,
@@ -366,7 +366,8 @@ fn imports_assemblers_furnaces_and_machine_defaults() {
         MachineEnergySource::Burner {
             fuel_categories,
             effectivity
-        } if fuel_categories == &[FuelCategory::new("chemical").unwrap()].into_iter().collect()
+        } if fuel_categories.len() == 1
+            && fuel_categories.contains(&FuelCategory::new("chemical").unwrap())
             && (effectivity.get() - 1.0).abs() < f64::EPSILON
     ));
 
@@ -535,6 +536,198 @@ fn warns_about_unknown_machine_effects_and_energy_sources() {
     );
     assert_eq!(
         machine.energy_source(),
+        &MachineEnergySource::Unsupported(UnsupportedEnergySource::Unknown("future-power".into()))
+    );
+    assert_eq!(
+        report
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn imports_electric_and_burner_mining_drills() {
+    let report = import(
+        r#"{
+            "mining-drill": {
+                "electric-mining-drill": {
+                    "type": "mining-drill",
+                    "name": "electric-mining-drill",
+                    "resource_categories": ["basic-solid", "hard-ore"],
+                    "mining_speed": 0.5,
+                    "module_slots": 3,
+                    "allowed_effects": ["speed", "productivity", "consumption"],
+                    "allowed_module_categories": ["speed", "productivity"],
+                    "energy_usage": "90kW",
+                    "energy_source": {
+                        "type": "electric",
+                        "drain": "3kW"
+                    }
+                },
+                "burner-mining-drill": {
+                    "type": "mining-drill",
+                    "name": "burner-mining-drill",
+                    "resource_categories": ["basic-solid"],
+                    "mining_speed": 0.25,
+                    "energy_usage": "150kW",
+                    "energy_source": {
+                        "type": "burner",
+                        "effectivity": 1,
+                        "fuel_categories": ["chemical"]
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let catalog = report.catalog();
+
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(catalog.mining_machines().len(), 2);
+
+    let electric = catalog
+        .mining_machine(&MiningMachineId::new("electric-mining-drill").unwrap())
+        .unwrap();
+    assert_eq!(
+        electric.resource_categories(),
+        &[
+            ResourceCategory::new("basic-solid").unwrap(),
+            ResourceCategory::new("hard-ore").unwrap()
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_close(electric.mining_speed().get(), 0.5);
+    assert_eq!(electric.module_slots(), 3);
+    assert_eq!(
+        electric.allowed_effects(),
+        &[
+            ModuleEffect::Speed,
+            ModuleEffect::Productivity,
+            ModuleEffect::Consumption
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(
+        electric.allowed_module_categories(),
+        Some(
+            &[
+                ModuleCategory::new("productivity").unwrap(),
+                ModuleCategory::new("speed").unwrap()
+            ]
+            .into_iter()
+            .collect()
+        )
+    );
+    assert_close(electric.energy_usage().get(), 90_000.0);
+    assert!(matches!(
+        electric.energy_source(),
+        MachineEnergySource::Electric { drain }
+            if (drain.get() - 3_000.0).abs() < f64::EPSILON
+    ));
+
+    let burner = catalog
+        .mining_machine(&MiningMachineId::new("burner-mining-drill").unwrap())
+        .unwrap();
+    assert_close(burner.mining_speed().get(), 0.25);
+    assert!(matches!(
+        burner.energy_source(),
+        MachineEnergySource::Burner {
+            fuel_categories,
+            effectivity
+        } if fuel_categories.len() == 1
+            && fuel_categories.contains(&FuelCategory::new("chemical").unwrap())
+            && (effectivity.get() - 1.0).abs() < f64::EPSILON
+    ));
+    assert_eq!(
+        catalog
+            .mining_machines_for_resource_category(&ResourceCategory::new("basic-solid").unwrap()),
+        &[
+            MiningMachineId::new("burner-mining-drill").unwrap(),
+            MiningMachineId::new("electric-mining-drill").unwrap()
+        ]
+    );
+}
+
+#[test]
+fn reports_malformed_mining_drill_fields_with_precise_context() {
+    let diagnostics = invalid_data(
+        r#"{
+            "mining-drill": {
+                "bad": {
+                    "type": "mining-drill",
+                    "name": "bad",
+                    "resource_categories": ["basic-solid", 7, ""],
+                    "mining_speed": 0,
+                    "module_slots": -1,
+                    "allowed_effects": ["speed", 7],
+                    "allowed_module_categories": ["speed", ""],
+                    "energy_usage": "not-power",
+                    "energy_source": {
+                        "type": "burner",
+                        "effectivity": 0,
+                        "fuel_categories": ["chemical", 7]
+                    }
+                }
+            }
+        }"#,
+    );
+
+    for path in [
+        "/mining-drill/bad/resource_categories/1",
+        "/mining-drill/bad/resource_categories/2",
+        "/mining-drill/bad/mining_speed",
+        "/mining-drill/bad/module_slots",
+        "/mining-drill/bad/allowed_effects/1",
+        "/mining-drill/bad/allowed_module_categories/1",
+        "/mining-drill/bad/energy_usage",
+        "/mining-drill/bad/energy_source/effectivity",
+        "/mining-drill/bad/energy_source/fuel_categories/1",
+    ] {
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.path == path),
+            "missing diagnostic for {path}: {diagnostics:#?}"
+        );
+    }
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Error
+            && diagnostic.disposition == PrototypeDisposition::Rejected
+    }));
+}
+
+#[test]
+fn warns_about_unknown_mining_drill_effects_and_energy_sources() {
+    let report = import(
+        r#"{
+            "mining-drill": {
+                "future-miner": {
+                    "type": "mining-drill",
+                    "name": "future-miner",
+                    "resource_categories": ["basic-solid"],
+                    "mining_speed": 1,
+                    "allowed_effects": ["speed", "future-effect"],
+                    "energy_usage": "1kW",
+                    "energy_source": {"type": "future-power"}
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let mining_machine = report
+        .catalog()
+        .mining_machine(&MiningMachineId::new("future-miner").unwrap())
+        .unwrap();
+    assert_eq!(
+        mining_machine.allowed_effects(),
+        &[ModuleEffect::Speed].into_iter().collect()
+    );
+    assert_eq!(
+        mining_machine.energy_source(),
         &MachineEnergySource::Unsupported(UnsupportedEnergySource::Unknown("future-power".into()))
     );
     assert_eq!(

@@ -12,10 +12,10 @@ use thiserror::Error;
 use crate::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, DatasetFingerprint, Finite,
     FluidId, FluidProperties, FluidSource, FluidSourceId, FluidSourceKind, Fuel, FuelCategory,
-    FuelId, Ingredient, ItemId, Machine, MachineEnergySource, MachineId, Module, ModuleCategory,
-    ModuleEffect, ModuleId, NonNegative, Positive, Product, ProductionSource, Recipe,
-    RecipeCategory, RecipeId, ResourceCategory, ResourceSource, ResourceSourceId,
-    RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
+    FuelId, Ingredient, ItemId, Machine, MachineEnergySource, MachineId, MiningMachine,
+    MiningMachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, Positive,
+    Product, ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceCategory, ResourceSource,
+    ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
 };
 use crate::import::{
     DiagnosticSeverity, ImportDiagnostic, ImportError, LocaleError, LocalePrototypeKind,
@@ -1507,6 +1507,8 @@ struct CatalogDto {
     #[serde(default)]
     rocket_launch_sources: Vec<RocketLaunchSourceDto>,
     machines: Vec<MachineDto>,
+    #[serde(default)]
+    mining_machines: Vec<MiningMachineDto>,
     modules: Vec<ModuleDto>,
     fuels: Vec<FuelDto>,
     belts: Vec<BeltDto>,
@@ -1531,6 +1533,10 @@ impl From<&Catalog> for CatalogDto {
                 .map(RocketLaunchSourceDto::from)
                 .collect(),
             machines: catalog.machines().map(MachineDto::from).collect(),
+            mining_machines: catalog
+                .mining_machines()
+                .map(MiningMachineDto::from)
+                .collect(),
             modules: catalog.modules().map(ModuleDto::from).collect(),
             fuels: catalog.fuels().map(FuelDto::from).collect(),
             belts: catalog.belts().map(BeltDto::from).collect(),
@@ -1577,6 +1583,11 @@ impl TryFrom<CatalogDto> for Catalog {
                 .machines
                 .into_iter()
                 .map(MachineDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            mining_machines: catalog
+                .mining_machines
+                .into_iter()
+                .map(MiningMachineDto::into_record)
                 .collect::<Result<Vec<_>, _>>()?,
             modules: catalog
                 .modules
@@ -2488,6 +2499,78 @@ impl MachineDto {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+struct MiningMachineDto {
+    id: String,
+    localized_name: Option<String>,
+    resource_categories: Vec<String>,
+    mining_speed: f64,
+    module_slots: u16,
+    allowed_effects: Vec<ModuleEffectDto>,
+    allowed_module_categories: Option<Vec<String>>,
+    energy_usage: f64,
+    energy_source: MachineEnergySourceDto,
+}
+
+impl From<&MiningMachine> for MiningMachineDto {
+    fn from(mining_machine: &MiningMachine) -> Self {
+        Self {
+            id: mining_machine.id().as_str().to_owned(),
+            localized_name: mining_machine.localized_name().map(str::to_owned),
+            resource_categories: mining_machine
+                .resource_categories()
+                .iter()
+                .map(|category| category.as_str().to_owned())
+                .collect(),
+            mining_speed: mining_machine.mining_speed().get(),
+            module_slots: mining_machine.module_slots(),
+            allowed_effects: mining_machine
+                .allowed_effects()
+                .iter()
+                .copied()
+                .map(ModuleEffectDto::from)
+                .collect(),
+            allowed_module_categories: mining_machine.allowed_module_categories().map(
+                |categories| {
+                    categories
+                        .iter()
+                        .map(|category| category.as_str().to_owned())
+                        .collect()
+                },
+            ),
+            energy_usage: mining_machine.energy_usage().get(),
+            energy_source: mining_machine.energy_source().into(),
+        }
+    }
+}
+
+impl MiningMachineDto {
+    fn into_record(self) -> Result<MiningMachine, ProfileError> {
+        MiningMachine::new(
+            mining_machine_id(self.id)?,
+            self.resource_categories
+                .into_iter()
+                .map(resource_category)
+                .collect::<Result<Vec<_>, _>>()?,
+            positive(self.mining_speed)?,
+            self.module_slots,
+            self.allowed_effects.into_iter().map(ModuleEffect::from),
+            self.allowed_module_categories
+                .map(|categories| {
+                    categories
+                        .into_iter()
+                        .map(module_category)
+                        .collect::<Result<BTreeSet<_>, _>>()
+                })
+                .transpose()?,
+            positive(self.energy_usage)?,
+            self.energy_source.into_source()?,
+        )
+        .map(|mining_machine| mining_machine.with_localized_name(self.localized_name))
+        .map_err(|error| invalid_catalog(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ModuleDto {
     id: String,
     localized_name: Option<String>,
@@ -2842,6 +2925,10 @@ fn machine_id(value: String) -> Result<MachineId, ProfileError> {
     MachineId::new(value).map_err(|error| invalid_catalog(error.to_string()))
 }
 
+fn mining_machine_id(value: String) -> Result<MiningMachineId, ProfileError> {
+    MiningMachineId::new(value).map_err(|error| invalid_catalog(error.to_string()))
+}
+
 fn module_id(value: String) -> Result<ModuleId, ProfileError> {
     ModuleId::new(value).map_err(|error| invalid_catalog(error.to_string()))
 }
@@ -2856,6 +2943,10 @@ fn belt_id(value: String) -> Result<BeltId, ProfileError> {
 
 fn recipe_category(value: String) -> Result<RecipeCategory, ProfileError> {
     RecipeCategory::new(value).map_err(|error| invalid_catalog(error.to_string()))
+}
+
+fn resource_category(value: String) -> Result<ResourceCategory, ProfileError> {
+    ResourceCategory::new(value).map_err(|error| invalid_catalog(error.to_string()))
 }
 
 fn module_category(value: String) -> Result<ModuleCategory, ProfileError> {

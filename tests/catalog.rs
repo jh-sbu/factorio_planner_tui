@@ -1,9 +1,10 @@
 use factorio_planner_tui::catalog::{
     Belt, BeltId, Catalog, CatalogError, CatalogParts, Commodity, CommodityId, DatasetFingerprint,
     Finite, FluidId, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource,
-    MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
-    Product, ProductionSource, Recipe, RecipeCategory, RecipeId, RecordError, ResourceCategory,
-    ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
+    MachineId, MiningMachine, MiningMachineId, Module, ModuleCategory, ModuleEffect, ModuleId,
+    NonNegative, NumericError, Positive, Product, ProductionSource, Recipe, RecipeCategory,
+    RecipeId, RecordError, ResourceCategory, ResourceSource, ResourceSourceId, RocketLaunchSource,
+    RocketLaunchSourceId,
 };
 
 fn item(name: &str) -> ItemId {
@@ -16,6 +17,10 @@ fn recipe_id(name: &str) -> RecipeId {
 
 fn machine_id(name: &str) -> MachineId {
     MachineId::new(name).expect("test machine ID should be valid")
+}
+
+fn mining_machine_id(name: &str) -> MiningMachineId {
+    MiningMachineId::new(name).expect("test mining machine ID should be valid")
 }
 
 fn resource_id(name: &str) -> ResourceSourceId {
@@ -267,6 +272,54 @@ fn machine_module_fuel_and_belt_records_expose_validated_data() {
 }
 
 #[test]
+fn mining_machine_records_expose_validated_data() {
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let hard_ore = ResourceCategory::new("hard-ore").unwrap();
+    let speed_modules = ModuleCategory::new("speed").unwrap();
+    let mining_machine = MiningMachine::new(
+        mining_machine_id("electric-mining-drill"),
+        [basic_solid.clone(), hard_ore.clone()],
+        positive(0.5),
+        3,
+        [ModuleEffect::Speed, ModuleEffect::Consumption],
+        Some([speed_modules.clone()].into_iter().collect()),
+        positive(90_000.0),
+        MachineEnergySource::Electric {
+            drain: NonNegative::new(3_000.0).unwrap(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        mining_machine.id(),
+        &mining_machine_id("electric-mining-drill")
+    );
+    assert_eq!(
+        mining_machine.resource_categories(),
+        &[basic_solid.clone(), hard_ore].into_iter().collect()
+    );
+    assert_close(mining_machine.mining_speed().get(), 0.5);
+    assert_eq!(mining_machine.module_slots(), 3);
+    assert_eq!(
+        mining_machine.allowed_effects(),
+        &[ModuleEffect::Speed, ModuleEffect::Consumption]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        mining_machine.allowed_module_categories(),
+        Some(&[speed_modules].into_iter().collect())
+    );
+    assert_close(mining_machine.energy_usage().get(), 90_000.0);
+    assert!(mining_machine.supports_resource_category(&basic_solid));
+    assert!(matches!(
+        mining_machine.energy_source(),
+        MachineEnergySource::Electric { drain }
+            if (drain.get() - 3_000.0).abs() < f64::EPSILON
+    ));
+}
+
+#[test]
 fn catalog_indexes_and_looks_up_records_deterministically() {
     let plate = CommodityId::Item(item("iron-plate"));
     let gear = CommodityId::Item(item("iron-gear-wheel"));
@@ -364,6 +417,67 @@ fn catalog_indexes_and_looks_up_records_deterministically() {
 }
 
 #[test]
+fn catalog_indexes_mining_machines_by_resource_category() {
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let hard_ore = ResourceCategory::new("hard-ore").unwrap();
+    let slow = MiningMachine::new(
+        mining_machine_id("a-slow-miner"),
+        [basic_solid.clone()],
+        positive(0.25),
+        0,
+        [],
+        None,
+        positive(150_000.0),
+        MachineEnergySource::Burner {
+            fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                .into_iter()
+                .collect(),
+            effectivity: positive(1.0),
+        },
+    )
+    .unwrap();
+    let fast = MiningMachine::new(
+        mining_machine_id("z-fast-miner"),
+        [basic_solid.clone(), hard_ore.clone()],
+        positive(0.5),
+        3,
+        [ModuleEffect::Speed],
+        None,
+        positive(90_000.0),
+        MachineEnergySource::Electric {
+            drain: NonNegative::new(3_000.0).unwrap(),
+        },
+    )
+    .unwrap();
+
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        mining_machines: vec![fast, slow],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        catalog
+            .mining_machine(&mining_machine_id("z-fast-miner"))
+            .unwrap()
+            .mining_speed(),
+        positive(0.5)
+    );
+    assert_eq!(
+        catalog.mining_machines_for_resource_category(&basic_solid),
+        &[
+            mining_machine_id("a-slow-miner"),
+            mining_machine_id("z-fast-miner")
+        ]
+    );
+    assert_eq!(
+        catalog.mining_machines_for_resource_category(&hard_ore),
+        &[mining_machine_id("z-fast-miner")]
+    );
+    assert_eq!(catalog.mining_machines().len(), 2);
+}
+
+#[test]
 fn catalog_rejects_duplicate_ids() {
     let plate = CommodityId::Item(item("iron-plate"));
     let result = Catalog::try_from_parts(CatalogParts {
@@ -409,6 +523,29 @@ fn catalog_rejects_duplicate_record_ids() {
         }),
         Err(CatalogError::DuplicateMachine {
             id: machine_id("assembler")
+        })
+    );
+
+    let mining_machine = MiningMachine::new(
+        mining_machine_id("electric-mining-drill"),
+        [ResourceCategory::new("basic-solid").unwrap()],
+        positive(0.5),
+        0,
+        [],
+        None,
+        positive(90_000.0),
+        MachineEnergySource::Electric {
+            drain: NonNegative::new(3_000.0).unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        Catalog::try_from_parts(CatalogParts {
+            mining_machines: vec![mining_machine.clone(), mining_machine],
+            ..CatalogParts::default()
+        }),
+        Err(CatalogError::DuplicateMiningMachine {
+            id: mining_machine_id("electric-mining-drill")
         })
     );
 
