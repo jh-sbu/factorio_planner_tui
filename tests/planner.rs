@@ -3,7 +3,7 @@ use factorio_planner_tui::catalog::{
     FluidSourceId, FluidSourceKind, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine,
     MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative,
     Positive, Product, Recipe, RecipeCategory, RecipeId, ResourceCategory, ResourceSource,
-    ResourceSourceId, UnsupportedEnergySource,
+    ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
 };
 use factorio_planner_tui::planner::{
     DependencyNodeKind, FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit,
@@ -49,6 +49,10 @@ fn resource_id(name: &str) -> ResourceSourceId {
 
 fn fluid_source_id(name: &str) -> FluidSourceId {
     FluidSourceId::new(name).expect("test fluid source ID should be valid")
+}
+
+fn rocket_launch_id(name: &str) -> RocketLaunchSourceId {
+    RocketLaunchSourceId::new(name).expect("test rocket launch source ID should be valid")
 }
 
 fn positive(value: f64) -> Positive {
@@ -450,6 +454,24 @@ fn resource_source(
     .unwrap()
 }
 
+fn rocket_launch_source(
+    name: &str,
+    launched_item: &str,
+    product: CommodityId,
+    product_amount: f64,
+    rocket_recipe: &str,
+    rocket_parts_required: f64,
+) -> RocketLaunchSource {
+    RocketLaunchSource::new(
+        rocket_launch_id(name),
+        item_id(launched_item),
+        vec![Product::new(product, positive(product_amount))],
+        recipe_id(rocket_recipe),
+        positive(rocket_parts_required),
+    )
+    .unwrap()
+}
+
 fn belt_equivalent_for<'a>(
     equivalents: &'a [factorio_planner_tui::planner::BeltEquivalent],
     commodity: &CommodityId,
@@ -717,6 +739,131 @@ fn burner_boiler_steam_expands_water_and_fuel_dependencies() {
         tree.children()
             .iter()
             .any(|child| child.commodity() == &coal)
+    );
+}
+
+#[test]
+fn rocket_launch_sources_expand_launched_item_and_rocket_part_dependencies() {
+    let ore = item("iron-ore");
+    let low_density = item("low-density-structure");
+    let satellite = item("satellite");
+    let rocket_fuel = item("rocket-fuel");
+    let rocket_part = item("rocket-part");
+    let science = item("space-science-pack");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let rocket_building = RecipeCategory::new("rocket-building").unwrap();
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: [
+            ore.clone(),
+            low_density.clone(),
+            satellite.clone(),
+            rocket_fuel.clone(),
+            rocket_part.clone(),
+            science.clone(),
+        ]
+        .into_iter()
+        .map(|id| Commodity::new(id, None))
+        .collect(),
+        recipes: vec![
+            recipe(
+                "low-density-structure",
+                &crafting,
+                1.0,
+                vec![(ore.clone(), 2.0)],
+                low_density.clone(),
+                1.0,
+            ),
+            recipe(
+                "satellite",
+                &crafting,
+                5.0,
+                vec![(low_density.clone(), 100.0)],
+                satellite.clone(),
+                1.0,
+            ),
+            recipe(
+                "rocket-fuel",
+                &crafting,
+                1.0,
+                vec![(ore.clone(), 10.0)],
+                rocket_fuel.clone(),
+                1.0,
+            ),
+            recipe(
+                "rocket-part",
+                &rocket_building,
+                3.0,
+                vec![(low_density.clone(), 10.0), (rocket_fuel.clone(), 10.0)],
+                rocket_part.clone(),
+                1.0,
+            ),
+        ],
+        machines: vec![
+            machine("assembler", [crafting], 1.0),
+            machine("rocket-silo", [rocket_building], 1.0),
+        ],
+        rocket_launch_sources: vec![rocket_launch_source(
+            "satellite",
+            "satellite",
+            science.clone(),
+            1000.0,
+            "rocket-part",
+            100.0,
+        )],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(science.clone(), 1.0))).unwrap();
+
+    assert!(
+        result
+            .external_inputs()
+            .iter()
+            .all(|input| input.commodity() != &science)
+    );
+    let launch_step = result
+        .extraction_steps()
+        .iter()
+        .find(|step| step.planning_product() == &science)
+        .expect("expected rocket launch step");
+    assert_eq!(
+        launch_step.source(),
+        &factorio_planner_tui::catalog::ProductionSource::RocketLaunch(rocket_launch_id(
+            "satellite"
+        ))
+    );
+    assert_close(launch_step.extraction_rate().get(), 0.001);
+    assert_close(rate_for(launch_step.required_fluids(), &satellite), 0.001);
+    assert_close(rate_for(launch_step.required_fluids(), &rocket_part), 0.1);
+    assert_close(
+        step_for(&result, &satellite).required_output_rate().get(),
+        0.001,
+    );
+    assert_close(
+        step_for(&result, &rocket_part).required_output_rate().get(),
+        0.1,
+    );
+    assert_close(
+        step_for(&result, &low_density).required_output_rate().get(),
+        1.1,
+    );
+    assert_close(
+        step_for(&result, &rocket_fuel).required_output_rate().get(),
+        1.0,
+    );
+
+    let tree = &result.dependency_trees()[0];
+    assert_eq!(tree.commodity(), &science);
+    assert!(
+        tree.children()
+            .iter()
+            .any(|child| child.commodity() == &satellite)
+    );
+    assert!(
+        tree.children()
+            .iter()
+            .any(|child| child.commodity() == &rocket_part)
     );
 }
 

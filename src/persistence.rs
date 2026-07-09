@@ -14,7 +14,8 @@ use crate::catalog::{
     FluidId, FluidProperties, FluidSource, FluidSourceId, FluidSourceKind, Fuel, FuelCategory,
     FuelId, Ingredient, ItemId, Machine, MachineEnergySource, MachineId, Module, ModuleCategory,
     ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId,
-    ResourceCategory, ResourceSource, ResourceSourceId, UnsupportedEnergySource,
+    ResourceCategory, ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
+    UnsupportedEnergySource,
 };
 use crate::import::{
     DiagnosticSeverity, ImportDiagnostic, ImportError, LocaleError, LocalePrototypeKind,
@@ -1498,6 +1499,8 @@ struct CatalogDto {
     resource_sources: Vec<ResourceSourceDto>,
     #[serde(default)]
     fluid_sources: Vec<FluidSourceDto>,
+    #[serde(default)]
+    rocket_launch_sources: Vec<RocketLaunchSourceDto>,
     machines: Vec<MachineDto>,
     modules: Vec<ModuleDto>,
     fuels: Vec<FuelDto>,
@@ -1518,6 +1521,10 @@ impl From<&Catalog> for CatalogDto {
                 .map(ResourceSourceDto::from)
                 .collect(),
             fluid_sources: catalog.fluid_sources().map(FluidSourceDto::from).collect(),
+            rocket_launch_sources: catalog
+                .rocket_launch_sources()
+                .map(RocketLaunchSourceDto::from)
+                .collect(),
             machines: catalog.machines().map(MachineDto::from).collect(),
             modules: catalog.modules().map(ModuleDto::from).collect(),
             fuels: catalog.fuels().map(FuelDto::from).collect(),
@@ -1555,6 +1562,11 @@ impl TryFrom<CatalogDto> for Catalog {
                 .fluid_sources
                 .into_iter()
                 .map(FluidSourceDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            rocket_launch_sources: catalog
+                .rocket_launch_sources
+                .into_iter()
+                .map(RocketLaunchSourceDto::into_record)
                 .collect::<Result<Vec<_>, _>>()?,
             machines: catalog
                 .machines
@@ -2057,6 +2069,44 @@ impl FluidSourceDto {
                 .map(MachineEnergySourceDto::into_source)
                 .transpose()?,
             self.energy_usage.map(positive).transpose()?,
+        )
+        .map_err(|error| invalid_catalog(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RocketLaunchSourceDto {
+    id: String,
+    launched_item: String,
+    products: Vec<ProductDto>,
+    rocket_recipe: String,
+    rocket_parts_required: f64,
+}
+
+impl From<&RocketLaunchSource> for RocketLaunchSourceDto {
+    fn from(source: &RocketLaunchSource) -> Self {
+        Self {
+            id: source.id().as_str().to_owned(),
+            launched_item: source.launched_item().as_str().to_owned(),
+            products: source.products().iter().map(ProductDto::from).collect(),
+            rocket_recipe: source.rocket_recipe().as_str().to_owned(),
+            rocket_parts_required: source.rocket_parts_required().get(),
+        }
+    }
+}
+
+impl RocketLaunchSourceDto {
+    fn into_record(self) -> Result<RocketLaunchSource, ProfileError> {
+        RocketLaunchSource::new(
+            RocketLaunchSourceId::new(self.id)
+                .map_err(|error| invalid_catalog(error.to_string()))?,
+            item_id(self.launched_item)?,
+            self.products
+                .into_iter()
+                .map(ProductDto::into_record)
+                .collect::<Result<Vec<_>, _>>()?,
+            recipe_id(self.rocket_recipe)?,
+            positive(self.rocket_parts_required)?,
         )
         .map_err(|error| invalid_catalog(error.to_string()))
     }

@@ -1338,6 +1338,12 @@ fn source_label(catalog: Option<&Catalog>, source: &ProductionSource) -> String 
                     FluidSourceKind::BoilerSteam => "boiler steam".to_owned(),
                 },
             ),
+        ProductionSource::RocketLaunch(source_id) => catalog
+            .and_then(|catalog| catalog.rocket_launch_source(source_id))
+            .map_or_else(
+                || format!("rocket launch: {source_id}"),
+                |source| format!("rocket launch: {}", source.launched_item()),
+            ),
     }
 }
 

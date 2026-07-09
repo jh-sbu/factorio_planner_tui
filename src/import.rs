@@ -11,7 +11,8 @@ use crate::catalog::{
     FluidSource, FluidSourceId, FluidSourceKind, Fuel, FuelCategory, FuelId, Ingredient, ItemId,
     Machine, MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId,
     NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId, ResourceCategory,
-    ResourceSource, ResourceSourceId, UnsupportedEnergySource,
+    ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
+    UnsupportedEnergySource,
 };
 
 const DEFAULT_RECIPE_CATEGORY: &str = "crafting";
@@ -140,6 +141,8 @@ struct RelevantCollections {
     #[serde(rename = "offshore-pump")]
     offshore_pump: Option<Value>,
     boiler: Option<Value>,
+    #[serde(rename = "rocket-silo")]
+    rocket_silo: Option<Value>,
     #[serde(rename = "assembling-machine")]
     assembling_machine: Option<Value>,
     furnace: Option<Value>,
@@ -308,18 +311,28 @@ fn parse_data_raw_inner(
     let mut diagnostics = Vec::new();
     let mut commodities = Vec::new();
     let mut parsed_fuels = Vec::new();
+    let mut rocket_launch_items = Vec::new();
     parse_item_collection(
         raw.item,
         &mut commodities,
         &mut parsed_fuels,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
-    parse_item_like_collection("ammo", raw.ammo, &mut commodities, &mut diagnostics, locale);
+    parse_item_like_collection(
+        "ammo",
+        raw.ammo,
+        &mut commodities,
+        &mut rocket_launch_items,
+        &mut diagnostics,
+        locale,
+    );
     parse_item_like_collection(
         "armor",
         raw.armor,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -327,6 +340,7 @@ fn parse_data_raw_inner(
         "blueprint",
         raw.blueprint,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -334,6 +348,7 @@ fn parse_data_raw_inner(
         "blueprint-book",
         raw.blueprint_book,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -341,6 +356,7 @@ fn parse_data_raw_inner(
         "capsule",
         raw.capsule,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -348,6 +364,7 @@ fn parse_data_raw_inner(
         "copy-paste-tool",
         raw.copy_paste_tool,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -355,14 +372,23 @@ fn parse_data_raw_inner(
         "deconstruction-item",
         raw.deconstruction_item,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
-    parse_item_like_collection("gun", raw.gun, &mut commodities, &mut diagnostics, locale);
+    parse_item_like_collection(
+        "gun",
+        raw.gun,
+        &mut commodities,
+        &mut rocket_launch_items,
+        &mut diagnostics,
+        locale,
+    );
     parse_item_like_collection(
         "item-with-entity-data",
         raw.item_with_entity_data,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -370,6 +396,7 @@ fn parse_data_raw_inner(
         "rail-planner",
         raw.rail_planner,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -377,6 +404,7 @@ fn parse_data_raw_inner(
         "repair-tool",
         raw.repair_tool,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -384,6 +412,7 @@ fn parse_data_raw_inner(
         "selection-tool",
         raw.selection_tool,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -391,14 +420,23 @@ fn parse_data_raw_inner(
         "spidertron-remote",
         raw.spidertron_remote,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
-    parse_item_like_collection("tool", raw.tool, &mut commodities, &mut diagnostics, locale);
+    parse_item_like_collection(
+        "tool",
+        raw.tool,
+        &mut commodities,
+        &mut rocket_launch_items,
+        &mut diagnostics,
+        locale,
+    );
     parse_item_like_collection(
         "upgrade-item",
         raw.upgrade_item,
         &mut commodities,
+        &mut rocket_launch_items,
         &mut diagnostics,
         locale,
     );
@@ -419,6 +457,14 @@ fn parse_data_raw_inner(
     validate_fuel_references(&parsed_fuels, &commodity_ids, &mut diagnostics);
     let fuels = parsed_fuels.into_iter().map(|parsed| parsed.fuel).collect();
     let recipes = parse_recipe_collection(raw.recipe, &commodity_ids, &mut diagnostics, locale);
+    let rocket_silo_requirements =
+        parse_rocket_silo_collection(raw.rocket_silo, &recipes, &mut diagnostics);
+    let rocket_launch_sources = parse_rocket_launch_sources(
+        rocket_launch_items,
+        rocket_silo_requirements.as_ref(),
+        &commodity_ids,
+        &mut diagnostics,
+    );
     let resource_sources =
         parse_resource_collection(raw.resource, &commodity_ids, &mut diagnostics);
     let fluid_property_map = fluid_properties
@@ -457,6 +503,7 @@ fn parse_data_raw_inner(
         recipes,
         resource_sources,
         fluid_sources,
+        rocket_launch_sources,
         machines,
         modules,
         fuels,
@@ -538,13 +585,6 @@ impl CommodityKind {
             Self::Fluid => FluidId::new(name).map(CommodityId::Fluid),
         }
     }
-
-    const fn locale_kind(self) -> LocalePrototypeKind {
-        match self {
-            Self::Item => LocalePrototypeKind::Item,
-            Self::Fluid => LocalePrototypeKind::Fluid,
-        }
-    }
 }
 
 struct ParsedFuel {
@@ -552,10 +592,22 @@ struct ParsedFuel {
     prototype_type: &'static str,
 }
 
+struct ParsedRocketLaunchItem {
+    prototype_type: &'static str,
+    id: String,
+    products: Value,
+}
+
+struct RocketSiloRequirements {
+    rocket_recipe: RecipeId,
+    rocket_parts_required: Positive,
+}
+
 fn parse_item_collection(
     collection: Option<Value>,
     commodities: &mut Vec<Commodity>,
     fuels: &mut Vec<ParsedFuel>,
+    rocket_launch_items: &mut Vec<ParsedRocketLaunchItem>,
     diagnostics: &mut Vec<ImportDiagnostic>,
     locale: Option<&PrototypeLocale>,
 ) {
@@ -618,6 +670,13 @@ fn parse_item_collection(
             commodities.push(Commodity::new(CommodityId::Item(item_id), localized_name));
             if let Some(fuel) = fuel {
                 fuels.push(fuel);
+            }
+            if let Some(products) = fields.get("rocket_launch_products") {
+                rocket_launch_items.push(ParsedRocketLaunchItem {
+                    prototype_type: "item",
+                    id,
+                    products: products.clone(),
+                });
             }
         }
     }
@@ -1198,66 +1257,6 @@ fn parse_belt(
     )
 }
 
-fn parse_commodity_collection(
-    collection_name: &str,
-    collection: Option<Value>,
-    kind: CommodityKind,
-    commodities: &mut Vec<Commodity>,
-    diagnostics: &mut Vec<ImportDiagnostic>,
-    locale: Option<&PrototypeLocale>,
-) {
-    let Some(collection) = collection else {
-        return;
-    };
-    let Value::Object(prototypes) = collection else {
-        diagnostics.push(error_diagnostic(
-            Some(collection_name),
-            None,
-            format!("/{collection_name}"),
-            "prototype collection must be a JSON object",
-        ));
-        return;
-    };
-
-    for (id, prototype) in prototypes {
-        let prototype_path = format!("/{collection_name}/{}", pointer_segment(&id));
-        let Value::Object(fields) = prototype else {
-            diagnostics.push(error_diagnostic(
-                Some(collection_name),
-                Some(&id),
-                prototype_path,
-                "prototype must be a JSON object",
-            ));
-            continue;
-        };
-
-        let initial_errors = diagnostics.len();
-        validate_prototype_identity(&fields, collection_name, &id, &prototype_path, diagnostics);
-
-        let commodity_id = match kind.id(id.clone()) {
-            Ok(id) => Some(id),
-            Err(error) => {
-                diagnostics.push(error_diagnostic(
-                    Some(collection_name),
-                    Some(&id),
-                    format!("{prototype_path}/name"),
-                    error.to_string(),
-                ));
-                None
-            }
-        };
-
-        if diagnostics.len() == initial_errors
-            && let Some(commodity_id) = commodity_id
-        {
-            commodities.push(Commodity::new(
-                commodity_id,
-                locale_name(locale, kind.locale_kind(), &id),
-            ));
-        }
-    }
-}
-
 fn parse_fluid_collection(
     collection: Option<Value>,
     commodities: &mut Vec<Commodity>,
@@ -1401,20 +1400,70 @@ fn parse_fluid_heat_capacity(
 }
 
 fn parse_item_like_collection(
-    collection_name: &str,
+    collection_name: &'static str,
     collection: Option<Value>,
     commodities: &mut Vec<Commodity>,
+    rocket_launch_items: &mut Vec<ParsedRocketLaunchItem>,
     diagnostics: &mut Vec<ImportDiagnostic>,
     locale: Option<&PrototypeLocale>,
 ) {
-    parse_commodity_collection(
-        collection_name,
-        collection,
-        CommodityKind::Item,
-        commodities,
-        diagnostics,
-        locale,
-    );
+    let Some(collection) = collection else {
+        return;
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some(collection_name),
+            None,
+            format!("/{collection_name}"),
+            "prototype collection must be a JSON object",
+        ));
+        return;
+    };
+
+    for (id, prototype) in prototypes {
+        let prototype_path = format!("/{collection_name}/{}", pointer_segment(&id));
+        let Value::Object(fields) = prototype else {
+            diagnostics.push(error_diagnostic(
+                Some(collection_name),
+                Some(&id),
+                prototype_path,
+                "prototype must be a JSON object",
+            ));
+            continue;
+        };
+
+        let initial_errors = diagnostics.len();
+        validate_prototype_identity(&fields, collection_name, &id, &prototype_path, diagnostics);
+
+        let item_id = match ItemId::new(id.clone()) {
+            Ok(id) => Some(id),
+            Err(error) => {
+                diagnostics.push(error_diagnostic(
+                    Some(collection_name),
+                    Some(&id),
+                    format!("{prototype_path}/name"),
+                    error.to_string(),
+                ));
+                None
+            }
+        };
+
+        if diagnostics.len() == initial_errors
+            && let Some(item_id) = item_id
+        {
+            commodities.push(Commodity::new(
+                CommodityId::Item(item_id),
+                locale_name(locale, LocalePrototypeKind::Item, &id),
+            ));
+            if let Some(products) = fields.get("rocket_launch_products") {
+                rocket_launch_items.push(ParsedRocketLaunchItem {
+                    prototype_type: collection_name,
+                    id,
+                    products: products.clone(),
+                });
+            }
+        }
+    }
 }
 
 fn parse_recipe_collection(
@@ -1445,6 +1494,250 @@ fn parse_recipe_collection(
             parse_recipe(&id, prototype, commodities, diagnostics, locale)
         })
         .collect()
+}
+
+fn parse_rocket_silo_collection(
+    collection: Option<Value>,
+    recipes: &[Recipe],
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<RocketSiloRequirements> {
+    let Some(collection) = collection else {
+        return None;
+    };
+    let Value::Object(prototypes) = collection else {
+        diagnostics.push(error_diagnostic(
+            Some("rocket-silo"),
+            None,
+            "/rocket-silo".into(),
+            "prototype collection must be a JSON object",
+        ));
+        return None;
+    };
+    let recipe_ids = recipes
+        .iter()
+        .map(|recipe| recipe.id().clone())
+        .collect::<BTreeSet<_>>();
+
+    prototypes
+        .into_iter()
+        .filter_map(|(id, prototype)| parse_rocket_silo(&id, prototype, &recipe_ids, diagnostics))
+        .min_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, requirements)| requirements)
+}
+
+fn parse_rocket_silo(
+    id: &str,
+    prototype: Value,
+    recipe_ids: &BTreeSet<RecipeId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<(String, RocketSiloRequirements)> {
+    let prototype_path = format!("/rocket-silo/{}", pointer_segment(id));
+    let Value::Object(fields) = prototype else {
+        diagnostics.push(error_diagnostic(
+            Some("rocket-silo"),
+            Some(id),
+            prototype_path,
+            "prototype must be a JSON object",
+        ));
+        return None;
+    };
+    let initial_errors = error_count(diagnostics);
+    validate_prototype_identity(&fields, "rocket-silo", id, &prototype_path, diagnostics);
+    let rocket_recipe =
+        parse_rocket_silo_fixed_recipe(&fields, id, &prototype_path, recipe_ids, diagnostics);
+    let rocket_parts_required = parse_positive_number_field(
+        &fields,
+        "rocket_parts_required",
+        "rocket-silo",
+        id,
+        &prototype_path,
+        diagnostics,
+    );
+    if error_count(diagnostics) == initial_errors {
+        Some((
+            id.to_owned(),
+            RocketSiloRequirements {
+                rocket_recipe: rocket_recipe?,
+                rocket_parts_required: rocket_parts_required?,
+            },
+        ))
+    } else {
+        None
+    }
+}
+
+fn parse_rocket_silo_fixed_recipe(
+    fields: &Map<String, Value>,
+    silo_id: &str,
+    prototype_path: &str,
+    recipe_ids: &BTreeSet<RecipeId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<RecipeId> {
+    let path = format!("{prototype_path}/fixed_recipe");
+    let Some(value) = fields.get("fixed_recipe") else {
+        prototype_error(
+            diagnostics,
+            "rocket-silo",
+            silo_id,
+            path,
+            "missing required fixed_recipe",
+        );
+        return None;
+    };
+    let Value::String(recipe) = value else {
+        prototype_error(
+            diagnostics,
+            "rocket-silo",
+            silo_id,
+            path,
+            "fixed_recipe must be a string",
+        );
+        return None;
+    };
+    let recipe_id = RecipeId::new(recipe.clone()).map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                "rocket-silo",
+                silo_id,
+                path.clone(),
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )?;
+    if !recipe_ids.contains(&recipe_id) {
+        prototype_error(
+            diagnostics,
+            "rocket-silo",
+            silo_id,
+            path,
+            format!("references missing recipe {recipe:?}"),
+        );
+        return None;
+    }
+    Some(recipe_id)
+}
+
+fn parse_rocket_launch_sources(
+    launch_items: Vec<ParsedRocketLaunchItem>,
+    silo: Option<&RocketSiloRequirements>,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<RocketLaunchSource> {
+    launch_items
+        .into_iter()
+        .filter_map(|launch_item| {
+            parse_rocket_launch_source(launch_item, silo, commodities, diagnostics)
+        })
+        .collect()
+}
+
+fn parse_rocket_launch_source(
+    launch_item: ParsedRocketLaunchItem,
+    silo: Option<&RocketSiloRequirements>,
+    commodities: &BTreeSet<CommodityId>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Option<RocketLaunchSource> {
+    let prototype_path = format!(
+        "/{}/{}",
+        launch_item.prototype_type,
+        pointer_segment(&launch_item.id)
+    );
+    let Some(silo) = silo else {
+        diagnostics.push(warning_diagnostic(
+            launch_item.prototype_type,
+            &launch_item.id,
+            format!("{prototype_path}/rocket_launch_products"),
+            "rocket launch source is unsupported because no supported rocket silo requirements were imported",
+        ));
+        return None;
+    };
+    let Value::Array(entries) = &launch_item.products else {
+        prototype_error(
+            diagnostics,
+            launch_item.prototype_type,
+            &launch_item.id,
+            format!("{prototype_path}/rocket_launch_products"),
+            "rocket_launch_products must be an array",
+        );
+        return None;
+    };
+    if entries.is_empty() {
+        prototype_error(
+            diagnostics,
+            launch_item.prototype_type,
+            &launch_item.id,
+            format!("{prototype_path}/rocket_launch_products"),
+            "rocket_launch_products must contain at least one product",
+        );
+        return None;
+    }
+
+    let initial_errors = error_count(diagnostics);
+    let mut products: Vec<Product> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = format!("{prototype_path}/rocket_launch_products/{index}");
+        let entry_errors = error_count(diagnostics);
+        let parsed = parse_product_entry(
+            entry,
+            &launch_item.id,
+            &entry_path,
+            commodities,
+            diagnostics,
+        );
+        if error_count(diagnostics) == entry_errors
+            && let Some((commodity, expected_amount, _)) = parsed
+        {
+            match Positive::new(expected_amount) {
+                Ok(amount) => products.push(Product::new(commodity, amount)),
+                Err(error) => prototype_error(
+                    diagnostics,
+                    launch_item.prototype_type,
+                    &launch_item.id,
+                    entry_path,
+                    format!("expected output {error}"),
+                ),
+            }
+        }
+    }
+    if error_count(diagnostics) != initial_errors {
+        return None;
+    }
+
+    RocketLaunchSource::new(
+        RocketLaunchSourceId::new(launch_item.id.clone()).map_or_else(
+            |error| {
+                prototype_error(
+                    diagnostics,
+                    launch_item.prototype_type,
+                    &launch_item.id,
+                    format!("{prototype_path}/name"),
+                    error.to_string(),
+                );
+                None
+            },
+            Some,
+        )?,
+        ItemId::new(launch_item.id.clone()).expect("validated item IDs can be reused"),
+        products,
+        silo.rocket_recipe.clone(),
+        silo.rocket_parts_required,
+    )
+    .map_or_else(
+        |error| {
+            prototype_error(
+                diagnostics,
+                launch_item.prototype_type,
+                &launch_item.id,
+                prototype_path,
+                error.to_string(),
+            );
+            None
+        },
+        Some,
+    )
 }
 
 fn parse_resource_collection(

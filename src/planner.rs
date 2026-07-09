@@ -6,7 +6,7 @@ use crate::catalog::{
     BeltId, Catalog, CommodityId, Finite, FluidSource, Fuel, FuelCategory, FuelId, ItemId, Machine,
     MachineEnergySource, MachineId, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
     ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceSource, ResourceSourceId,
-    UnsupportedEnergySource,
+    RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -879,6 +879,9 @@ impl<'a> Calculation<'a> {
             ProductionSource::Fluid(fluid_source_id) => {
                 self.expand_fluid_source(commodity, required_rate, fluid_source_id)
             }
+            ProductionSource::RocketLaunch(rocket_launch_id) => {
+                self.expand_rocket_launch(commodity, required_rate, rocket_launch_id)
+            }
         }
     }
 
@@ -1083,6 +1086,61 @@ impl<'a> Calculation<'a> {
                 &CommodityId::Item(fuel_rate.fuel_item().clone()),
                 fuel_rate.rate_per_second(),
             )?;
+        }
+        Ok(())
+    }
+
+    fn expand_rocket_launch(
+        &mut self,
+        commodity: &CommodityId,
+        required_rate: Positive,
+        rocket_launch_id: RocketLaunchSourceId,
+    ) -> Result<(), PlannerError> {
+        let source = self
+            .catalog
+            .rocket_launch_source(&rocket_launch_id)
+            .expect("resolved rocket launch source IDs must remain present in the catalog");
+        let product_amount = source
+            .products()
+            .iter()
+            .filter(|product| product.commodity() == commodity)
+            .map(|product| product.amount().get())
+            .sum::<f64>();
+        let launch_rate = checked_positive(
+            required_rate.get() / product_amount,
+            "rocket launch rate per second",
+        )?;
+        let rocket_recipe = self
+            .catalog
+            .recipe(source.rocket_recipe())
+            .expect("validated rocket launch recipes must remain present in the catalog");
+        let rocket_part = recipe_planning_product(rocket_recipe)?;
+        let ingredients = vec![
+            CommodityRate {
+                commodity: CommodityId::Item(source.launched_item().clone()),
+                rate: launch_rate,
+            },
+            CommodityRate {
+                commodity: rocket_part.clone(),
+                rate: checked_positive(
+                    launch_rate.get() * source.rocket_parts_required().get(),
+                    "rocket part rate per second",
+                )?,
+            },
+        ];
+        let products = aggregate_rocket_launch_products(source, launch_rate)?;
+
+        self.add_extraction_step(
+            commodity,
+            &ProductionSource::RocketLaunch(rocket_launch_id.clone()),
+            required_rate,
+            launch_rate,
+            &ingredients,
+            &products,
+        )?;
+
+        for ingredient in ingredients {
+            self.expand(ingredient.commodity(), ingredient.rate())?;
         }
         Ok(())
     }
@@ -1456,6 +1514,18 @@ impl<'a> SourceResolver<'a> {
                     dependencies.push(CommodityId::Item(fuel.item().clone()));
                 }
             }
+            ProductionSource::RocketLaunch(rocket_launch_id) => {
+                let source = self
+                    .catalog
+                    .rocket_launch_source(rocket_launch_id)
+                    .expect("selected rocket launch source IDs must remain present in the catalog");
+                let recipe = self
+                    .catalog
+                    .recipe(source.rocket_recipe())
+                    .expect("validated rocket launch recipes must remain present in the catalog");
+                dependencies.push(CommodityId::Item(source.launched_item().clone()));
+                dependencies.push(recipe_planning_product(recipe)?);
+            }
         }
         self.selected_sources.insert(commodity.clone(), source);
 
@@ -1498,17 +1568,18 @@ impl<'a> SourceResolver<'a> {
             return Ok(Some(ProductionSource::Recipe(recipe.id().clone())));
         }
 
-        let fluid_source =
-            self.catalog
-                .sources_for_product(commodity)
-                .iter()
-                .find_map(|source| match source {
-                    ProductionSource::Fluid(source_id) => {
-                        Some(ProductionSource::Fluid(source_id.clone()))
-                    }
-                    ProductionSource::Recipe(_) => None,
-                    ProductionSource::Resource(_) => None,
-                });
+        let fluid_source = self
+            .catalog
+            .sources_for_product(commodity)
+            .iter()
+            .find_map(|source| match source {
+                ProductionSource::Fluid(source_id) => {
+                    Some(ProductionSource::Fluid(source_id.clone()))
+                }
+                ProductionSource::Recipe(_) => None,
+                ProductionSource::Resource(_) => None,
+                ProductionSource::RocketLaunch(_) => None,
+            });
         if fluid_source.is_some() {
             return Ok(fluid_source);
         }
@@ -1523,9 +1594,26 @@ impl<'a> SourceResolver<'a> {
                         Some(ProductionSource::Resource(resource_id.clone()))
                     }
                     ProductionSource::Fluid(_) => None,
+                    ProductionSource::RocketLaunch(_) => None,
                 });
         if resource_source.is_some() {
             return Ok(resource_source);
+        }
+
+        let rocket_launch_source =
+            self.catalog
+                .sources_for_product(commodity)
+                .iter()
+                .find_map(|source| match source {
+                    ProductionSource::RocketLaunch(source_id) => {
+                        Some(ProductionSource::RocketLaunch(source_id.clone()))
+                    }
+                    ProductionSource::Recipe(_)
+                    | ProductionSource::Resource(_)
+                    | ProductionSource::Fluid(_) => None,
+                });
+        if rocket_launch_source.is_some() {
+            return Ok(rocket_launch_source);
         }
 
         if let Some(recipe) = self
@@ -1534,7 +1622,9 @@ impl<'a> SourceResolver<'a> {
             .iter()
             .filter_map(|source| match source {
                 ProductionSource::Recipe(recipe_id) => self.catalog.recipe(recipe_id),
-                ProductionSource::Resource(_) | ProductionSource::Fluid(_) => None,
+                ProductionSource::Resource(_)
+                | ProductionSource::Fluid(_)
+                | ProductionSource::RocketLaunch(_) => None,
             })
             .filter(|recipe| recipe.supported())
             .min_by(|left, right| {
@@ -2002,6 +2092,49 @@ fn aggregate_fluid_source_products(
         .collect()
 }
 
+fn aggregate_rocket_launch_products(
+    source: &RocketLaunchSource,
+    launch_rate: Positive,
+) -> Result<Vec<CommodityRate>, PlannerError> {
+    let mut products = BTreeMap::<CommodityId, f64>::new();
+    for product in source.products() {
+        let rate = checked_positive(
+            launch_rate.get() * product.amount().get(),
+            "rocket launch product rate per second",
+        )?;
+        let total = products.entry(product.commodity().clone()).or_default();
+        *total += rate.get();
+        checked_positive(*total, "aggregated rocket launch product rate per second")?;
+    }
+    products
+        .into_iter()
+        .map(|(commodity, rate)| {
+            checked_positive(rate, "aggregated rocket launch product rate per second")
+                .map(|rate| CommodityRate { commodity, rate })
+        })
+        .collect()
+}
+
+fn recipe_planning_product(recipe: &Recipe) -> Result<CommodityId, PlannerError> {
+    if let Some(main_product) = recipe.main_product() {
+        return Ok(main_product.clone());
+    }
+    let mut products = recipe.products().iter().map(|product| product.commodity());
+    let Some(product) = products.next() else {
+        return Err(PlannerError::UnsupportedRecipeChoice {
+            commodity: CommodityId::Item(ItemId::new("rocket-part").expect("valid item id")),
+            recipe: recipe.id().clone(),
+        });
+    };
+    if products.next().is_some() {
+        return Err(PlannerError::UnsupportedRecipeChoice {
+            commodity: product.clone(),
+            recipe: recipe.id().clone(),
+        });
+    }
+    Ok(product.clone())
+}
+
 struct ModuleConfiguration {
     modules: Vec<ModuleId>,
     speed_multiplier: Positive,
@@ -2205,6 +2338,13 @@ fn build_dependency_node(
             edge_kind,
             fluid_source_id,
         ),
+        ProductionSource::RocketLaunch(rocket_launch_id) => build_rocket_launch_dependency_node(
+            context,
+            commodity,
+            required_rate,
+            edge_kind,
+            rocket_launch_id,
+        ),
     }
 }
 
@@ -2384,6 +2524,66 @@ fn build_fluid_source_dependency_node(
             DependencyEdgeKind::Fuel,
         )?);
     }
+
+    Ok(DependencyNode {
+        commodity: commodity.clone(),
+        required_rate,
+        kind: match edge_kind {
+            DependencyEdgeKind::Normal => DependencyNodeKind::Production,
+            DependencyEdgeKind::Fuel => DependencyNodeKind::FuelInput,
+        },
+        recipe: None,
+        machine: None,
+        fractional_machine_count: None,
+        installed_machine_count: None,
+        shared: false,
+        children,
+    })
+}
+
+fn build_rocket_launch_dependency_node(
+    context: &DependencyBuildContext<'_>,
+    commodity: &CommodityId,
+    required_rate: Positive,
+    edge_kind: DependencyEdgeKind,
+    source_id: &RocketLaunchSourceId,
+) -> Result<DependencyNode, PlannerError> {
+    let source = context
+        .catalog
+        .rocket_launch_source(source_id)
+        .expect("resolved rocket launch source IDs must remain present in the catalog");
+    let product_amount = source
+        .products()
+        .iter()
+        .filter(|product| product.commodity() == commodity)
+        .map(|product| product.amount().get())
+        .sum::<f64>();
+    let launch_rate = checked_positive(
+        required_rate.get() / product_amount,
+        "dependency tree rocket launch rate per second",
+    )?;
+    let rocket_recipe = context
+        .catalog
+        .recipe(source.rocket_recipe())
+        .expect("validated rocket launch recipes must remain present in the catalog");
+    let rocket_part = recipe_planning_product(rocket_recipe)?;
+    let children = vec![
+        build_dependency_node(
+            context,
+            &CommodityId::Item(source.launched_item().clone()),
+            launch_rate,
+            DependencyEdgeKind::Normal,
+        )?,
+        build_dependency_node(
+            context,
+            &rocket_part,
+            checked_positive(
+                launch_rate.get() * source.rocket_parts_required().get(),
+                "dependency tree rocket part rate per second",
+            )?,
+            DependencyEdgeKind::Normal,
+        )?,
+    ];
 
     Ok(DependencyNode {
         commodity: commodity.clone(),

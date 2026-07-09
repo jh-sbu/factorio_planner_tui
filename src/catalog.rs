@@ -53,6 +53,7 @@ string_id!(DatasetFingerprint);
 string_id!(RecipeCategory);
 string_id!(ResourceSourceId);
 string_id!(FluidSourceId);
+string_id!(RocketLaunchSourceId);
 string_id!(ResourceCategory);
 string_id!(ModuleCategory);
 string_id!(FuelCategory);
@@ -62,6 +63,7 @@ pub enum ProductionSource {
     Recipe(RecipeId),
     Resource(ResourceSourceId),
     Fluid(FluidSourceId),
+    RocketLaunch(RocketLaunchSourceId),
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -851,6 +853,15 @@ pub struct FluidSource {
     energy_usage: Option<Positive>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RocketLaunchSource {
+    id: RocketLaunchSourceId,
+    launched_item: ItemId,
+    products: Vec<Product>,
+    rocket_recipe: RecipeId,
+    rocket_parts_required: Positive,
+}
+
 impl FluidSource {
     /// Creates a normalized non-recipe fluid source.
     ///
@@ -911,6 +922,58 @@ impl FluidSource {
     #[must_use]
     pub const fn energy_usage(&self) -> Option<Positive> {
         self.energy_usage
+    }
+}
+
+impl RocketLaunchSource {
+    /// Creates a normalized rocket launch source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordError::RocketLaunchHasNoProducts`] when no launch
+    /// product is supplied.
+    pub fn new(
+        id: RocketLaunchSourceId,
+        launched_item: ItemId,
+        products: Vec<Product>,
+        rocket_recipe: RecipeId,
+        rocket_parts_required: Positive,
+    ) -> Result<Self, RecordError> {
+        if products.is_empty() {
+            return Err(RecordError::RocketLaunchHasNoProducts { rocket_launch: id });
+        }
+        Ok(Self {
+            id,
+            launched_item,
+            products,
+            rocket_recipe,
+            rocket_parts_required,
+        })
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &RocketLaunchSourceId {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn launched_item(&self) -> &ItemId {
+        &self.launched_item
+    }
+
+    #[must_use]
+    pub fn products(&self) -> &[Product] {
+        &self.products
+    }
+
+    #[must_use]
+    pub const fn rocket_recipe(&self) -> &RecipeId {
+        &self.rocket_recipe
+    }
+
+    #[must_use]
+    pub const fn rocket_parts_required(&self) -> Positive {
+        self.rocket_parts_required
     }
 }
 
@@ -999,6 +1062,8 @@ pub enum RecordError {
         "fluid source {fluid_source} must supply both energy source and energy usage or neither"
     )]
     FluidSourceEnergyMismatch { fluid_source: FluidSourceId },
+    #[error("rocket launch source {rocket_launch} has no products")]
+    RocketLaunchHasNoProducts { rocket_launch: RocketLaunchSourceId },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1008,6 +1073,7 @@ pub struct CatalogParts {
     pub recipes: Vec<Recipe>,
     pub resource_sources: Vec<ResourceSource>,
     pub fluid_sources: Vec<FluidSource>,
+    pub rocket_launch_sources: Vec<RocketLaunchSource>,
     pub machines: Vec<Machine>,
     pub modules: Vec<Module>,
     pub fuels: Vec<Fuel>,
@@ -1021,6 +1087,7 @@ pub struct Catalog {
     recipes: BTreeMap<RecipeId, Recipe>,
     resource_sources: BTreeMap<ResourceSourceId, ResourceSource>,
     fluid_sources: BTreeMap<FluidSourceId, FluidSource>,
+    rocket_launch_sources: BTreeMap<RocketLaunchSourceId, RocketLaunchSource>,
     machines: BTreeMap<MachineId, Machine>,
     modules: BTreeMap<ModuleId, Module>,
     fuels: BTreeMap<FuelId, Fuel>,
@@ -1054,6 +1121,10 @@ impl Catalog {
         let fluid_sources = collect_unique(parts.fluid_sources, FluidSource::id, |id| {
             CatalogError::DuplicateFluidSource { id }
         })?;
+        let rocket_launch_sources =
+            collect_unique(parts.rocket_launch_sources, RocketLaunchSource::id, |id| {
+                CatalogError::DuplicateRocketLaunchSource { id }
+            })?;
         let machines = collect_unique(parts.machines, Machine::id, |id| {
             CatalogError::DuplicateMachine { id }
         })?;
@@ -1073,6 +1144,7 @@ impl Catalog {
             &recipes,
             &resource_sources,
             &fluid_sources,
+            &rocket_launch_sources,
             &fuels,
         )?;
 
@@ -1117,6 +1189,17 @@ impl Catalog {
                 }
             }
         }
+        for (rocket_launch_id, rocket_launch) in &rocket_launch_sources {
+            for product in rocket_launch.products() {
+                let sources = sources_by_product
+                    .entry(product.commodity().clone())
+                    .or_default();
+                let source = ProductionSource::RocketLaunch(rocket_launch_id.clone());
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+        }
 
         let mut machines_by_category: BTreeMap<RecipeCategory, Vec<MachineId>> = BTreeMap::new();
         for (machine_id, machine) in &machines {
@@ -1134,6 +1217,7 @@ impl Catalog {
             recipes,
             resource_sources,
             fluid_sources,
+            rocket_launch_sources,
             machines,
             modules,
             fuels,
@@ -1167,6 +1251,11 @@ impl Catalog {
     #[must_use]
     pub fn fluid_source(&self, id: &FluidSourceId) -> Option<&FluidSource> {
         self.fluid_sources.get(id)
+    }
+
+    #[must_use]
+    pub fn rocket_launch_source(&self, id: &RocketLaunchSourceId) -> Option<&RocketLaunchSource> {
+        self.rocket_launch_sources.get(id)
     }
 
     #[must_use]
@@ -1229,6 +1318,11 @@ impl Catalog {
     #[must_use]
     pub fn fluid_sources(&self) -> impl ExactSizeIterator<Item = &FluidSource> {
         self.fluid_sources.values()
+    }
+
+    #[must_use]
+    pub fn rocket_launch_sources(&self) -> impl ExactSizeIterator<Item = &RocketLaunchSource> {
+        self.rocket_launch_sources.values()
     }
 
     #[must_use]
@@ -1340,6 +1434,7 @@ fn validate_references(
     recipes: &BTreeMap<RecipeId, Recipe>,
     resource_sources: &BTreeMap<ResourceSourceId, ResourceSource>,
     fluid_sources: &BTreeMap<FluidSourceId, FluidSource>,
+    rocket_launch_sources: &BTreeMap<RocketLaunchSourceId, RocketLaunchSource>,
     fuels: &BTreeMap<FuelId, Fuel>,
 ) -> Result<(), CatalogError> {
     for fluid_id in fluid_properties.keys() {
@@ -1420,6 +1515,35 @@ fn validate_references(
         }
     }
 
+    for (rocket_launch_id, source) in rocket_launch_sources {
+        if !commodities.contains_key(&CommodityId::Item(source.launched_item().clone())) {
+            return Err(CatalogError::MissingRocketLaunchItem {
+                rocket_launch: rocket_launch_id.clone(),
+                item: source.launched_item().clone(),
+            });
+        }
+        for product in source.products() {
+            if !commodities.contains_key(product.commodity()) {
+                return Err(CatalogError::MissingRocketLaunchProduct {
+                    rocket_launch: rocket_launch_id.clone(),
+                    commodity: product.commodity().clone(),
+                });
+            }
+        }
+        let recipe = recipes.get(source.rocket_recipe()).ok_or_else(|| {
+            CatalogError::MissingRocketLaunchRecipe {
+                rocket_launch: rocket_launch_id.clone(),
+                recipe: source.rocket_recipe().clone(),
+            }
+        })?;
+        if !recipe.supported() {
+            return Err(CatalogError::UnsupportedRocketLaunchRecipe {
+                rocket_launch: rocket_launch_id.clone(),
+                recipe: source.rocket_recipe().clone(),
+            });
+        }
+    }
+
     for (fuel_id, fuel) in fuels {
         if !commodities.contains_key(&CommodityId::Item(fuel.item().clone())) {
             return Err(CatalogError::MissingFuelItem {
@@ -1451,6 +1575,8 @@ pub enum CatalogError {
     DuplicateResourceSource { id: ResourceSourceId },
     #[error("duplicate fluid source ID {id}")]
     DuplicateFluidSource { id: FluidSourceId },
+    #[error("duplicate rocket launch source ID {id}")]
+    DuplicateRocketLaunchSource { id: RocketLaunchSourceId },
     #[error("duplicate machine ID {id}")]
     DuplicateMachine { id: MachineId },
     #[error("duplicate module ID {id}")]
@@ -1495,6 +1621,26 @@ pub enum CatalogError {
     MissingFluidSourceFuelCategory {
         fluid_source: FluidSourceId,
         category: FuelCategory,
+    },
+    #[error("rocket launch source {rocket_launch} references missing launch item {item}")]
+    MissingRocketLaunchItem {
+        rocket_launch: RocketLaunchSourceId,
+        item: ItemId,
+    },
+    #[error("rocket launch source {rocket_launch} references missing product {commodity}")]
+    MissingRocketLaunchProduct {
+        rocket_launch: RocketLaunchSourceId,
+        commodity: CommodityId,
+    },
+    #[error("rocket launch source {rocket_launch} references missing rocket recipe {recipe}")]
+    MissingRocketLaunchRecipe {
+        rocket_launch: RocketLaunchSourceId,
+        recipe: RecipeId,
+    },
+    #[error("rocket launch source {rocket_launch} references unsupported rocket recipe {recipe}")]
+    UnsupportedRocketLaunchRecipe {
+        rocket_launch: RocketLaunchSourceId,
+        recipe: RecipeId,
     },
     #[error("fuel {fuel} references missing item {item}")]
     MissingFuelItem { fuel: FuelId, item: ItemId },

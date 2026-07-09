@@ -3,7 +3,7 @@ use factorio_planner_tui::catalog::{
     Finite, FluidId, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine, MachineEnergySource,
     MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
     Product, ProductionSource, Recipe, RecipeCategory, RecipeId, RecordError, ResourceCategory,
-    ResourceSource, ResourceSourceId,
+    ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
 };
 
 fn item(name: &str) -> ItemId {
@@ -20,6 +20,10 @@ fn machine_id(name: &str) -> MachineId {
 
 fn resource_id(name: &str) -> ResourceSourceId {
     ResourceSourceId::new(name).expect("test resource source ID should be valid")
+}
+
+fn rocket_launch_id(name: &str) -> RocketLaunchSourceId {
+    RocketLaunchSourceId::new(name).expect("test rocket launch source ID should be valid")
 }
 
 fn positive(value: f64) -> Positive {
@@ -618,6 +622,56 @@ fn resource_sources_are_indexed_as_production_sources() {
         &[ProductionSource::Resource(resource_id("iron-ore"))]
     );
     assert!(catalog.resource_source(&resource_id("iron-ore")).is_some());
+}
+
+#[test]
+fn rocket_launch_sources_are_indexed_as_production_sources() {
+    let satellite = CommodityId::Item(item("satellite"));
+    let science = CommodityId::Item(item("space-science-pack"));
+    let rocket_part = CommodityId::Item(item("rocket-part"));
+    let crafting = RecipeCategory::new("rocket-building").unwrap();
+    let rocket_recipe = Recipe::new(
+        recipe_id("rocket-part"),
+        crafting,
+        positive(3.0),
+        vec![],
+        vec![Product::new(rocket_part.clone(), positive(1.0))],
+        Some(rocket_part.clone()),
+        true,
+    )
+    .unwrap();
+    let source = RocketLaunchSource::new(
+        rocket_launch_id("satellite"),
+        item("satellite"),
+        vec![Product::new(science.clone(), positive(1000.0))],
+        recipe_id("rocket-part"),
+        positive(100.0),
+    )
+    .unwrap();
+
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: vec![
+            Commodity::new(satellite, None),
+            Commodity::new(science.clone(), None),
+            Commodity::new(rocket_part, None),
+        ],
+        recipes: vec![rocket_recipe],
+        rocket_launch_sources: vec![source],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+
+    assert_eq!(
+        catalog.sources_for_product(&science),
+        &[ProductionSource::RocketLaunch(rocket_launch_id(
+            "satellite"
+        ))]
+    );
+    assert!(
+        catalog
+            .rocket_launch_source(&rocket_launch_id("satellite"))
+            .is_some()
+    );
 }
 
 #[test]

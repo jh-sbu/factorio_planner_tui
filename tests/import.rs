@@ -3,7 +3,8 @@ use std::io::Cursor;
 use factorio_planner_tui::catalog::{
     BeltId, CommodityId, FluidId, FluidSourceId, FluidSourceKind, FuelCategory, FuelId, ItemId,
     MachineEnergySource, MachineId, ModuleCategory, ModuleEffect, ModuleId, Positive,
-    ProductionSource, RecipeCategory, RecipeId, ResourceSourceId, UnsupportedEnergySource,
+    ProductionSource, RecipeCategory, RecipeId, ResourceSourceId, RocketLaunchSourceId,
+    UnsupportedEnergySource,
 };
 use factorio_planner_tui::import::{
     DiagnosticSeverity, ImportError, PrototypeDisposition, parse_data_raw,
@@ -1562,6 +1563,92 @@ fn imports_offshore_pumps_and_burner_boiler_fluid_sources() {
         boiler.energy_source(),
         Some(MachineEnergySource::Burner { .. })
     ));
+}
+
+#[test]
+fn imports_rocket_launch_sources_from_items_and_rocket_silos() {
+    let report = import(
+        r#"{
+            "item": {
+                "satellite": {
+                    "type": "item",
+                    "name": "satellite",
+                    "rocket_launch_products": [
+                        {"type": "item", "name": "space-science-pack", "amount": 1000}
+                    ]
+                },
+                "space-science-pack": {"type": "item", "name": "space-science-pack"},
+                "rocket-part": {"type": "item", "name": "rocket-part"}
+            },
+            "recipe": {
+                "rocket-part": {
+                    "type": "recipe",
+                    "name": "rocket-part",
+                    "results": [{"type": "item", "name": "rocket-part", "amount": 1}]
+                }
+            },
+            "rocket-silo": {
+                "rocket-silo": {
+                    "type": "rocket-silo",
+                    "name": "rocket-silo",
+                    "fixed_recipe": "rocket-part",
+                    "rocket_parts_required": 100
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let catalog = report.catalog();
+
+    assert!(report.diagnostics().is_empty());
+    assert_eq!(
+        catalog.sources_for_product(&item("space-science-pack")),
+        &[ProductionSource::RocketLaunch(
+            RocketLaunchSourceId::new("satellite").unwrap()
+        )]
+    );
+    let source = catalog
+        .rocket_launch_source(&RocketLaunchSourceId::new("satellite").unwrap())
+        .unwrap();
+    assert_eq!(source.launched_item(), &ItemId::new("satellite").unwrap());
+    assert_close(source.products()[0].amount().get(), 1000.0);
+    assert_eq!(
+        source.rocket_recipe(),
+        &RecipeId::new("rocket-part").unwrap()
+    );
+    assert_close(source.rocket_parts_required().get(), 100.0);
+}
+
+#[test]
+fn warns_and_skips_rocket_launch_sources_without_supported_silo_data() {
+    let report = import(
+        r#"{
+            "item": {
+                "satellite": {
+                    "type": "item",
+                    "name": "satellite",
+                    "rocket_launch_products": [
+                        {"type": "item", "name": "space-science-pack", "amount": 1000}
+                    ]
+                },
+                "space-science-pack": {"type": "item", "name": "space-science-pack"}
+            }
+        }"#,
+    )
+    .unwrap();
+
+    assert!(
+        report
+            .catalog()
+            .sources_for_product(&item("space-science-pack"))
+            .is_empty()
+    );
+    assert!(report.diagnostics().iter().any(|diagnostic| {
+        diagnostic.severity == DiagnosticSeverity::Warning
+            && diagnostic.prototype_type.as_deref() == Some("item")
+            && diagnostic.prototype_id.as_deref() == Some("satellite")
+            && diagnostic.message.contains("no supported rocket silo")
+    }));
 }
 
 #[test]
