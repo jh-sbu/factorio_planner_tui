@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::catalog::{
     BeltId, Catalog, CommodityId, Finite, FluidSource, Fuel, FuelCategory, FuelId, ItemId, Machine,
     MachineEnergySource, MachineId, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
-    ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceSource, ResourceSourceId,
+    Product, ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceSource, ResourceSourceId,
     RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
 };
 
@@ -65,6 +65,7 @@ pub struct FactoryPlan {
     targets: Vec<Target>,
     external_inputs: BTreeSet<CommodityId>,
     recipe_choices: BTreeMap<CommodityId, RecipeId>,
+    source_choices: BTreeMap<CommodityId, ProductionSource>,
     machine_choices: BTreeMap<RecipeId, MachineId>,
     module_choices: BTreeMap<CommodityId, Vec<ModuleId>>,
     fuel_choices: BTreeMap<CommodityId, FuelId>,
@@ -79,6 +80,7 @@ impl FactoryPlan {
             targets: vec![target],
             external_inputs: BTreeSet::new(),
             recipe_choices: BTreeMap::new(),
+            source_choices: BTreeMap::new(),
             machine_choices: BTreeMap::new(),
             module_choices: BTreeMap::new(),
             fuel_choices: BTreeMap::new(),
@@ -190,11 +192,27 @@ impl FactoryPlan {
         commodity: CommodityId,
         recipe: RecipeId,
     ) -> Option<RecipeId> {
-        self.recipe_choices.insert(commodity, recipe)
+        match self.set_source_choice(commodity, ProductionSource::Recipe(recipe)) {
+            Some(ProductionSource::Recipe(recipe)) => Some(recipe),
+            Some(
+                ProductionSource::Resource(_)
+                | ProductionSource::Fluid(_)
+                | ProductionSource::RocketLaunch(_),
+            )
+            | None => None,
+        }
     }
 
     pub fn clear_recipe_choice(&mut self, commodity: &CommodityId) -> Option<RecipeId> {
-        self.recipe_choices.remove(commodity)
+        if matches!(
+            self.source_choices.get(commodity),
+            Some(ProductionSource::Recipe(_))
+        ) {
+            self.source_choices.remove(commodity);
+            self.recipe_choices.remove(commodity)
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -205,6 +223,40 @@ impl FactoryPlan {
     #[must_use]
     pub const fn recipe_choices(&self) -> &BTreeMap<CommodityId, RecipeId> {
         &self.recipe_choices
+    }
+
+    pub fn set_source_choice(
+        &mut self,
+        commodity: CommodityId,
+        source: ProductionSource,
+    ) -> Option<ProductionSource> {
+        match &source {
+            ProductionSource::Recipe(recipe) => {
+                self.recipe_choices
+                    .insert(commodity.clone(), recipe.clone());
+            }
+            ProductionSource::Resource(_)
+            | ProductionSource::Fluid(_)
+            | ProductionSource::RocketLaunch(_) => {
+                self.recipe_choices.remove(&commodity);
+            }
+        }
+        self.source_choices.insert(commodity, source)
+    }
+
+    pub fn clear_source_choice(&mut self, commodity: &CommodityId) -> Option<ProductionSource> {
+        self.recipe_choices.remove(commodity);
+        self.source_choices.remove(commodity)
+    }
+
+    #[must_use]
+    pub fn source_choice(&self, commodity: &CommodityId) -> Option<&ProductionSource> {
+        self.source_choices.get(commodity)
+    }
+
+    #[must_use]
+    pub const fn source_choices(&self) -> &BTreeMap<CommodityId, ProductionSource> {
+        &self.source_choices
     }
 
     pub fn set_machine_choice(
@@ -701,6 +753,16 @@ pub enum PlannerError {
     RecipeDoesNotProduceCommodity {
         commodity: CommodityId,
         recipe: RecipeId,
+    },
+    #[error("selected source {selected_source:?} for {commodity} is not present in the catalog")]
+    MissingSourceChoice {
+        commodity: CommodityId,
+        selected_source: ProductionSource,
+    },
+    #[error("selected source {selected_source:?} does not produce {commodity}")]
+    SourceDoesNotProduceCommodity {
+        commodity: CommodityId,
+        selected_source: ProductionSource,
     },
     #[error("recipe {recipe} has no compatible machine for category {category}")]
     NoCompatibleMachine {
@@ -1542,30 +1604,9 @@ impl<'a> SourceResolver<'a> {
         &self,
         commodity: &CommodityId,
     ) -> Result<Option<ProductionSource>, PlannerError> {
-        if let Some(recipe_id) = self.plan.recipe_choice(commodity) {
-            let recipe = self.catalog.recipe(recipe_id).ok_or_else(|| {
-                PlannerError::MissingRecipeChoice {
-                    commodity: commodity.clone(),
-                    recipe: recipe_id.clone(),
-                }
-            })?;
-            if !recipe.supported() {
-                return Err(PlannerError::UnsupportedRecipeChoice {
-                    commodity: commodity.clone(),
-                    recipe: recipe_id.clone(),
-                });
-            }
-            if !recipe
-                .products()
-                .iter()
-                .any(|product| product.commodity() == commodity)
-            {
-                return Err(PlannerError::RecipeDoesNotProduceCommodity {
-                    commodity: commodity.clone(),
-                    recipe: recipe_id.clone(),
-                });
-            }
-            return Ok(Some(ProductionSource::Recipe(recipe.id().clone())));
+        if let Some(source) = self.plan.source_choice(commodity) {
+            self.validate_source_choice(commodity, source)?;
+            return Ok(Some(source.clone()));
         }
 
         let fluid_source = self
@@ -1638,6 +1679,110 @@ impl<'a> SourceResolver<'a> {
 
         Ok(None)
     }
+
+    fn validate_source_choice(
+        &self,
+        commodity: &CommodityId,
+        source: &ProductionSource,
+    ) -> Result<(), PlannerError> {
+        if let ProductionSource::Recipe(recipe_id) = source {
+            return self.validate_recipe_source_choice(commodity, recipe_id);
+        }
+        if !self.source_exists(source) {
+            return Err(PlannerError::MissingSourceChoice {
+                commodity: commodity.clone(),
+                selected_source: source.clone(),
+            });
+        }
+        if !self.source_produces(commodity, source) {
+            return Err(PlannerError::SourceDoesNotProduceCommodity {
+                commodity: commodity.clone(),
+                selected_source: source.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_recipe_source_choice(
+        &self,
+        commodity: &CommodityId,
+        recipe_id: &RecipeId,
+    ) -> Result<(), PlannerError> {
+        let recipe =
+            self.catalog
+                .recipe(recipe_id)
+                .ok_or_else(|| PlannerError::MissingRecipeChoice {
+                    commodity: commodity.clone(),
+                    recipe: recipe_id.clone(),
+                })?;
+        if !recipe.supported() {
+            return Err(PlannerError::UnsupportedRecipeChoice {
+                commodity: commodity.clone(),
+                recipe: recipe_id.clone(),
+            });
+        }
+        if !recipe
+            .products()
+            .iter()
+            .any(|product| product.commodity() == commodity)
+        {
+            return Err(PlannerError::RecipeDoesNotProduceCommodity {
+                commodity: commodity.clone(),
+                recipe: recipe_id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn source_exists(&self, source: &ProductionSource) -> bool {
+        match source {
+            ProductionSource::Recipe(recipe_id) => self.catalog.recipe(recipe_id).is_some(),
+            ProductionSource::Resource(resource_id) => {
+                self.catalog.resource_source(resource_id).is_some()
+            }
+            ProductionSource::Fluid(fluid_source_id) => {
+                self.catalog.fluid_source(fluid_source_id).is_some()
+            }
+            ProductionSource::RocketLaunch(rocket_launch_id) => self
+                .catalog
+                .rocket_launch_source(rocket_launch_id)
+                .is_some(),
+        }
+    }
+
+    fn source_produces(&self, commodity: &CommodityId, source: &ProductionSource) -> bool {
+        match source {
+            ProductionSource::Recipe(recipe_id) => self
+                .catalog
+                .recipe(recipe_id)
+                .is_some_and(|recipe| recipe_produces(recipe, commodity)),
+            ProductionSource::Resource(resource_id) => self
+                .catalog
+                .resource_source(resource_id)
+                .is_some_and(|source| products_include(source.products(), commodity)),
+            ProductionSource::Fluid(fluid_source_id) => self
+                .catalog
+                .fluid_source(fluid_source_id)
+                .is_some_and(|source| products_include(source.products(), commodity)),
+            ProductionSource::RocketLaunch(rocket_launch_id) => self
+                .catalog
+                .rocket_launch_source(rocket_launch_id)
+                .is_some_and(|source| products_include(source.products(), commodity)),
+        }
+    }
+}
+
+fn recipe_produces(recipe: &Recipe, commodity: &CommodityId) -> bool {
+    recipe
+        .products()
+        .iter()
+        .any(|product| product.commodity() == commodity)
+}
+
+fn products_include(products: &[Product], commodity: &CommodityId) -> bool {
+    products
+        .iter()
+        .any(|product| product.commodity() == commodity)
 }
 
 fn select_machine(

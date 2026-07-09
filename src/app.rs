@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::catalog::{BeltId, CommodityId, FuelId, MachineId, ModuleId, RecipeId};
+use crate::catalog::{
+    BeltId, CommodityId, FuelId, MachineId, ModuleId, ProductionSource, RecipeId,
+};
 use crate::cli::StartupMode;
 use crate::persistence::{
     BlockedPlanDocument, DatasetProfile, PlanDocument, PlanFileError, PlanFileStore, PlanName,
@@ -375,6 +377,18 @@ impl App {
             Action::ClearRecipeChoice { commodity } => {
                 self.edit_plan(|plan| {
                     plan.clear_recipe_choice(&commodity);
+                })?;
+                true
+            }
+            Action::SetSourceChoice { commodity, source } => {
+                self.edit_plan(|plan| {
+                    plan.set_source_choice(commodity, source);
+                })?;
+                true
+            }
+            Action::ClearSourceChoice { commodity } => {
+                self.edit_plan(|plan| {
+                    plan.clear_source_choice(&commodity);
                 })?;
                 true
             }
@@ -1250,6 +1264,13 @@ pub enum Action {
         recipe: RecipeId,
     },
     ClearRecipeChoice {
+        commodity: CommodityId,
+    },
+    SetSourceChoice {
+        commodity: CommodityId,
+        source: ProductionSource,
+    },
+    ClearSourceChoice {
         commodity: CommodityId,
     },
     SetMachineChoice {

@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use factorio_planner_tui::app::{
     Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, WorkspaceView,
 };
-use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, MachineId, RecipeId};
+use factorio_planner_tui::catalog::{
+    CommodityId, FluidId, ItemId, MachineId, ProductionSource, RecipeId,
+};
 use factorio_planner_tui::cli::{StartupInputError, StartupMode, StartupRequest};
 use factorio_planner_tui::persistence::{
     PlanDocument, PlanFileStore, PlanName, ProfileImportRequest, ProfileName, ProfileStore,
@@ -661,6 +663,56 @@ fn workspace_selection_and_selector_confirmation_drive_plan_edits() {
         Some(&recipe_id("advanced-iron-plate"))
     );
     assert!(app.plan().unwrap().is_dirty());
+}
+
+#[test]
+fn source_choice_actions_mark_the_plan_dirty_and_recalculate() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::SetSourceChoice {
+            commodity: item("iron-plate"),
+            source: ProductionSource::Recipe(recipe_id("advanced-iron-plate")),
+        },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let plan = app.plan().unwrap().plan();
+    assert_eq!(
+        plan.source_choice(&item("iron-plate")),
+        Some(&ProductionSource::Recipe(recipe_id("advanced-iron-plate")))
+    );
+    assert_eq!(
+        app.calculation().unwrap().production_steps()[0].recipe(),
+        &recipe_id("advanced-iron-plate")
+    );
+    assert!(app.plan().unwrap().is_dirty());
+
+    app.dispatch(
+        Action::ClearSourceChoice {
+            commodity: item("iron-plate"),
+        },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(
+        app.plan()
+            .unwrap()
+            .plan()
+            .source_choice(&item("iron-plate")),
+        None
+    );
 }
 
 #[test]

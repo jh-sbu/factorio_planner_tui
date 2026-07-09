@@ -13,9 +13,9 @@ use crate::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, DatasetFingerprint, Finite,
     FluidId, FluidProperties, FluidSource, FluidSourceId, FluidSourceKind, Fuel, FuelCategory,
     FuelId, Ingredient, ItemId, Machine, MachineEnergySource, MachineId, Module, ModuleCategory,
-    ModuleEffect, ModuleId, NonNegative, Positive, Product, Recipe, RecipeCategory, RecipeId,
-    ResourceCategory, ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
-    UnsupportedEnergySource,
+    ModuleEffect, ModuleId, NonNegative, Positive, Product, ProductionSource, Recipe,
+    RecipeCategory, RecipeId, ResourceCategory, ResourceSource, ResourceSourceId,
+    RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
 };
 use crate::import::{
     DiagnosticSeverity, ImportDiagnostic, ImportError, LocaleError, LocalePrototypeKind,
@@ -26,7 +26,7 @@ use crate::planner::{FactoryPlan, RateUnit, Target};
 pub const PROFILE_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const CATALOG_SCHEMA_VERSION: u32 = 4;
 pub const IMPORTER_SCHEMA_VERSION: u32 = 4;
-pub const PLAN_SCHEMA_VERSION: u32 = 1;
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
 pub const PLAN_FILE_SUFFIX: &str = ".fptplan.json";
 
 const INDEX_FILE_NAME: &str = "profiles.json";
@@ -718,6 +718,11 @@ pub enum MissingPlanReference {
         commodity: CommodityId,
         recipe: RecipeId,
     },
+    SourceChoiceCommodity(CommodityId),
+    SourceChoiceSource {
+        commodity: CommodityId,
+        source: ProductionSource,
+    },
     MachineChoiceRecipe(RecipeId),
     MachineChoiceMachine {
         recipe: RecipeId,
@@ -768,7 +773,7 @@ impl PlanFileStore {
         ensure_plan_suffix(path)?;
         let bytes = read_plan_file(path, "read plan file")?;
         let version = parse_plan_version(&bytes, path)?;
-        if version != PLAN_SCHEMA_VERSION {
+        if !(1..=PLAN_SCHEMA_VERSION).contains(&version) {
             return Err(PlanFileError::UnsupportedPlanSchema {
                 found: version,
                 supported: PLAN_SCHEMA_VERSION,
@@ -1662,6 +1667,9 @@ impl PlanFile {
 struct FactoryPlanDto {
     targets: Vec<TargetDto>,
     external_inputs: Vec<CommodityIdDto>,
+    #[serde(default)]
+    source_choices: Vec<SourceChoiceDto>,
+    #[serde(default)]
     recipe_choices: Vec<RecipeChoiceDto>,
     machine_choices: Vec<MachineChoiceDto>,
     module_choices: Vec<ModuleChoiceDto>,
@@ -1678,6 +1686,14 @@ impl From<&FactoryPlan> for FactoryPlanDto {
                 .external_inputs()
                 .iter()
                 .map(CommodityIdDto::from)
+                .collect(),
+            source_choices: plan
+                .source_choices()
+                .iter()
+                .map(|(commodity, source)| SourceChoiceDto {
+                    commodity: commodity.into(),
+                    source: source.into(),
+                })
                 .collect(),
             recipe_choices: plan
                 .recipe_choices()
@@ -1742,13 +1758,34 @@ impl FactoryPlanDto {
             plan.set_selected_belt(plan_belt_id(selected_belt)?);
         }
 
+        for choice in self.source_choices {
+            let commodity = plan_commodity_id(choice.commodity)?;
+            let source = choice.source.into_source()?;
+            if plan.set_source_choice(commodity.clone(), source).is_some() {
+                return Err(invalid_plan(format!(
+                    "duplicate source choice for commodity {commodity}"
+                )));
+            }
+        }
+        let mut recipe_choice_commodities = BTreeSet::new();
         for choice in self.recipe_choices {
             let commodity = plan_commodity_id(choice.commodity)?;
             let recipe = plan_recipe_id(choice.recipe)?;
-            if plan.set_recipe_choice(commodity.clone(), recipe).is_some() {
+            if !recipe_choice_commodities.insert(commodity.clone()) {
                 return Err(invalid_plan(format!(
                     "duplicate recipe choice for commodity {commodity}"
                 )));
+            }
+            match plan.source_choice(&commodity) {
+                Some(ProductionSource::Recipe(selected)) if selected == &recipe => {}
+                Some(_) => {
+                    return Err(invalid_plan(format!(
+                        "conflicting source and recipe choices for commodity {commodity}"
+                    )));
+                }
+                None => {
+                    plan.set_recipe_choice(commodity, recipe);
+                }
             }
         }
         for choice in self.machine_choices {
@@ -1812,6 +1849,59 @@ impl TargetDto {
 struct RecipeChoiceDto {
     commodity: CommodityIdDto,
     recipe: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SourceChoiceDto {
+    commodity: CommodityIdDto,
+    source: ProductionSourceDto,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ProductionSourceDto {
+    Recipe { recipe: String },
+    Resource { resource: String },
+    Fluid { fluid_source: String },
+    RocketLaunch { rocket_launch: String },
+}
+
+impl From<&ProductionSource> for ProductionSourceDto {
+    fn from(source: &ProductionSource) -> Self {
+        match source {
+            ProductionSource::Recipe(recipe) => Self::Recipe {
+                recipe: recipe.as_str().to_owned(),
+            },
+            ProductionSource::Resource(resource) => Self::Resource {
+                resource: resource.as_str().to_owned(),
+            },
+            ProductionSource::Fluid(fluid_source) => Self::Fluid {
+                fluid_source: fluid_source.as_str().to_owned(),
+            },
+            ProductionSource::RocketLaunch(rocket_launch) => Self::RocketLaunch {
+                rocket_launch: rocket_launch.as_str().to_owned(),
+            },
+        }
+    }
+}
+
+impl ProductionSourceDto {
+    fn into_source(self) -> Result<ProductionSource, PlanFileError> {
+        Ok(match self {
+            Self::Recipe { recipe } => ProductionSource::Recipe(plan_recipe_id(recipe)?),
+            Self::Resource { resource } => ProductionSource::Resource(
+                ResourceSourceId::new(resource).map_err(|error| invalid_plan(error.to_string()))?,
+            ),
+            Self::Fluid { fluid_source } => ProductionSource::Fluid(
+                FluidSourceId::new(fluid_source)
+                    .map_err(|error| invalid_plan(error.to_string()))?,
+            ),
+            Self::RocketLaunch { rocket_launch } => ProductionSource::RocketLaunch(
+                RocketLaunchSourceId::new(rocket_launch)
+                    .map_err(|error| invalid_plan(error.to_string()))?,
+            ),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2523,6 +2613,19 @@ fn missing_plan_references(plan: &FactoryPlan, catalog: &Catalog) -> Vec<Missing
             });
         }
     }
+    for (commodity, source) in plan.source_choices() {
+        if catalog.commodity(commodity).is_none() {
+            references.insert(MissingPlanReference::SourceChoiceCommodity(
+                commodity.clone(),
+            ));
+        }
+        if source_missing(catalog, source) {
+            references.insert(MissingPlanReference::SourceChoiceSource {
+                commodity: commodity.clone(),
+                source: source.clone(),
+            });
+        }
+    }
     for (recipe, machine) in plan.machine_choices() {
         if catalog.recipe(recipe).is_none() {
             references.insert(MissingPlanReference::MachineChoiceRecipe(recipe.clone()));
@@ -2580,6 +2683,17 @@ fn collect_unique_plan_commodities(
         }
     }
     Ok(unique)
+}
+
+fn source_missing(catalog: &Catalog, source: &ProductionSource) -> bool {
+    match source {
+        ProductionSource::Recipe(recipe) => catalog.recipe(recipe).is_none(),
+        ProductionSource::Resource(resource) => catalog.resource_source(resource).is_none(),
+        ProductionSource::Fluid(fluid_source) => catalog.fluid_source(fluid_source).is_none(),
+        ProductionSource::RocketLaunch(rocket_launch) => {
+            catalog.rocket_launch_source(rocket_launch).is_none()
+        }
+    }
 }
 
 fn ensure_plan_suffix(path: &Path) -> Result<(), PlanFileError> {

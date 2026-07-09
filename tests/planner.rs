@@ -2,8 +2,9 @@ use factorio_planner_tui::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, FluidSource,
     FluidSourceId, FluidSourceKind, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine,
     MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative,
-    Positive, Product, Recipe, RecipeCategory, RecipeId, ResourceCategory, ResourceSource,
-    ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
+    Positive, Product, ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceCategory,
+    ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
+    UnsupportedEnergySource,
 };
 use factorio_planner_tui::planner::{
     DependencyNodeKind, FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit,
@@ -1404,6 +1405,108 @@ fn explicit_recipe_choice_overrides_the_default_and_can_be_cleared() {
     assert_eq!(
         defaulted.production_steps()[0].recipe(),
         &recipe_id("a-iron-plate")
+    );
+}
+
+#[test]
+fn explicit_source_choices_can_select_recipe_or_non_recipe_sources() {
+    let ore = item("iron-ore");
+    let crafting = RecipeCategory::new("crafting").unwrap();
+    let catalog = catalog_with_resources(
+        [ore.clone()],
+        vec![recipe(
+            "synthetic-iron-ore",
+            &crafting,
+            1.0,
+            vec![],
+            ore.clone(),
+            1.0,
+        )],
+        vec![machine("assembler", [crafting], 1.0)],
+        vec![resource_source("iron-ore", ore.clone(), 1.0, None)],
+    );
+
+    let implicit = calculate(&catalog, &FactoryPlan::new(target(ore.clone(), 2.0))).unwrap();
+    assert!(implicit.production_steps().is_empty());
+    assert_eq!(
+        implicit.extraction_steps()[0].source(),
+        &ProductionSource::Resource(resource_id("iron-ore"))
+    );
+
+    let mut plan = FactoryPlan::new(target(ore.clone(), 2.0));
+    assert_eq!(
+        plan.set_source_choice(
+            ore.clone(),
+            ProductionSource::Recipe(recipe_id("synthetic-iron-ore")),
+        ),
+        None
+    );
+    assert_eq!(
+        plan.recipe_choice(&ore),
+        Some(&recipe_id("synthetic-iron-ore"))
+    );
+    let recipe_backed = calculate(&catalog, &plan).unwrap();
+    assert_eq!(
+        recipe_backed.production_steps()[0].recipe(),
+        &recipe_id("synthetic-iron-ore")
+    );
+
+    assert_eq!(
+        plan.set_source_choice(
+            ore.clone(),
+            ProductionSource::Resource(resource_id("iron-ore")),
+        ),
+        Some(ProductionSource::Recipe(recipe_id("synthetic-iron-ore")))
+    );
+    assert_eq!(plan.recipe_choice(&ore), None);
+    let extraction_backed = calculate(&catalog, &plan).unwrap();
+    assert!(extraction_backed.production_steps().is_empty());
+    assert_eq!(
+        extraction_backed.extraction_steps()[0].source(),
+        &ProductionSource::Resource(resource_id("iron-ore"))
+    );
+
+    assert_eq!(
+        plan.clear_source_choice(&ore),
+        Some(ProductionSource::Resource(resource_id("iron-ore")))
+    );
+}
+
+#[test]
+fn rejects_missing_and_wrong_product_source_choices() {
+    let ore = item("iron-ore");
+    let plate = item("iron-plate");
+    let catalog = catalog_with_resources(
+        [ore.clone(), plate.clone()],
+        vec![],
+        vec![],
+        vec![resource_source("iron-ore", ore.clone(), 1.0, None)],
+    );
+
+    let mut missing = FactoryPlan::new(target(ore.clone(), 1.0));
+    missing.set_source_choice(
+        ore.clone(),
+        ProductionSource::Resource(resource_id("missing")),
+    );
+    assert_eq!(
+        calculate(&catalog, &missing),
+        Err(PlannerError::MissingSourceChoice {
+            commodity: ore.clone(),
+            selected_source: ProductionSource::Resource(resource_id("missing")),
+        })
+    );
+
+    let mut wrong_product = FactoryPlan::new(target(plate.clone(), 1.0));
+    wrong_product.set_source_choice(
+        plate.clone(),
+        ProductionSource::Resource(resource_id("iron-ore")),
+    );
+    assert_eq!(
+        calculate(&catalog, &wrong_product),
+        Err(PlannerError::SourceDoesNotProduceCommodity {
+            commodity: plate,
+            selected_source: ProductionSource::Resource(resource_id("iron-ore")),
+        })
     );
 }
 

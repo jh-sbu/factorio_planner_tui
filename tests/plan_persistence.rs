@@ -1,6 +1,8 @@
 use std::fs;
 
-use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId};
+use factorio_planner_tui::catalog::{
+    CommodityId, FluidId, ItemId, ProductionSource, RecipeId, ResourceSourceId,
+};
 use factorio_planner_tui::persistence::{
     MissingPlanReference, PlanDocument, PlanFileError, PlanFileStore, PlanName,
     PlanOpenBlockReason, PlanOpenResult, ProfileImportRequest, ProfileName, ProfileStore,
@@ -23,6 +25,14 @@ fn item(name: &str) -> CommodityId {
 
 fn fluid(name: &str) -> CommodityId {
     CommodityId::Fluid(FluidId::new(name).expect("test fluid ID should be valid"))
+}
+
+fn recipe_id(name: &str) -> RecipeId {
+    RecipeId::new(name).expect("test recipe ID should be valid")
+}
+
+fn resource_id(name: &str) -> ResourceSourceId {
+    ResourceSourceId::new(name).expect("test resource source ID should be valid")
 }
 
 fn target(commodity: CommodityId, rate_per_second: f64) -> Target {
@@ -139,10 +149,7 @@ fn sample_plan() -> FactoryPlan {
         .with_display_rate_unit(RateUnit::Minute)
         .with_selected_belt(factorio_planner_tui::catalog::BeltId::new("transport-belt").unwrap());
     plan.add_target(target(fluid("steam"), 1.25));
-    plan.set_recipe_choice(
-        item("iron-plate"),
-        factorio_planner_tui::catalog::RecipeId::new("iron-plate").unwrap(),
-    );
+    plan.set_recipe_choice(item("iron-plate"), recipe_id("iron-plate"));
     plan.set_machine_choice(
         factorio_planner_tui::catalog::RecipeId::new("iron-plate").unwrap(),
         factorio_planner_tui::catalog::MachineId::new("assembler").unwrap(),
@@ -201,6 +208,58 @@ fn saves_loads_and_opens_a_versioned_factory_plan() {
 }
 
 #[test]
+fn migrates_legacy_recipe_choices_into_source_choices() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let file_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    file_store.save(&path, &mut document).unwrap();
+
+    let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    json["schema_version"] = Value::from(1);
+    json["plan"]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_choices");
+    fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+    let loaded = file_store.load(&path).unwrap();
+    assert_eq!(
+        loaded.plan().source_choice(&item("iron-plate")),
+        Some(&ProductionSource::Recipe(recipe_id("iron-plate")))
+    );
+    assert_eq!(
+        loaded.plan().recipe_choice(&item("iron-plate")),
+        Some(&recipe_id("iron-plate"))
+    );
+}
+
+#[test]
+fn rejects_conflicting_recipe_and_source_choices() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let file_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    file_store.save(&path, &mut document).unwrap();
+
+    let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    json["plan"]["source_choices"] = Value::from(vec![serde_json::json!({
+        "commodity": {"type": "item", "id": "iron-plate"},
+        "source": {"kind": "recipe", "recipe": "steam"}
+    })]);
+    fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+    assert!(matches!(
+        file_store.load(&path),
+        Err(PlanFileError::InvalidPlan { .. })
+    ));
+}
+
+#[test]
 fn rejects_invalid_plan_files_and_unsupported_versions() {
     let root = TempDir::new().unwrap();
     let sources = TempDir::new().unwrap();
@@ -220,10 +279,7 @@ fn rejects_invalid_plan_files_and_unsupported_versions() {
     fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
     assert!(matches!(
         file_store.load(&path),
-        Err(PlanFileError::UnsupportedPlanSchema {
-            found: 999,
-            supported: 1
-        })
+        Err(PlanFileError::UnsupportedPlanSchema { found: 999, .. })
     ));
 
     json["schema_version"] = Value::from(1);
@@ -384,4 +440,46 @@ fn dataset_mismatches_block_opening_until_explicit_rebind() {
     assert_eq!(rebound.dataset_profile(), &profile_name("compatible"));
     assert_eq!(rebound.dataset_fingerprint(), compatible.fingerprint());
     assert!(rebound.is_dirty());
+}
+
+#[test]
+fn reports_missing_source_choice_references_when_rebinding() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile_store = ProfileStore::new(root.path());
+    let main = create_profile(&root, &sources, "main", "full.json", full_data());
+    let file_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&main);
+    document.edit_plan(|plan| {
+        plan.set_source_choice(
+            item("iron-plate"),
+            ProductionSource::Resource(resource_id("iron-ore")),
+        );
+    });
+    file_store.save(&path, &mut document).unwrap();
+
+    let minimal_path = write_data(&sources, "minimal.json", &minimal_data("iron-plate"));
+    let incompatible = profile_store
+        .replace(&ProfileImportRequest::new(
+            profile_name("main"),
+            minimal_path,
+        ))
+        .unwrap();
+    let PlanOpenResult::Blocked(blocked) = file_store.open(&path, &profile_store).unwrap() else {
+        panic!("expected dataset mismatch to block opening");
+    };
+
+    let missing = file_store
+        .rebind(blocked, &incompatible)
+        .expect_err("incompatible profile should be missing source choice references");
+    let PlanFileError::MissingReferences { references } = missing else {
+        panic!("expected missing references");
+    };
+    assert!(
+        references.contains(&MissingPlanReference::SourceChoiceSource {
+            commodity: item("iron-plate"),
+            source: ProductionSource::Resource(resource_id("iron-ore")),
+        })
+    );
 }
