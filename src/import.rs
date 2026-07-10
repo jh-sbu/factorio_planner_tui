@@ -2714,8 +2714,14 @@ fn parse_machine(
     );
     let module_slots =
         parse_module_slots(&fields, prototype_type, id, &prototype_path, diagnostics);
-    let allowed_effects =
-        parse_allowed_effects(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let allowed_effects = parse_allowed_effects(
+        &fields,
+        module_slots.unwrap_or(0),
+        prototype_type,
+        id,
+        &prototype_path,
+        diagnostics,
+    );
     let allowed_module_categories =
         parse_allowed_module_categories(&fields, prototype_type, id, &prototype_path, diagnostics);
     let energy_usage =
@@ -2817,8 +2823,14 @@ fn parse_mining_machine(
     );
     let module_slots =
         parse_module_slots(&fields, prototype_type, id, &prototype_path, diagnostics);
-    let allowed_effects =
-        parse_allowed_effects(&fields, prototype_type, id, &prototype_path, diagnostics);
+    let allowed_effects = parse_allowed_effects(
+        &fields,
+        module_slots.unwrap_or(0),
+        prototype_type,
+        id,
+        &prototype_path,
+        diagnostics,
+    );
     let allowed_module_categories =
         parse_allowed_module_categories(&fields, prototype_type, id, &prototype_path, diagnostics);
     let energy_usage =
@@ -3174,13 +3186,14 @@ fn parse_module_slots(
 
 fn parse_allowed_effects(
     fields: &Map<String, Value>,
+    module_slots: u16,
     prototype_type: &str,
     machine_id: &str,
     prototype_path: &str,
     diagnostics: &mut Vec<ImportDiagnostic>,
 ) -> Option<BTreeSet<ModuleEffect>> {
     let Some(value) = fields.get("allowed_effects") else {
-        return Some(BTreeSet::new());
+        return Some(default_machine_allowed_effects(module_slots));
     };
     let path = format!("{prototype_path}/allowed_effects");
     let initial_errors = error_count(diagnostics);
@@ -3227,6 +3240,20 @@ fn parse_allowed_effects(
     }
 
     (error_count(diagnostics) == initial_errors).then_some(effects)
+}
+
+fn default_machine_allowed_effects(module_slots: u16) -> BTreeSet<ModuleEffect> {
+    if module_slots == 0 {
+        BTreeSet::new()
+    } else {
+        [
+            ModuleEffect::Speed,
+            ModuleEffect::Productivity,
+            ModuleEffect::Consumption,
+        ]
+        .into_iter()
+        .collect()
+    }
 }
 
 fn parse_module_effect(

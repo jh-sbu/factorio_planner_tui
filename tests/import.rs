@@ -708,6 +708,45 @@ fn imports_electric_and_burner_mining_drills() {
 }
 
 #[test]
+fn defaults_module_capable_mining_drills_to_supported_effects() {
+    let report = import(
+        r#"{
+            "mining-drill": {
+                "electric-mining-drill": {
+                    "type": "mining-drill",
+                    "name": "electric-mining-drill",
+                    "resource_categories": ["basic-solid"],
+                    "mining_speed": 0.5,
+                    "module_slots": 3,
+                    "energy_usage": "90kW",
+                    "energy_source": {
+                        "type": "electric"
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let electric = report
+        .catalog()
+        .mining_machine(&MiningMachineId::new("electric-mining-drill").unwrap())
+        .unwrap();
+
+    assert_eq!(
+        electric.allowed_effects(),
+        &[
+            ModuleEffect::Speed,
+            ModuleEffect::Productivity,
+            ModuleEffect::Consumption
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(electric.allowed_module_categories(), None);
+}
+
+#[test]
 fn reports_malformed_mining_drill_fields_with_precise_context() {
     let diagnostics = invalid_data(
         r#"{
