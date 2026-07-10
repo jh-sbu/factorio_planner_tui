@@ -6,7 +6,7 @@ use factorio_planner_tui::app::{
     Action, App, ExitState, FocusTarget, MoveDirection, Overlay, OverlayKind, Screen,
     SelectionKind, TextPromptKind, WorkspaceView,
 };
-use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, MachineId, RecipeId};
+use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, MachineId, ModuleId, RecipeId};
 use factorio_planner_tui::cli::StartupMode;
 use factorio_planner_tui::persistence::{
     PlanDocument, PlanFileStore, PlanName, ProfileImportRequest, ProfileName, ProfileStore,
@@ -59,6 +59,10 @@ fn recipe_id(name: &str) -> RecipeId {
 
 fn machine_id(name: &str) -> MachineId {
     MachineId::new(name).expect("test machine ID should be valid")
+}
+
+fn module_id(name: &str) -> ModuleId {
+    ModuleId::new(name).expect("test module ID should be valid")
 }
 
 fn target(commodity: CommodityId, rate_per_second: f64) -> Target {
@@ -285,6 +289,63 @@ fn water_source_data() -> &'static str {
                 "name": "offshore-pump",
                 "fluid": "water",
                 "pumping_speed": 20
+            }
+        }
+    }"#
+}
+
+fn mining_machine_data() -> &'static str {
+    r#"{
+        "item": {
+            "uranium-ore": {"type": "item", "name": "uranium-ore"}
+        },
+        "fluid": {
+            "sulfuric-acid": {
+                "type": "fluid",
+                "name": "sulfuric-acid",
+                "default_temperature": 25,
+                "heat_capacity": "0.2kJ"
+            }
+        },
+        "resource": {
+            "uranium-ore": {
+                "type": "resource",
+                "name": "uranium-ore",
+                "minable": {
+                    "mining_time": 1,
+                    "result": "uranium-ore",
+                    "required_fluid": "sulfuric-acid",
+                    "fluid_amount": 10
+                }
+            }
+        },
+        "mining-drill": {
+            "electric-mining-drill": {
+                "type": "mining-drill",
+                "name": "electric-mining-drill",
+                "resource_categories": ["basic-solid"],
+                "mining_speed": 1,
+                "module_slots": 1,
+                "allowed_effects": ["speed", "productivity", "consumption"],
+                "allowed_module_categories": ["mining"],
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "drain": "3kW"}
+            },
+            "slow-miner": {
+                "type": "mining-drill",
+                "name": "slow-miner",
+                "resource_categories": ["basic-solid"],
+                "mining_speed": 0.25,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        },
+        "module": {
+            "productivity-module": {
+                "type": "module",
+                "name": "productivity-module",
+                "category": "mining",
+                "effect": {"productivity": 0.25}
             }
         }
     }"#
@@ -841,6 +902,42 @@ fn renders_non_recipe_source_rows_in_the_aggregated_table() {
 }
 
 #[test]
+fn renders_mining_machine_rows_in_the_aggregated_table() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(
+        &root,
+        &sources,
+        "main",
+        "mining.json",
+        mining_machine_data(),
+    );
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("mining.fptplan.json");
+    let plan = FactoryPlan::new(target(item("uranium-ore"), 10.0));
+    let mut document = PlanDocument::new(
+        plan_name("Mining"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        plan,
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let app = App::start(
+        StartupMode::OpenPlan { path },
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 150, 24);
+
+    assert!(screen.contains("> uranium-ore | 10/s | resource: uranium-ore"));
+    assert!(screen.contains("electric-mining-drill"));
+    assert!(screen.contains("10/10"));
+    assert!(screen.contains("Electric 930kW"));
+}
+
+#[test]
 fn renders_selected_non_recipe_source_details() {
     let root = TempDir::new().unwrap();
     let sources = TempDir::new().unwrap();
@@ -873,6 +970,49 @@ fn renders_selected_non_recipe_source_details() {
 }
 
 #[test]
+fn renders_selected_mining_machine_details() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(
+        &root,
+        &sources,
+        "main",
+        "mining.json",
+        mining_machine_data(),
+    );
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("mining.fptplan.json");
+    let mut plan = FactoryPlan::new(target(item("uranium-ore"), 10.0));
+    plan.set_modules(item("uranium-ore"), [module_id("productivity-module")]);
+    let mut document = PlanDocument::new(
+        plan_name("Mining"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        plan,
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+    app.dispatch(
+        Action::MoveFocus(FocusTarget::StepConfiguration),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 150, 28);
+
+    assert!(screen.contains("Miner: electric-mining-drill"));
+    assert!(screen.contains("Machines: 8 fractional / 8 installed"));
+    assert!(screen.contains("Modules: productivity-module"));
+    assert!(screen.contains("Energy: Electric 744kW"));
+    assert!(screen.contains("Required fluids"));
+    assert!(screen.contains("sulfuric-acid 80/s"));
+    assert!(screen.contains("Products"));
+    assert!(screen.contains("uranium-ore 10/s"));
+}
+
+#[test]
 fn renders_source_selection_overlay() {
     let root = TempDir::new().unwrap();
     let sources = TempDir::new().unwrap();
@@ -902,6 +1042,49 @@ fn renders_source_selection_overlay() {
     assert!(screen.contains("Selection: Source"));
     assert!(screen.contains("synthetic-iron-ore"));
     assert!(screen.contains("resource: iron-ore"));
+}
+
+#[test]
+fn renders_miner_selection_overlay_for_mined_commodities() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(
+        &root,
+        &sources,
+        "main",
+        "mining.json",
+        mining_machine_data(),
+    );
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("mining.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Mining"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("uranium-ore"), 10.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+    app.dispatch(
+        Action::OpenMachineSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("min".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 120, 28);
+
+    assert!(screen.contains("Selection: Miner"));
+    assert!(screen.contains("Query: min"));
+    assert!(screen.contains("electric-mining-drill"));
+    assert!(screen.contains("slow-miner"));
 }
 
 #[test]

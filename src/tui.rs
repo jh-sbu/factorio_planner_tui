@@ -30,7 +30,9 @@ use crate::catalog::{
 };
 use crate::import::DiagnosticSeverity;
 use crate::persistence::{PlanFileStore, ProfileStore};
-use crate::planner::{CommodityRate, DependencyNode, DependencyNodeKind, RateUnit, StepEnergy};
+use crate::planner::{
+    CommodityRate, DependencyNode, DependencyNodeKind, ExtractionStep, RateUnit, StepEnergy,
+};
 
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 12;
@@ -904,11 +906,17 @@ fn aggregated_table_lines(app: &App) -> Vec<Line<'static>> {
                 |equivalent| format!("{} belts", format_quantity(equivalent.exact_belts().get())),
             );
         lines.push(Line::from(format!(
-            "{marker} {} | {} | {} | - | {} | - | {belt}",
+            "{marker} {} | {} | {} | {} | {} | {} | {belt}",
             commodity_label(catalog, step.planning_product()),
             format_rate(step.required_output_rate(), unit),
             source_label(catalog, step.source()),
-            format_quantity(step.extraction_rate().get()),
+            step.mining_machine().map_or_else(
+                || "-".to_owned(),
+                |miner| mining_machine_label(catalog, miner)
+            ),
+            extraction_machine_count_summary(step),
+            step.energy()
+                .map_or_else(|| "-".to_owned(), step_energy_summary),
         )));
     }
     lines
@@ -1076,6 +1084,34 @@ fn selected_step_detail_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(format!(
             "Extraction rate: {}",
             format_rate(step.extraction_rate(), calculation.display_rate_unit())
+        )),
+        Line::from(format!(
+            "Miner: {}",
+            step.mining_machine().map_or_else(
+                || "none".to_owned(),
+                |miner| mining_machine_label(catalog, miner)
+            )
+        )),
+        Line::from(format!(
+            "Machines: {}",
+            step.fractional_machine_count().map_or_else(
+                || "none".to_owned(),
+                |fractional| format!(
+                    "{} fractional / {} installed",
+                    format_quantity(fractional.get()),
+                    step.installed_machine_count()
+                        .expect("mining machine count should have installed count")
+                )
+            )
+        )),
+        Line::from(format!(
+            "Modules: {}",
+            module_list_label(catalog, step.modules())
+        )),
+        Line::from(format!(
+            "Energy: {}",
+            step.energy()
+                .map_or_else(|| "none".to_owned(), step_energy_summary)
         )),
         Line::from(""),
         Line::from("Required fluids"),
@@ -1363,6 +1399,20 @@ fn push_rate_lines(
             format_rate(rate.rate(), unit)
         )));
     }
+}
+
+fn extraction_machine_count_summary(step: &ExtractionStep) -> String {
+    step.fractional_machine_count().map_or_else(
+        || format_quantity(step.extraction_rate().get()),
+        |fractional| {
+            format!(
+                "{}/{}",
+                format_quantity(fractional.get()),
+                step.installed_machine_count()
+                    .expect("mining machine count should have installed count")
+            )
+        },
+    )
 }
 
 fn commodity_label(catalog: Option<&Catalog>, id: &CommodityId) -> String {
