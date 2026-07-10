@@ -3214,6 +3214,7 @@ fn parse_allowed_effects(
                 }
             }
         }
+        Value::Object(entries) if entries.is_empty() => {}
         _ => {
             machine_error(
                 diagnostics,

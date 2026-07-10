@@ -460,6 +460,58 @@ fn normalizes_machine_power_units_and_single_allowed_effects() {
 }
 
 #[test]
+fn imports_empty_object_allowed_effects_as_no_allowed_effects() {
+    let report = import(
+        r#"{
+            "assembling-machine": {
+                "plain-assembler": {
+                    "type": "assembling-machine",
+                    "name": "plain-assembler",
+                    "crafting_categories": ["crafting"],
+                    "crafting_speed": 1,
+                    "allowed_effects": {},
+                    "energy_usage": "90kW",
+                    "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+                }
+            },
+            "mining-drill": {
+                "plain-miner": {
+                    "type": "mining-drill",
+                    "name": "plain-miner",
+                    "resource_categories": ["basic-solid"],
+                    "mining_speed": 0.25,
+                    "allowed_effects": {},
+                    "energy_usage": "150kW",
+                    "energy_source": {
+                        "type": "burner",
+                        "effectivity": 1,
+                        "fuel_categories": ["chemical"]
+                    }
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let catalog = report.catalog();
+    assert!(report.diagnostics().is_empty());
+    assert!(
+        catalog
+            .machine(&MachineId::new("plain-assembler").unwrap())
+            .unwrap()
+            .allowed_effects()
+            .is_empty()
+    );
+    assert!(
+        catalog
+            .mining_machine(&MiningMachineId::new("plain-miner").unwrap())
+            .unwrap()
+            .allowed_effects()
+            .is_empty()
+    );
+}
+
+#[test]
 fn reports_malformed_machine_fields_with_precise_context() {
     let diagnostics = invalid_data(
         r#"{
@@ -572,6 +624,7 @@ fn imports_electric_and_burner_mining_drills() {
                     "name": "burner-mining-drill",
                     "resource_categories": ["basic-solid"],
                     "mining_speed": 0.25,
+                    "allowed_effects": {},
                     "energy_usage": "150kW",
                     "energy_source": {
                         "type": "burner",
@@ -634,6 +687,7 @@ fn imports_electric_and_burner_mining_drills() {
         .mining_machine(&MiningMachineId::new("burner-mining-drill").unwrap())
         .unwrap();
     assert_close(burner.mining_speed().get(), 0.25);
+    assert!(burner.allowed_effects().is_empty());
     assert!(matches!(
         burner.energy_source(),
         MachineEnergySource::Burner {
