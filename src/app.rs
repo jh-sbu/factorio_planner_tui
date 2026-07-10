@@ -102,12 +102,31 @@ impl From<&Overlay> for OverlayKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectionKind {
     Commodity,
-    Source { commodity: CommodityId },
-    Recipe { commodity: CommodityId },
-    Machine { recipe: RecipeId },
-    Miner { commodity: CommodityId },
-    Modules { commodity: CommodityId },
-    Fuel { commodity: CommodityId },
+    Source {
+        commodity: CommodityId,
+    },
+    Recipe {
+        commodity: CommodityId,
+    },
+    Machine {
+        recipe: RecipeId,
+    },
+    Miner {
+        commodity: CommodityId,
+    },
+    Modules {
+        commodity: CommodityId,
+    },
+    ModuleSlot {
+        commodity: CommodityId,
+    },
+    ModuleChoice {
+        commodity: CommodityId,
+        slot: Option<usize>,
+    },
+    Fuel {
+        commodity: CommodityId,
+    },
     Belt,
 }
 
@@ -967,7 +986,7 @@ impl App {
         if let Some(commodity) = self.current_workspace_commodity() {
             self.selector_index = 0;
             self.selection_query.clear();
-            self.overlay = Some(Overlay::Selection(SelectionKind::Modules { commodity }));
+            self.overlay = Some(Overlay::Selection(SelectionKind::ModuleSlot { commodity }));
         }
     }
 
@@ -1142,6 +1161,27 @@ impl App {
             (SelectionKind::Miner { commodity }, SelectionValue::MiningMachine(miner)) => {
                 self.dispatch_plan_action(Action::SetMinerChoice { commodity, miner })?;
             }
+            (SelectionKind::ModuleSlot { commodity }, SelectionValue::ModuleSlot(slot)) => {
+                self.overlay = Some(Overlay::Selection(SelectionKind::ModuleChoice {
+                    commodity,
+                    slot: Some(slot),
+                }));
+                self.selector_index = 0;
+                self.selection_query.clear();
+                return Ok(());
+            }
+            (SelectionKind::ModuleSlot { commodity }, SelectionValue::AddModule) => {
+                self.overlay = Some(Overlay::Selection(SelectionKind::ModuleChoice {
+                    commodity,
+                    slot: None,
+                }));
+                self.selector_index = 0;
+                self.selection_query.clear();
+                return Ok(());
+            }
+            (SelectionKind::ModuleSlot { commodity }, SelectionValue::ClearModules) => {
+                self.dispatch_plan_action(Action::ClearModules { commodity })?;
+            }
             (SelectionKind::Modules { commodity }, SelectionValue::Module(module)) => {
                 let mut modules = self
                     .plan
@@ -1151,6 +1191,47 @@ impl App {
                     .modules_for(&commodity)
                     .to_vec();
                 modules.push(module);
+                self.dispatch_plan_action(Action::SetModules { commodity, modules })?;
+            }
+            (SelectionKind::ModuleChoice { commodity, slot }, SelectionValue::Module(module)) => {
+                let mut modules = self
+                    .plan
+                    .as_ref()
+                    .ok_or(AppError::NoOpenPlan)?
+                    .plan()
+                    .modules_for(&commodity)
+                    .to_vec();
+                if let Some(slot) = slot {
+                    let Some(existing) = modules.get_mut(slot) else {
+                        self.status_message =
+                            Some(format!("module slot {} is unavailable", slot + 1));
+                        return Ok(());
+                    };
+                    *existing = module;
+                } else {
+                    modules.push(module);
+                }
+                self.dispatch_plan_action(Action::SetModules { commodity, modules })?;
+            }
+            (
+                SelectionKind::ModuleChoice {
+                    commodity,
+                    slot: Some(slot),
+                },
+                SelectionValue::RemoveModule,
+            ) => {
+                let mut modules = self
+                    .plan
+                    .as_ref()
+                    .ok_or(AppError::NoOpenPlan)?
+                    .plan()
+                    .modules_for(&commodity)
+                    .to_vec();
+                if slot >= modules.len() {
+                    self.status_message = Some(format!("module slot {} is unavailable", slot + 1));
+                    return Ok(());
+                }
+                modules.remove(slot);
                 self.dispatch_plan_action(Action::SetModules { commodity, modules })?;
             }
             (SelectionKind::Fuel { commodity }, SelectionValue::Fuel(fuel)) => {
@@ -1303,6 +1384,35 @@ impl App {
                 })
                 .map(|module| SelectionValue::Module(module.id().clone()))
                 .collect(),
+            SelectionKind::ModuleSlot { commodity } => module_slot_values(
+                self.plan
+                    .as_ref()
+                    .map(|document| document.plan().modules_for(commodity))
+                    .unwrap_or_default(),
+                &query,
+            ),
+            SelectionKind::ModuleChoice { slot, .. } => {
+                let mut values = Vec::new();
+                if slot.is_some()
+                    && selection_matches(&query, "remove-module", Some("Remove module"))
+                {
+                    values.push(SelectionValue::RemoveModule);
+                }
+                values.extend(
+                    catalog
+                        .modules()
+                        .filter(|module| {
+                            module.is_selectable()
+                                && selection_matches(
+                                    &query,
+                                    module.id().as_str(),
+                                    module.localized_name(),
+                                )
+                        })
+                        .map(|module| SelectionValue::Module(module.id().clone())),
+                );
+                values
+            }
             SelectionKind::Fuel { .. } => catalog
                 .fuels()
                 .filter(|fuel| selection_matches(&query, fuel.id().as_str(), fuel.localized_name()))
@@ -1456,8 +1566,36 @@ enum SelectionValue {
     Machine(MachineId),
     MiningMachine(MiningMachineId),
     Module(ModuleId),
+    ModuleSlot(usize),
+    AddModule,
+    RemoveModule,
+    ClearModules,
     Fuel(FuelId),
     Belt(BeltId),
+}
+
+fn module_slot_values(modules: &[ModuleId], query: &str) -> Vec<SelectionValue> {
+    let mut values = modules
+        .iter()
+        .enumerate()
+        .filter(|(index, module)| module_slot_matches(query, *index, module))
+        .map(|(index, _)| SelectionValue::ModuleSlot(index))
+        .collect::<Vec<_>>();
+    if selection_matches(query, "add-module", Some("Add module")) {
+        values.push(SelectionValue::AddModule);
+    }
+    if !modules.is_empty()
+        && selection_matches(query, "clear-all-modules", Some("Clear all modules"))
+    {
+        values.push(SelectionValue::ClearModules);
+    }
+    values
+}
+
+fn module_slot_matches(query: &str, index: usize, module: &ModuleId) -> bool {
+    query.is_empty()
+        || module.as_str().to_lowercase().contains(query)
+        || format!("slot {}", index + 1).contains(query)
 }
 
 fn selection_matches(query: &str, id: &str, localized_name: Option<&str>) -> bool {

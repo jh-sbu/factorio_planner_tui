@@ -269,6 +269,20 @@ fn workspace_data() -> &'static str {
                 "name": "transport-belt",
                 "speed": 0.03125
             }
+        },
+        "module": {
+            "speed-module": {
+                "type": "module",
+                "name": "speed-module",
+                "category": "speed",
+                "effect": {"speed": 0.2}
+            },
+            "productivity-module": {
+                "type": "module",
+                "name": "productivity-module",
+                "category": "productivity",
+                "effect": {"productivity": 0.1}
+            }
         }
     }"#
 }
@@ -1231,6 +1245,47 @@ fn renders_selection_and_diagnostics_overlays_from_workspace_state() {
     let diagnostics = render_to_string(&app, 100, 28);
     assert!(diagnostics.contains("Diagnostics"));
     assert!(diagnostics.contains("missing-machine"));
+}
+
+#[test]
+fn renders_module_slot_editor_overlay() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "workspace.json", workspace_data());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut plan = FactoryPlan::new(target(item("iron-plate"), 2.0));
+    plan.set_modules(
+        item("iron-plate"),
+        [module_id("speed-module"), module_id("productivity-module")],
+    );
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        plan,
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(
+        StartupMode::OpenPlan { path },
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+
+    app.dispatch(
+        Action::OpenModulesSelectionForSelected,
+        &ProfileStore::new(root.path()),
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 100, 28);
+    assert!(screen.contains("Selection: Module slot"));
+    assert!(screen.contains("Slot 1: productivity-module"));
+    assert!(screen.contains("Slot 2: speed-module"));
+    assert!(screen.contains("Add module"));
+    assert!(screen.contains("Clear all modules"));
 }
 
 #[test]

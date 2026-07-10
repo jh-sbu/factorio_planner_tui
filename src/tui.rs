@@ -1323,6 +1323,25 @@ fn selection_option_labels(app: &App, kind: &SelectionKind) -> Vec<String> {
             })
             .map(|module| module_label(Some(catalog), module.id()))
             .collect(),
+        SelectionKind::ModuleSlot { commodity } => {
+            module_slot_option_labels(app, catalog, commodity)
+        }
+        SelectionKind::ModuleChoice { slot, .. } => {
+            let mut labels = Vec::new();
+            if slot.is_some() && matches_query(&query, "remove-module", Some("Remove module")) {
+                labels.push("Remove module".to_owned());
+            }
+            labels.extend(
+                catalog
+                    .modules()
+                    .filter(|module| {
+                        module.is_selectable()
+                            && matches_query(&query, module.id().as_str(), module.localized_name())
+                    })
+                    .map(|module| module_label(Some(catalog), module.id())),
+            );
+            labels
+        }
         SelectionKind::Fuel { .. } => catalog
             .fuels()
             .filter(|fuel| matches_query(&query, fuel.id().as_str(), fuel.localized_name()))
@@ -1452,6 +1471,38 @@ fn module_label(catalog: Option<&Catalog>, id: &ModuleId) -> String {
         || id.to_string(),
         |module| label_with_id(id.as_str(), module.localized_name()),
     )
+}
+
+fn module_slot_option_labels(app: &App, catalog: &Catalog, commodity: &CommodityId) -> Vec<String> {
+    let query = app.selection_query().to_lowercase();
+    let modules = app
+        .plan()
+        .map(|document| document.plan().modules_for(commodity))
+        .unwrap_or_default();
+    let mut labels = modules
+        .iter()
+        .enumerate()
+        .filter(|(index, module)| {
+            query.is_empty()
+                || module.as_str().to_lowercase().contains(&query)
+                || format!("slot {}", index + 1).contains(&query)
+        })
+        .map(|(index, module)| {
+            format!(
+                "Slot {}: {}",
+                index + 1,
+                module_label(Some(catalog), module)
+            )
+        })
+        .collect::<Vec<_>>();
+    if matches_query(&query, "add-module", Some("Add module")) {
+        labels.push("Add module".to_owned());
+    }
+    if !modules.is_empty() && matches_query(&query, "clear-all-modules", Some("Clear all modules"))
+    {
+        labels.push("Clear all modules".to_owned());
+    }
+    labels
 }
 
 fn fuel_label(catalog: Option<&Catalog>, id: &FuelId) -> String {
@@ -1585,6 +1636,8 @@ fn selection_kind_title(kind: &SelectionKind) -> &'static str {
         SelectionKind::Machine { .. } => "Machine",
         SelectionKind::Miner { .. } => "Miner",
         SelectionKind::Modules { .. } => "Modules",
+        SelectionKind::ModuleSlot { .. } => "Module slot",
+        SelectionKind::ModuleChoice { .. } => "Module",
         SelectionKind::Fuel { .. } => "Fuel",
         SelectionKind::Belt => "Belt",
     }

@@ -5,7 +5,7 @@ use factorio_planner_tui::app::{
     Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, WorkspaceView,
 };
 use factorio_planner_tui::catalog::{
-    CommodityId, FluidId, ItemId, MachineId, MiningMachineId, ProductionSource, RecipeId,
+    CommodityId, FluidId, ItemId, MachineId, MiningMachineId, ModuleId, ProductionSource, RecipeId,
     ResourceSourceId,
 };
 use factorio_planner_tui::cli::{StartupInputError, StartupMode, StartupRequest};
@@ -45,6 +45,10 @@ fn mining_machine_id(name: &str) -> MiningMachineId {
 
 fn machine_id(name: &str) -> MachineId {
     MachineId::new(name).expect("test machine ID should be valid")
+}
+
+fn module_id(name: &str) -> ModuleId {
+    ModuleId::new(name).expect("test module ID should be valid")
 }
 
 fn target(commodity: CommodityId, rate_per_second: f64) -> Target {
@@ -221,6 +225,50 @@ fn mining_data() -> &'static str {
                 "mining_speed": 0.25,
                 "energy_usage": "90kW",
                 "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        }
+    }"#
+}
+
+fn module_data() -> &'static str {
+    r#"{
+        "item": {
+            "iron-ore": {"type": "item", "name": "iron-ore"},
+            "iron-plate": {"type": "item", "name": "iron-plate"}
+        },
+        "recipe": {
+            "iron-plate": {
+                "type": "recipe",
+                "name": "iron-plate",
+                "category": "crafting",
+                "energy_required": 1,
+                "ingredients": [{"type": "item", "name": "iron-ore", "amount": 1}],
+                "results": [{"type": "item", "name": "iron-plate", "amount": 1}]
+            }
+        },
+        "assembling-machine": {
+            "assembler": {
+                "type": "assembling-machine",
+                "name": "assembler",
+                "crafting_categories": ["crafting"],
+                "crafting_speed": 1,
+                "module_slots": 3,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        },
+        "module": {
+            "speed-module": {
+                "type": "module",
+                "name": "speed-module",
+                "category": "speed",
+                "effect": {"speed": 0.2}
+            },
+            "productivity-module": {
+                "type": "module",
+                "name": "productivity-module",
+                "category": "productivity",
+                "effect": {"productivity": 0.1}
             }
         }
     }"#
@@ -974,6 +1022,166 @@ fn miner_selector_lists_compatible_miners_and_updates_plan() {
     assert_eq!(
         app.plan().unwrap().plan().miner_choice(&item("iron-ore")),
         Some(&mining_machine_id("slow-miner"))
+    );
+}
+
+#[test]
+fn module_selector_can_replace_remove_and_clear_existing_slots() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "modules.json", module_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("modules.fptplan.json");
+    let mut document = sample_document(&profile);
+    document.edit_plan(|plan| {
+        plan.set_modules(
+            item("iron-plate"),
+            [
+                module_id("speed-module"),
+                module_id("speed-module"),
+                module_id("productivity-module"),
+            ],
+        );
+    });
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::OpenModulesSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    assert_eq!(
+        app.overlay(),
+        Some(&Overlay::Selection(SelectionKind::ModuleSlot {
+            commodity: item("iron-plate")
+        }))
+    );
+
+    app.dispatch(
+        Action::MoveSelectorSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(
+        app.overlay(),
+        Some(&Overlay::Selection(SelectionKind::ModuleChoice {
+            commodity: item("iron-plate"),
+            slot: Some(1)
+        }))
+    );
+    app.dispatch(
+        Action::SetSelectionQuery("productivity".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(
+        app.plan().unwrap().plan().modules_for(&item("iron-plate")),
+        &[
+            module_id("productivity-module"),
+            module_id("productivity-module"),
+            module_id("speed-module"),
+        ]
+    );
+
+    app.dispatch(
+        Action::OpenModulesSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::MoveSelectorSelection(MoveDirection::Next),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("remove".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(
+        app.plan().unwrap().plan().modules_for(&item("iron-plate")),
+        &[module_id("productivity-module"), module_id("speed-module")]
+    );
+
+    app.dispatch(
+        Action::OpenModulesSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("clear".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+    assert!(
+        app.plan()
+            .unwrap()
+            .plan()
+            .modules_for(&item("iron-plate"))
+            .is_empty()
+    );
+    assert!(app.plan().unwrap().is_dirty());
+}
+
+#[test]
+fn empty_module_slot_selector_can_add_a_module() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "modules.json", module_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("modules.fptplan.json");
+    let mut document = sample_document(&profile);
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::OpenModulesSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+    assert_eq!(
+        app.overlay(),
+        Some(&Overlay::Selection(SelectionKind::ModuleChoice {
+            commodity: item("iron-plate"),
+            slot: None
+        }))
+    );
+    app.dispatch(
+        Action::SetSelectionQuery("speed".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+
+    assert_eq!(
+        app.plan().unwrap().plan().modules_for(&item("iron-plate")),
+        &[module_id("speed-module")]
     );
 }
 
