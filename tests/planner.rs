@@ -1,10 +1,10 @@
 use factorio_planner_tui::catalog::{
     Belt, BeltId, Catalog, CatalogParts, Commodity, CommodityId, Finite, FluidId, FluidSource,
     FluidSourceId, FluidSourceKind, Fuel, FuelCategory, FuelId, Ingredient, ItemId, Machine,
-    MachineEnergySource, MachineId, Module, ModuleCategory, ModuleEffect, ModuleId, NonNegative,
-    Positive, Product, ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceCategory,
-    ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
-    UnsupportedEnergySource,
+    MachineEnergySource, MachineId, MiningMachine, MiningMachineId, Module, ModuleCategory,
+    ModuleEffect, ModuleId, NonNegative, Positive, Product, ProductionSource, Recipe,
+    RecipeCategory, RecipeId, ResourceCategory, ResourceSource, ResourceSourceId,
+    RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
 };
 use factorio_planner_tui::planner::{
     DependencyNodeKind, FactoryPlan, PlanEditError, PlannerError, ProductionStep, RateUnit,
@@ -30,6 +30,10 @@ fn recipe_id(name: &str) -> RecipeId {
 
 fn machine_id(name: &str) -> MachineId {
     MachineId::new(name).expect("test machine ID should be valid")
+}
+
+fn mining_machine_id(name: &str) -> MiningMachineId {
+    MiningMachineId::new(name).expect("test mining machine ID should be valid")
 }
 
 fn module_id(name: &str) -> ModuleId {
@@ -381,6 +385,23 @@ fn catalog_with_resources(
     .unwrap()
 }
 
+fn catalog_with_resources_and_miners(
+    commodities: impl IntoIterator<Item = CommodityId>,
+    resource_sources: Vec<ResourceSource>,
+    mining_machines: Vec<MiningMachine>,
+) -> Catalog {
+    Catalog::try_from_parts(CatalogParts {
+        commodities: commodities
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        resource_sources,
+        mining_machines,
+        ..CatalogParts::default()
+    })
+    .unwrap()
+}
+
 fn catalog_with_fluid_sources(
     commodities: impl IntoIterator<Item = CommodityId>,
     recipes: Vec<Recipe>,
@@ -451,6 +472,83 @@ fn resource_source(
         required_fluid.map(|(commodity, amount)| {
             factorio_planner_tui::catalog::Ingredient::new(commodity, positive(amount))
         }),
+    )
+    .unwrap()
+}
+
+fn resource_source_with_category(
+    name: &str,
+    category: &ResourceCategory,
+    product: CommodityId,
+    amount: f64,
+    mining_time: f64,
+) -> ResourceSource {
+    ResourceSource::new(
+        resource_id(name),
+        category.clone(),
+        false,
+        positive(mining_time),
+        vec![Product::new(product, positive(amount))],
+        None,
+    )
+    .unwrap()
+}
+
+fn mining_machine(name: &str, category: &ResourceCategory, mining_speed: f64) -> MiningMachine {
+    MiningMachine::new(
+        mining_machine_id(name),
+        [category.clone()],
+        positive(mining_speed),
+        0,
+        [],
+        None,
+        positive(90_000.0),
+        MachineEnergySource::Electric {
+            drain: NonNegative::new(0.0).unwrap(),
+        },
+    )
+    .unwrap()
+}
+
+fn configured_mining_machine(
+    name: &str,
+    category: &ResourceCategory,
+    mining_speed: f64,
+    energy_usage: f64,
+    energy_source: MachineEnergySource,
+) -> MiningMachine {
+    MiningMachine::new(
+        mining_machine_id(name),
+        [category.clone()],
+        positive(mining_speed),
+        0,
+        [],
+        None,
+        positive(energy_usage),
+        energy_source,
+    )
+    .unwrap()
+}
+
+fn modular_mining_machine(
+    name: &str,
+    category: &ResourceCategory,
+    mining_speed: f64,
+    module_slots: u16,
+    allowed_effects: impl IntoIterator<Item = ModuleEffect>,
+    allowed_module_categories: Option<std::collections::BTreeSet<ModuleCategory>>,
+    energy_usage: f64,
+    energy_source: MachineEnergySource,
+) -> MiningMachine {
+    MiningMachine::new(
+        mining_machine_id(name),
+        [category.clone()],
+        positive(mining_speed),
+        module_slots,
+        allowed_effects,
+        allowed_module_categories,
+        positive(energy_usage),
+        energy_source,
     )
     .unwrap()
 }
@@ -552,6 +650,526 @@ fn extracts_resource_targets_without_unexplained_external_inputs() {
 }
 
 #[test]
+fn resource_extraction_reports_default_miner_counts() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let catalog = catalog_with_resources_and_miners(
+        [ore.clone()],
+        vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            2.0,
+        )],
+        vec![mining_machine("electric-mining-drill", &basic_solid, 0.5)],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(ore.clone(), 9.0))).unwrap();
+
+    let step = &result.extraction_steps()[0];
+    assert_eq!(
+        step.mining_machine(),
+        Some(&mining_machine_id("electric-mining-drill"))
+    );
+    assert_close(step.extraction_rate().get(), 9.0);
+    assert_close(step.fractional_machine_count().unwrap().get(), 36.0);
+    assert_eq!(step.installed_machine_count(), Some(36));
+}
+
+#[test]
+fn resource_extraction_uses_fastest_default_miner_with_lexical_tie_break() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let catalog = catalog_with_resources_and_miners(
+        [ore.clone()],
+        vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            1.0,
+        )],
+        vec![
+            mining_machine("a-slower-miner", &basic_solid, 0.25),
+            mining_machine("z-fast-miner", &basic_solid, 1.0),
+            mining_machine("a-fast-miner", &basic_solid, 1.0),
+        ],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(ore, 2.0))).unwrap();
+    let step = &result.extraction_steps()[0];
+
+    assert_eq!(
+        step.mining_machine(),
+        Some(&mining_machine_id("a-fast-miner"))
+    );
+    assert_close(step.fractional_machine_count().unwrap().get(), 2.0);
+    assert_eq!(step.installed_machine_count(), Some(2));
+}
+
+#[test]
+fn explicit_miner_selection_changes_resource_machine_count() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let catalog = catalog_with_resources_and_miners(
+        [ore.clone()],
+        vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            1.0,
+        )],
+        vec![
+            mining_machine("fast-miner", &basic_solid, 1.0),
+            mining_machine("slow-miner", &basic_solid, 0.25),
+        ],
+    );
+    let mut plan = FactoryPlan::new(target(ore.clone(), 2.0));
+    plan.set_miner_choice(ore, mining_machine_id("slow-miner"));
+
+    let result = calculate(&catalog, &plan).unwrap();
+    let step = &result.extraction_steps()[0];
+
+    assert_eq!(
+        step.mining_machine(),
+        Some(&mining_machine_id("slow-miner"))
+    );
+    assert_close(step.fractional_machine_count().unwrap().get(), 8.0);
+    assert_eq!(step.installed_machine_count(), Some(8));
+}
+
+#[test]
+fn missing_explicit_miner_selection_fails() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let catalog = catalog_with_resources_and_miners(
+        [ore.clone()],
+        vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            1.0,
+        )],
+        vec![mining_machine("electric-mining-drill", &basic_solid, 0.5)],
+    );
+    let mut plan = FactoryPlan::new(target(ore.clone(), 2.0));
+    plan.set_miner_choice(ore.clone(), mining_machine_id("missing-miner"));
+
+    assert_eq!(
+        calculate(&catalog, &plan).unwrap_err(),
+        PlannerError::MissingMinerChoice {
+            commodity: ore,
+            miner: mining_machine_id("missing-miner"),
+        }
+    );
+}
+
+#[test]
+fn incompatible_explicit_miner_selection_fails() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let hard_ore = ResourceCategory::new("hard-ore").unwrap();
+    let catalog = catalog_with_resources_and_miners(
+        [ore.clone()],
+        vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            1.0,
+        )],
+        vec![mining_machine("hard-ore-miner", &hard_ore, 0.5)],
+    );
+    let mut plan = FactoryPlan::new(target(ore.clone(), 2.0));
+    plan.set_miner_choice(ore.clone(), mining_machine_id("hard-ore-miner"));
+
+    assert_eq!(
+        calculate(&catalog, &plan).unwrap_err(),
+        PlannerError::IncompatibleMinerChoice {
+            commodity: ore,
+            miner: mining_machine_id("hard-ore-miner"),
+            category: basic_solid,
+        }
+    );
+}
+
+#[test]
+fn pumpjack_style_resource_extraction_uses_mining_machine_counts() {
+    let crude_oil = fluid("crude-oil");
+    let oil = ResourceCategory::new("basic-fluid").unwrap();
+    let catalog = catalog_with_resources_and_miners(
+        [crude_oil.clone()],
+        vec![resource_source_with_category(
+            "crude-oil",
+            &oil,
+            crude_oil.clone(),
+            10.0,
+            1.0,
+        )],
+        vec![mining_machine("pumpjack", &oil, 1.0)],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(crude_oil, 60.0))).unwrap();
+    let step = &result.extraction_steps()[0];
+
+    assert_eq!(step.mining_machine(), Some(&mining_machine_id("pumpjack")));
+    assert_close(step.extraction_rate().get(), 6.0);
+    assert_close(step.fractional_machine_count().unwrap().get(), 6.0);
+    assert_eq!(step.installed_machine_count(), Some(6));
+}
+
+#[test]
+fn resource_extraction_without_compatible_miners_stays_abstract() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let hard_ore = ResourceCategory::new("hard-ore").unwrap();
+    let catalog = catalog_with_resources_and_miners(
+        [ore.clone()],
+        vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            1.0,
+        )],
+        vec![mining_machine("hard-ore-miner", &hard_ore, 10.0)],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(ore, 3.0))).unwrap();
+    let step = &result.extraction_steps()[0];
+
+    assert!(step.mining_machine().is_none());
+    assert!(step.fractional_machine_count().is_none());
+    assert!(step.installed_machine_count().is_none());
+    assert_close(step.extraction_rate().get(), 3.0);
+}
+
+#[test]
+fn electric_resource_extraction_reports_power_demand() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let catalog = catalog_with_resources_and_miners(
+        [ore.clone()],
+        vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            2.0,
+        )],
+        vec![configured_mining_machine(
+            "electric-mining-drill",
+            &basic_solid,
+            0.5,
+            90_000.0,
+            MachineEnergySource::Electric {
+                drain: NonNegative::new(3_000.0).unwrap(),
+            },
+        )],
+    );
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(ore, 9.0))).unwrap();
+    let step = &result.extraction_steps()[0];
+    let StepEnergy::Electric(power) = step.energy().expect("expected miner power") else {
+        panic!("expected electric miner power");
+    };
+
+    assert_close(power.fractional_process_watts().get(), 3_348_000.0);
+    assert_close(power.installed_full_load_watts().get(), 3_348_000.0);
+    let total = result.electric_power().expect("expected electric total");
+    assert_close(total.fractional_process_watts().get(), 3_348_000.0);
+    assert_close(total.installed_full_load_watts().get(), 3_348_000.0);
+}
+
+#[test]
+fn burner_resource_extraction_expands_fuel_demand() {
+    let ore = item("iron-ore");
+    let wood = item("wood");
+    let stone = item("stone");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: [ore.clone(), wood.clone(), stone]
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        resource_sources: vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            2.0,
+        )],
+        mining_machines: vec![configured_mining_machine(
+            "burner-mining-drill",
+            &basic_solid,
+            0.25,
+            150_000.0,
+            MachineEnergySource::Burner {
+                fuel_categories: [FuelCategory::new("chemical").unwrap()]
+                    .into_iter()
+                    .collect(),
+                effectivity: positive(0.5),
+            },
+        )],
+        fuels: vec![test_fuel("wood", "chemical", 4_000_000.0, Some("stone"))],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+
+    let result = calculate(&catalog, &FactoryPlan::new(target(ore.clone(), 1.0))).unwrap();
+    let step = result
+        .extraction_steps()
+        .iter()
+        .find(|step| step.planning_product() == &ore)
+        .expect("expected ore extraction step");
+    let StepEnergy::Burner(fuel) = step.energy().expect("expected miner fuel") else {
+        panic!("expected burner miner fuel");
+    };
+
+    assert_eq!(fuel.fuel(), &fuel_id("wood"));
+    assert_close(fuel.rate_per_second().get(), 0.6);
+    assert_close(rate_for(result.external_inputs(), &wood), 0.6);
+    assert_close(result.burner_fuel_demand()[0].rate_per_second().get(), 0.6);
+    assert_close(rate_for(result.surplus(), &item("stone")), 0.6);
+}
+
+#[test]
+fn applies_mining_machine_module_speed_productivity_and_consumption_effects() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let mining = ModuleCategory::new("mining").unwrap();
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: [ore.clone()]
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        resource_sources: vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            2.0,
+        )],
+        mining_machines: vec![modular_mining_machine(
+            "electric-mining-drill",
+            &basic_solid,
+            0.5,
+            2,
+            [
+                ModuleEffect::Speed,
+                ModuleEffect::Productivity,
+                ModuleEffect::Consumption,
+            ],
+            Some([mining.clone()].into_iter().collect()),
+            100.0,
+            MachineEnergySource::Electric {
+                drain: NonNegative::new(10.0).unwrap(),
+            },
+        )],
+        modules: vec![test_module("combined", "mining", 0.5, 0.25, 0.5)],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+    let mut plan = FactoryPlan::new(target(ore.clone(), 12.5));
+    plan.set_modules(ore.clone(), [module_id("combined")]);
+
+    let result = calculate(&catalog, &plan).unwrap();
+    let step = &result.extraction_steps()[0];
+    let StepEnergy::Electric(power) = step.energy().expect("expected miner power") else {
+        panic!("expected electric miner power");
+    };
+
+    assert_eq!(step.modules(), &[module_id("combined")]);
+    assert_close(step.speed_multiplier().get(), 1.5);
+    assert_close(step.productivity_effect().get(), 0.25);
+    assert_close(step.consumption_multiplier().get(), 1.5);
+    assert_close(step.extraction_rate().get(), 10.0);
+    assert_close(step.fractional_machine_count().unwrap().get(), 80.0 / 3.0);
+    assert_eq!(step.installed_machine_count(), Some(27));
+    assert_close(rate_for(step.products(), &ore), 12.5);
+    assert_close(power.fractional_process_watts().get(), 4_270.0);
+    assert_close(power.installed_full_load_watts().get(), 4_320.0);
+}
+
+#[test]
+fn mining_productivity_reduces_operations_but_not_fluid_per_operation() {
+    let ore = item("uranium-ore");
+    let acid = fluid("sulfuric-acid");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let mining = ModuleCategory::new("mining").unwrap();
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: [ore.clone(), acid.clone()]
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        resource_sources: vec![resource_source(
+            "uranium-ore",
+            ore.clone(),
+            1.0,
+            Some((acid.clone(), 10.0)),
+        )],
+        mining_machines: vec![modular_mining_machine(
+            "electric-mining-drill",
+            &basic_solid,
+            1.0,
+            1,
+            [ModuleEffect::Productivity],
+            Some([mining.clone()].into_iter().collect()),
+            90_000.0,
+            MachineEnergySource::Electric {
+                drain: NonNegative::new(0.0).unwrap(),
+            },
+        )],
+        modules: vec![test_module("productivity", "mining", 0.0, 0.25, 0.0)],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+    let mut plan = FactoryPlan::new(target(ore.clone(), 10.0));
+    plan.set_modules(ore.clone(), [module_id("productivity")]);
+
+    let result = calculate(&catalog, &plan).unwrap();
+    let step = &result.extraction_steps()[0];
+
+    assert_close(step.extraction_rate().get(), 8.0);
+    assert_close(step.fractional_machine_count().unwrap().get(), 8.0);
+    assert_close(rate_for(step.required_fluids(), &acid), 80.0);
+    assert_close(rate_for(result.external_inputs(), &acid), 80.0);
+    assert_close(rate_for(step.products(), &ore), 10.0);
+}
+
+#[test]
+fn validates_mining_module_configurations() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let speed_category = ModuleCategory::new("speed").unwrap();
+    let productivity_category = ModuleCategory::new("productivity").unwrap();
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: [ore.clone()]
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        resource_sources: vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            1.0,
+        )],
+        mining_machines: vec![modular_mining_machine(
+            "electric-mining-drill",
+            &basic_solid,
+            1.0,
+            1,
+            [ModuleEffect::Speed],
+            Some([speed_category.clone()].into_iter().collect()),
+            90_000.0,
+            MachineEnergySource::Electric {
+                drain: NonNegative::new(0.0).unwrap(),
+            },
+        )],
+        modules: vec![
+            test_module("speed", "speed", 0.2, 0.0, 0.0),
+            test_module("productivity", "productivity", 0.0, 0.1, 0.0),
+            test_module("future", "speed", 0.2, 0.0, 0.0)
+                .with_unsupported_effects(["future-effect".into()]),
+        ],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+    let mut plan = FactoryPlan::new(target(ore.clone(), 1.0));
+
+    plan.set_modules(ore.clone(), [module_id("speed"), module_id("speed")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::TooManyMiningModules {
+            commodity: ore.clone(),
+            miner: mining_machine_id("electric-mining-drill"),
+            selected: 2,
+            slots: 1,
+        })
+    );
+
+    plan.set_modules(ore.clone(), [module_id("missing")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::MissingModuleChoice {
+            commodity: ore.clone(),
+            module: module_id("missing"),
+        })
+    );
+
+    plan.set_modules(ore.clone(), [module_id("future")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::UnsupportedModuleChoice {
+            commodity: ore.clone(),
+            module: module_id("future"),
+        })
+    );
+
+    plan.set_modules(ore.clone(), [module_id("productivity")]);
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::MiningMachineDisallowsModuleCategory {
+            commodity: ore,
+            miner: mining_machine_id("electric-mining-drill"),
+            module: module_id("productivity"),
+            category: productivity_category,
+        })
+    );
+}
+
+#[test]
+fn validates_mining_module_effect_restrictions() {
+    let ore = item("iron-ore");
+    let basic_solid = ResourceCategory::new("basic-solid").unwrap();
+    let speed_category = ModuleCategory::new("speed").unwrap();
+    let catalog = Catalog::try_from_parts(CatalogParts {
+        commodities: [ore.clone()]
+            .into_iter()
+            .map(|id| Commodity::new(id, None))
+            .collect(),
+        resource_sources: vec![resource_source_with_category(
+            "iron-ore",
+            &basic_solid,
+            ore.clone(),
+            1.0,
+            1.0,
+        )],
+        mining_machines: vec![modular_mining_machine(
+            "electric-mining-drill",
+            &basic_solid,
+            1.0,
+            1,
+            [],
+            Some([speed_category].into_iter().collect()),
+            90_000.0,
+            MachineEnergySource::Electric {
+                drain: NonNegative::new(0.0).unwrap(),
+            },
+        )],
+        modules: vec![test_module("speed", "speed", 0.2, 0.0, 0.0)],
+        ..CatalogParts::default()
+    })
+    .unwrap();
+    let mut plan = FactoryPlan::new(target(ore.clone(), 1.0));
+    plan.set_modules(ore.clone(), [module_id("speed")]);
+
+    assert_eq!(
+        calculate(&catalog, &plan),
+        Err(PlannerError::MiningMachineDisallowsModuleEffect {
+            commodity: ore,
+            miner: mining_machine_id("electric-mining-drill"),
+            module: module_id("speed"),
+            effect: ModuleEffect::Speed,
+        })
+    );
+}
+
+#[test]
 fn resource_required_fluids_expand_as_dependencies() {
     let ore = item("uranium-ore");
     let acid = fluid("sulfuric-acid");
@@ -643,6 +1261,9 @@ fn offshore_pump_water_targets_are_not_external_inputs() {
         step.source(),
         &factorio_planner_tui::catalog::ProductionSource::Fluid(fluid_source_id("offshore-pump"))
     );
+    assert!(step.mining_machine().is_none());
+    assert!(step.fractional_machine_count().is_none());
+    assert!(step.installed_machine_count().is_none());
     assert_close(step.extraction_rate().get(), 0.05);
     assert_close(rate_for(step.products(), &water), 60.0);
 }

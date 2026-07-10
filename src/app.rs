@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::catalog::{
-    BeltId, CommodityId, FuelId, MachineId, ModuleId, ProductionSource, RecipeId,
+    BeltId, CommodityId, FuelId, MachineId, MiningMachineId, ModuleId, ProductionSource, RecipeId,
 };
 use crate::cli::StartupMode;
 use crate::persistence::{
@@ -105,6 +105,7 @@ pub enum SelectionKind {
     Source { commodity: CommodityId },
     Recipe { commodity: CommodityId },
     Machine { recipe: RecipeId },
+    Miner { commodity: CommodityId },
     Modules { commodity: CommodityId },
     Fuel { commodity: CommodityId },
     Belt,
@@ -402,6 +403,18 @@ impl App {
             Action::ClearMachineChoice { recipe } => {
                 self.edit_plan(|plan| {
                     plan.clear_machine_choice(&recipe);
+                })?;
+                true
+            }
+            Action::SetMinerChoice { commodity, miner } => {
+                self.edit_plan(|plan| {
+                    plan.set_miner_choice(commodity, miner);
+                })?;
+                true
+            }
+            Action::ClearMinerChoice { commodity } => {
+                self.edit_plan(|plan| {
+                    plan.clear_miner_choice(&commodity);
                 })?;
                 true
             }
@@ -943,6 +956,10 @@ impl App {
             self.selector_index = 0;
             self.selection_query.clear();
             self.overlay = Some(Overlay::Selection(SelectionKind::Machine { recipe }));
+        } else if let Some(commodity) = self.current_workspace_mined_commodity() {
+            self.selector_index = 0;
+            self.selection_query.clear();
+            self.overlay = Some(Overlay::Selection(SelectionKind::Miner { commodity }));
         }
     }
 
@@ -1003,6 +1020,52 @@ impl App {
                     .get(self.selected_result_index)
             })
             .map(|step| step.recipe().clone())
+    }
+
+    fn current_workspace_mined_commodity(&self) -> Option<CommodityId> {
+        self.calculation.as_ref().and_then(|calculation| {
+            let production_len = calculation.production_steps().len();
+            self.selected_result_index
+                .checked_sub(production_len)
+                .and_then(|index| calculation.extraction_steps().get(index))
+                .and_then(|step| match step.source() {
+                    ProductionSource::Resource(_) => Some(step.planning_product().clone()),
+                    ProductionSource::Fluid(_)
+                    | ProductionSource::RocketLaunch(_)
+                    | ProductionSource::Recipe(_) => None,
+                })
+        })
+    }
+
+    fn selected_resource_source_for(
+        &self,
+        commodity: &CommodityId,
+    ) -> Option<crate::catalog::ResourceSourceId> {
+        self.calculation
+            .as_ref()
+            .and_then(|calculation| {
+                calculation
+                    .extraction_steps()
+                    .iter()
+                    .find(|step| step.planning_product() == commodity)
+                    .and_then(|step| match step.source() {
+                        ProductionSource::Resource(resource) => Some(resource.clone()),
+                        ProductionSource::Recipe(_)
+                        | ProductionSource::Fluid(_)
+                        | ProductionSource::RocketLaunch(_) => None,
+                    })
+            })
+            .or_else(|| {
+                self.plan
+                    .as_ref()
+                    .and_then(|document| document.plan().source_choice(commodity))
+                    .and_then(|source| match source {
+                        ProductionSource::Resource(resource) => Some(resource.clone()),
+                        ProductionSource::Recipe(_)
+                        | ProductionSource::Fluid(_)
+                        | ProductionSource::RocketLaunch(_) => None,
+                    })
+            })
     }
 
     fn workspace_result_len(&self) -> usize {
@@ -1075,6 +1138,9 @@ impl App {
             }
             (SelectionKind::Machine { recipe }, SelectionValue::Machine(machine)) => {
                 self.dispatch_plan_action(Action::SetMachineChoice { recipe, machine })?;
+            }
+            (SelectionKind::Miner { commodity }, SelectionValue::MiningMachine(miner)) => {
+                self.dispatch_plan_action(Action::SetMinerChoice { commodity, miner })?;
             }
             (SelectionKind::Modules { commodity }, SelectionValue::Module(module)) => {
                 let mut modules = self
@@ -1215,6 +1281,20 @@ impl App {
                         .collect()
                 })
             }
+            SelectionKind::Miner { commodity } => self
+                .selected_resource_source_for(commodity)
+                .and_then(|source| catalog.resource_source(&source))
+                .map_or_else(Vec::new, |resource| {
+                    catalog
+                        .mining_machines_for_resource_category(resource.category())
+                        .iter()
+                        .filter_map(|miner_id| catalog.mining_machine(miner_id))
+                        .filter(|miner| {
+                            selection_matches(&query, miner.id().as_str(), miner.localized_name())
+                        })
+                        .map(|miner| SelectionValue::MiningMachine(miner.id().clone()))
+                        .collect()
+                }),
             SelectionKind::Modules { .. } => catalog
                 .modules()
                 .filter(|module| {
@@ -1299,6 +1379,13 @@ pub enum Action {
     ClearMachineChoice {
         recipe: RecipeId,
     },
+    SetMinerChoice {
+        commodity: CommodityId,
+        miner: MiningMachineId,
+    },
+    ClearMinerChoice {
+        commodity: CommodityId,
+    },
     SetModules {
         commodity: CommodityId,
         modules: Vec<ModuleId>,
@@ -1367,6 +1454,7 @@ enum SelectionValue {
     Source(ProductionSource),
     Recipe(RecipeId),
     Machine(MachineId),
+    MiningMachine(MiningMachineId),
     Module(ModuleId),
     Fuel(FuelId),
     Belt(BeltId),

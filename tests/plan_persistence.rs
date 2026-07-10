@@ -1,7 +1,7 @@
 use std::fs;
 
 use factorio_planner_tui::catalog::{
-    CommodityId, FluidId, ItemId, ProductionSource, RecipeId, ResourceSourceId,
+    CommodityId, FluidId, ItemId, MiningMachineId, ProductionSource, RecipeId, ResourceSourceId,
 };
 use factorio_planner_tui::persistence::{
     MissingPlanReference, PlanDocument, PlanFileError, PlanFileStore, PlanName,
@@ -33,6 +33,10 @@ fn recipe_id(name: &str) -> RecipeId {
 
 fn resource_id(name: &str) -> ResourceSourceId {
     ResourceSourceId::new(name).expect("test resource source ID should be valid")
+}
+
+fn mining_machine_id(name: &str) -> MiningMachineId {
+    MiningMachineId::new(name).expect("test mining machine ID should be valid")
 }
 
 fn target(commodity: CommodityId, rate_per_second: f64) -> Target {
@@ -105,6 +109,26 @@ fn full_data() -> &'static str {
                 "type": "transport-belt",
                 "name": "transport-belt",
                 "speed": 0.03125
+            }
+        },
+        "resource": {
+            "iron-ore": {
+                "type": "resource",
+                "name": "iron-ore",
+                "minable": {
+                    "mining_time": 1,
+                    "result": "iron-ore"
+                }
+            }
+        },
+        "mining-drill": {
+            "electric-mining-drill": {
+                "type": "mining-drill",
+                "name": "electric-mining-drill",
+                "resource_categories": ["basic-solid"],
+                "mining_speed": 0.5,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
             }
         }
     }"#
@@ -480,6 +504,102 @@ fn reports_missing_source_choice_references_when_rebinding() {
         references.contains(&MissingPlanReference::SourceChoiceSource {
             commodity: item("iron-plate"),
             source: ProductionSource::Resource(resource_id("iron-ore")),
+        })
+    );
+}
+
+#[test]
+fn plan_round_trip_preserves_miner_choices() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let file_store = PlanFileStore::new();
+    let path = root.path().join("miners.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Miners"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-ore"), 2.0)),
+    );
+    document.edit_plan(|plan| {
+        plan.set_miner_choice(item("iron-ore"), mining_machine_id("electric-mining-drill"));
+    });
+
+    file_store.save(&path, &mut document).unwrap();
+    let reopened = file_store.load(&path).unwrap();
+
+    assert_eq!(
+        reopened.plan().miner_choice(&item("iron-ore")),
+        Some(&mining_machine_id("electric-mining-drill"))
+    );
+}
+
+#[test]
+fn older_plan_files_without_miner_choices_still_open() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let file_store = PlanFileStore::new();
+    let path = root.path().join("old.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Old"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-ore"), 2.0)),
+    );
+    file_store.save(&path, &mut document).unwrap();
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    value["plan"]
+        .as_object_mut()
+        .unwrap()
+        .remove("miner_choices");
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+    let reopened = file_store.load(&path).unwrap();
+
+    assert!(reopened.plan().miner_choices().is_empty());
+}
+
+#[test]
+fn reports_missing_miner_choice_references_when_rebinding() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile_store = ProfileStore::new(root.path());
+    let main = create_profile(&root, &sources, "main", "full.json", full_data());
+    let file_store = PlanFileStore::new();
+    let path = root.path().join("miners.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Miners"),
+        main.name().clone(),
+        main.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-ore"), 2.0)),
+    );
+    document.edit_plan(|plan| {
+        plan.set_miner_choice(item("iron-ore"), mining_machine_id("electric-mining-drill"));
+    });
+    file_store.save(&path, &mut document).unwrap();
+
+    let minimal_path = write_data(&sources, "minimal.json", &minimal_data("iron-ore"));
+    let incompatible = profile_store
+        .replace(&ProfileImportRequest::new(
+            profile_name("main"),
+            minimal_path,
+        ))
+        .unwrap();
+    let PlanOpenResult::Blocked(blocked) = file_store.open(&path, &profile_store).unwrap() else {
+        panic!("expected dataset mismatch to block opening");
+    };
+
+    let missing = file_store
+        .rebind(blocked, &incompatible)
+        .expect_err("incompatible profile should be missing miner choice references");
+    let PlanFileError::MissingReferences { references } = missing else {
+        panic!("expected missing references");
+    };
+    assert!(
+        references.contains(&MissingPlanReference::MinerChoiceMiner {
+            commodity: item("iron-ore"),
+            miner: mining_machine_id("electric-mining-drill"),
         })
     );
 }

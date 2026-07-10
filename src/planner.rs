@@ -4,9 +4,10 @@ use thiserror::Error;
 
 use crate::catalog::{
     BeltId, Catalog, CommodityId, Finite, FluidSource, Fuel, FuelCategory, FuelId, ItemId, Machine,
-    MachineEnergySource, MachineId, ModuleEffect, ModuleId, NonNegative, NumericError, Positive,
-    Product, ProductionSource, Recipe, RecipeCategory, RecipeId, ResourceSource, ResourceSourceId,
-    RocketLaunchSource, RocketLaunchSourceId, UnsupportedEnergySource,
+    MachineEnergySource, MachineId, MiningMachine, MiningMachineId, ModuleEffect, ModuleId,
+    NonNegative, NumericError, Positive, Product, ProductionSource, Recipe, RecipeCategory,
+    RecipeId, ResourceSource, ResourceSourceId, RocketLaunchSource, RocketLaunchSourceId,
+    UnsupportedEnergySource,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -67,6 +68,7 @@ pub struct FactoryPlan {
     recipe_choices: BTreeMap<CommodityId, RecipeId>,
     source_choices: BTreeMap<CommodityId, ProductionSource>,
     machine_choices: BTreeMap<RecipeId, MachineId>,
+    miner_choices: BTreeMap<CommodityId, MiningMachineId>,
     module_choices: BTreeMap<CommodityId, Vec<ModuleId>>,
     fuel_choices: BTreeMap<CommodityId, FuelId>,
     selected_belt: Option<BeltId>,
@@ -82,6 +84,7 @@ impl FactoryPlan {
             recipe_choices: BTreeMap::new(),
             source_choices: BTreeMap::new(),
             machine_choices: BTreeMap::new(),
+            miner_choices: BTreeMap::new(),
             module_choices: BTreeMap::new(),
             fuel_choices: BTreeMap::new(),
             selected_belt: None,
@@ -279,6 +282,28 @@ impl FactoryPlan {
     #[must_use]
     pub const fn machine_choices(&self) -> &BTreeMap<RecipeId, MachineId> {
         &self.machine_choices
+    }
+
+    pub fn set_miner_choice(
+        &mut self,
+        commodity: CommodityId,
+        miner: MiningMachineId,
+    ) -> Option<MiningMachineId> {
+        self.miner_choices.insert(commodity, miner)
+    }
+
+    pub fn clear_miner_choice(&mut self, commodity: &CommodityId) -> Option<MiningMachineId> {
+        self.miner_choices.remove(commodity)
+    }
+
+    #[must_use]
+    pub fn miner_choice(&self, commodity: &CommodityId) -> Option<&MiningMachineId> {
+        self.miner_choices.get(commodity)
+    }
+
+    #[must_use]
+    pub const fn miner_choices(&self) -> &BTreeMap<CommodityId, MiningMachineId> {
+        &self.miner_choices
     }
 
     pub fn set_modules(
@@ -625,8 +650,16 @@ impl ProductionStep {
 pub struct ExtractionStep {
     planning_product: CommodityId,
     source: ProductionSource,
+    mining_machine: Option<MiningMachineId>,
     required_output_rate: Positive,
     extraction_rate: Positive,
+    fractional_machine_count: Option<Positive>,
+    installed_machine_count: Option<u64>,
+    modules: Vec<ModuleId>,
+    speed_multiplier: Positive,
+    productivity_effect: Finite,
+    consumption_multiplier: Positive,
+    energy: Option<StepEnergy>,
     required_fluids: Vec<CommodityRate>,
     products: Vec<CommodityRate>,
 }
@@ -650,6 +683,46 @@ impl ExtractionStep {
     #[must_use]
     pub const fn extraction_rate(&self) -> Positive {
         self.extraction_rate
+    }
+
+    #[must_use]
+    pub const fn mining_machine(&self) -> Option<&MiningMachineId> {
+        self.mining_machine.as_ref()
+    }
+
+    #[must_use]
+    pub const fn fractional_machine_count(&self) -> Option<Positive> {
+        self.fractional_machine_count
+    }
+
+    #[must_use]
+    pub const fn installed_machine_count(&self) -> Option<u64> {
+        self.installed_machine_count
+    }
+
+    #[must_use]
+    pub fn modules(&self) -> &[ModuleId] {
+        &self.modules
+    }
+
+    #[must_use]
+    pub const fn speed_multiplier(&self) -> Positive {
+        self.speed_multiplier
+    }
+
+    #[must_use]
+    pub const fn productivity_effect(&self) -> Finite {
+        self.productivity_effect
+    }
+
+    #[must_use]
+    pub const fn consumption_multiplier(&self) -> Positive {
+        self.consumption_multiplier
+    }
+
+    #[must_use]
+    pub const fn energy(&self) -> Option<&StepEnergy> {
+        self.energy.as_ref()
     }
 
     #[must_use]
@@ -782,6 +855,19 @@ pub enum PlannerError {
         machine: MachineId,
         category: RecipeCategory,
     },
+    #[error("selected mining machine {miner} for {commodity} is not present in the catalog")]
+    MissingMinerChoice {
+        commodity: CommodityId,
+        miner: MiningMachineId,
+    },
+    #[error(
+        "selected mining machine {miner} does not support resource category {category} required by {commodity}"
+    )]
+    IncompatibleMinerChoice {
+        commodity: CommodityId,
+        miner: MiningMachineId,
+        category: crate::catalog::ResourceCategory,
+    },
     #[error(
         "machine {machine} selected for recipe {recipe} uses unsupported energy source {energy_source:?}"
     )]
@@ -809,10 +895,28 @@ pub enum PlannerError {
         selected: usize,
         slots: u16,
     },
+    #[error(
+        "selected {selected} modules for {commodity}, but mining machine {miner} has only {slots} slots"
+    )]
+    TooManyMiningModules {
+        commodity: CommodityId,
+        miner: MiningMachineId,
+        selected: usize,
+        slots: u16,
+    },
     #[error("machine {machine} does not allow module {module} category {category} for {commodity}")]
     MachineDisallowsModuleCategory {
         commodity: CommodityId,
         machine: MachineId,
+        module: ModuleId,
+        category: crate::catalog::ModuleCategory,
+    },
+    #[error(
+        "mining machine {miner} does not allow module {module} category {category} for {commodity}"
+    )]
+    MiningMachineDisallowsModuleCategory {
+        commodity: CommodityId,
+        miner: MiningMachineId,
         module: ModuleId,
         category: crate::catalog::ModuleCategory,
     },
@@ -827,6 +931,15 @@ pub enum PlannerError {
     MachineDisallowsModuleEffect {
         commodity: CommodityId,
         machine: MachineId,
+        module: ModuleId,
+        effect: ModuleEffect,
+    },
+    #[error(
+        "mining machine {miner} does not allow module {module} effect {effect:?} for {commodity}"
+    )]
+    MiningMachineDisallowsModuleEffect {
+        commodity: CommodityId,
+        miner: MiningMachineId,
         module: ModuleId,
         effect: ModuleEffect,
     },
@@ -1053,16 +1166,64 @@ impl<'a> Calculation<'a> {
             .catalog
             .resource_source(&resource_id)
             .expect("resolved resource source IDs must remain present in the catalog");
+        let mining_machine_id = self.resolved_plan.mining_machines.get(commodity).cloned();
+        let module_configuration = mining_machine_id
+            .as_ref()
+            .map(|mining_machine_id| {
+                let mining_machine = self
+                    .catalog
+                    .mining_machine(mining_machine_id)
+                    .expect("selected mining machine IDs must remain present in the catalog");
+                resolve_mining_modules(self.catalog, self.plan, commodity, mining_machine)
+            })
+            .transpose()?
+            .unwrap_or_else(empty_module_configuration);
         let product_amount = resource
             .products()
             .iter()
             .filter(|product| product.commodity() == commodity)
-            .map(|product| product.amount().get())
+            .map(|product| {
+                effective_product_amount(product, module_configuration.productivity_effect)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .sum::<f64>();
         let extraction_rate = checked_positive(
             required_rate.get() / product_amount,
             "resource extraction rate per second",
         )?;
+        let fractional_machine_count = mining_machine_id
+            .as_ref()
+            .map(|mining_machine_id| {
+                let mining_machine = self
+                    .catalog
+                    .mining_machine(mining_machine_id)
+                    .expect("selected mining machine IDs must remain present in the catalog");
+                let operations_per_second_per_miner = checked_positive(
+                    mining_machine.mining_speed().get()
+                        * module_configuration.speed_multiplier.get()
+                        / resource.mining_time().get(),
+                    "mining operations per second per miner",
+                )?;
+                checked_positive(
+                    extraction_rate.get() / operations_per_second_per_miner.get(),
+                    "fractional mining machine count",
+                )
+            })
+            .transpose()?;
+        let energy = if let Some(mining_machine_id) = &mining_machine_id {
+            let mining_machine = self
+                .catalog
+                .mining_machine(mining_machine_id)
+                .expect("selected mining machine IDs must remain present in the catalog");
+            Some(self.resolve_extraction_energy(
+                commodity,
+                mining_machine,
+                module_configuration.consumption_multiplier,
+            )?)
+        } else {
+            None
+        };
         let required_fluids = resource
             .required_fluid()
             .map(|fluid| {
@@ -1078,19 +1239,36 @@ impl<'a> Calculation<'a> {
             .transpose()?
             .into_iter()
             .collect::<Vec<_>>();
-        let products = aggregate_resource_products(resource, extraction_rate)?;
+        let products = aggregate_resource_products(
+            resource,
+            extraction_rate,
+            module_configuration.productivity_effect,
+        )?;
 
         self.add_extraction_step(
             commodity,
             &ProductionSource::Resource(resource_id.clone()),
+            mining_machine_id.as_ref(),
             required_rate,
             extraction_rate,
+            fractional_machine_count,
+            &module_configuration,
+            energy.as_ref(),
             &required_fluids,
             &products,
         )?;
 
         for required_fluid in required_fluids {
             self.expand(required_fluid.commodity(), required_fluid.rate())?;
+        }
+        if let (Some(energy), Some(fractional_machine_count)) =
+            (energy.as_ref(), fractional_machine_count)
+            && let Some(fuel_rate) = energy.fuel_rate(fractional_machine_count)?
+        {
+            self.expand(
+                &CommodityId::Item(fuel_rate.fuel_item().clone()),
+                fuel_rate.rate_per_second(),
+            )?;
         }
         Ok(())
     }
@@ -1134,8 +1312,12 @@ impl<'a> Calculation<'a> {
         self.add_extraction_step(
             commodity,
             &ProductionSource::Fluid(fluid_source_id.clone()),
+            None,
             required_rate,
             source_rate,
+            None,
+            &empty_module_configuration(),
+            None,
             &ingredients,
             &products,
         )?;
@@ -1195,8 +1377,12 @@ impl<'a> Calculation<'a> {
         self.add_extraction_step(
             commodity,
             &ProductionSource::RocketLaunch(rocket_launch_id.clone()),
+            None,
             required_rate,
             launch_rate,
+            None,
+            &empty_module_configuration(),
+            None,
             &ingredients,
             &products,
         )?;
@@ -1211,8 +1397,12 @@ impl<'a> Calculation<'a> {
         &mut self,
         commodity: &CommodityId,
         source: &ProductionSource,
+        mining_machine: Option<&MiningMachineId>,
         required_output_rate: Positive,
         extraction_rate: Positive,
+        fractional_machine_count: Option<Positive>,
+        module_configuration: &ModuleConfiguration,
+        energy: Option<&StepEnergyConfiguration>,
         required_fluids: &[CommodityRate],
         products: &[CommodityRate],
     ) -> Result<(), PlannerError> {
@@ -1222,12 +1412,31 @@ impl<'a> Calculation<'a> {
             .or_insert_with(|| ExtractionStepAccumulator {
                 planning_product: commodity.clone(),
                 source: source.clone(),
+                mining_machine: mining_machine.cloned(),
                 required_output_rate: 0.0,
                 extraction_rate: 0.0,
+                fractional_machine_count: None,
+                modules: module_configuration.modules.clone(),
+                speed_multiplier: module_configuration.speed_multiplier,
+                productivity_effect: module_configuration.productivity_effect,
+                consumption_multiplier: module_configuration.consumption_multiplier,
+                energy: energy.cloned(),
                 required_fluids: BTreeMap::new(),
                 products: BTreeMap::new(),
             });
         debug_assert_eq!(&step.source, source);
+        debug_assert_eq!(step.mining_machine.as_ref(), mining_machine);
+        debug_assert_eq!(step.modules, module_configuration.modules);
+        debug_assert_eq!(step.speed_multiplier, module_configuration.speed_multiplier);
+        debug_assert_eq!(
+            step.productivity_effect,
+            module_configuration.productivity_effect
+        );
+        debug_assert_eq!(
+            step.consumption_multiplier,
+            module_configuration.consumption_multiplier
+        );
+        debug_assert_eq!(step.energy.as_ref(), energy);
         step.required_output_rate += required_output_rate.get();
         checked_positive(
             step.required_output_rate,
@@ -1238,6 +1447,11 @@ impl<'a> Calculation<'a> {
             step.extraction_rate,
             "aggregated resource extraction rate per second",
         )?;
+        if let Some(fractional_machine_count) = fractional_machine_count {
+            let total = step.fractional_machine_count.get_or_insert(0.0);
+            *total += fractional_machine_count.get();
+            checked_positive(*total, "aggregated fractional mining machine count")?;
+        }
         for required_fluid in required_fluids {
             let total = step
                 .required_fluids
@@ -1379,6 +1593,50 @@ impl<'a> Calculation<'a> {
         }
     }
 
+    fn resolve_extraction_energy(
+        &self,
+        commodity: &CommodityId,
+        mining_machine: &MiningMachine,
+        consumption_multiplier: Positive,
+    ) -> Result<StepEnergyConfiguration, PlannerError> {
+        let active_watts_per_machine = checked_positive(
+            mining_machine.energy_usage().get() * consumption_multiplier.get(),
+            "active mining machine power",
+        )?;
+        match mining_machine.energy_source() {
+            MachineEnergySource::Electric { drain } => Ok(StepEnergyConfiguration::Electric {
+                active_watts_per_machine,
+                drain_watts_per_machine: *drain,
+            }),
+            MachineEnergySource::Burner {
+                fuel_categories,
+                effectivity,
+            } => {
+                let fuel_id = self
+                    .resolved_plan
+                    .fuels
+                    .get(commodity)
+                    .expect("resolved burner extraction steps must have fuels");
+                let fuel = self
+                    .catalog
+                    .fuel(fuel_id)
+                    .expect("resolved fuel IDs must remain present in the catalog");
+                debug_assert!(fuel_categories.contains(fuel.category()));
+                Ok(StepEnergyConfiguration::Burner {
+                    fuel: fuel.id().clone(),
+                    fuel_item: fuel.item().clone(),
+                    active_watts_per_machine,
+                    effectivity: *effectivity,
+                    fuel_value: fuel.fuel_value(),
+                    burnt_result: fuel.burnt_result().cloned(),
+                })
+            }
+            MachineEnergySource::Unsupported(_) => {
+                unreachable!("unsupported mining machine energy sources are rejected during import")
+            }
+        }
+    }
+
     fn add_external_input(
         &mut self,
         commodity: &CommodityId,
@@ -1415,7 +1673,7 @@ impl<'a> Calculation<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let surplus = aggregate_surplus(self.catalog, &production_steps, &extraction_steps)?;
-        let electric_power = aggregate_electric_power(&production_steps)?;
+        let electric_power = aggregate_electric_power(&production_steps, &extraction_steps)?;
         let burner_fuel_demand =
             aggregate_burner_fuel_demand(self.catalog, &production_steps, &extraction_steps)?;
         let (item_flows, fluid_flows) = aggregate_logistics_flows(
@@ -1456,6 +1714,7 @@ fn resolve_plan(
         sources: resolver.selected_sources,
         recipes: resolver.selected_recipes,
         machines: resolver.selected_machines,
+        mining_machines: resolver.selected_mining_machines,
         fuels: resolver.selected_fuels,
     })
 }
@@ -1464,6 +1723,7 @@ struct ResolvedPlan {
     sources: BTreeMap<CommodityId, ProductionSource>,
     recipes: BTreeMap<CommodityId, RecipeId>,
     machines: BTreeMap<CommodityId, MachineId>,
+    mining_machines: BTreeMap<CommodityId, MiningMachineId>,
     fuels: BTreeMap<CommodityId, FuelId>,
 }
 
@@ -1473,6 +1733,7 @@ struct SourceResolver<'a> {
     selected_sources: BTreeMap<CommodityId, ProductionSource>,
     selected_recipes: BTreeMap<CommodityId, RecipeId>,
     selected_machines: BTreeMap<CommodityId, MachineId>,
+    selected_mining_machines: BTreeMap<CommodityId, MiningMachineId>,
     selected_fuels: BTreeMap<CommodityId, FuelId>,
     resolved: BTreeSet<CommodityId>,
     active_path: Vec<CommodityId>,
@@ -1486,6 +1747,7 @@ impl<'a> SourceResolver<'a> {
             selected_sources: BTreeMap::new(),
             selected_recipes: BTreeMap::new(),
             selected_machines: BTreeMap::new(),
+            selected_mining_machines: BTreeMap::new(),
             selected_fuels: BTreeMap::new(),
             resolved: BTreeSet::new(),
             active_path: Vec::new(),
@@ -1552,6 +1814,24 @@ impl<'a> SourceResolver<'a> {
                     .expect("selected resource source IDs must remain present in the catalog");
                 if let Some(required_fluid) = resource.required_fluid() {
                     dependencies.push(required_fluid.commodity().clone());
+                }
+                if let Some(mining_machine_id) =
+                    select_mining_machine(self.catalog, self.plan, commodity, resource)?
+                {
+                    let mining_machine = self
+                        .catalog
+                        .mining_machine(&mining_machine_id)
+                        .expect("selected mining machine IDs must remain present in the catalog");
+                    if let Some(fuel_id) = select_mining_fuel(self.catalog, mining_machine) {
+                        let fuel = self
+                            .catalog
+                            .fuel(&fuel_id)
+                            .expect("selected fuel IDs must remain present in the catalog");
+                        dependencies.push(CommodityId::Item(fuel.item().clone()));
+                        self.selected_fuels.insert(commodity.clone(), fuel_id);
+                    }
+                    self.selected_mining_machines
+                        .insert(commodity.clone(), mining_machine_id);
                 }
             }
             ProductionSource::Fluid(fluid_source_id) => {
@@ -1836,11 +2116,64 @@ fn select_machine(
     unreachable!("unsupported machines must return an error")
 }
 
+fn select_mining_machine(
+    catalog: &Catalog,
+    plan: &FactoryPlan,
+    commodity: &CommodityId,
+    resource: &ResourceSource,
+) -> Result<Option<MiningMachineId>, PlannerError> {
+    if let Some(mining_machine_id) = plan.miner_choice(commodity) {
+        let mining_machine = catalog.mining_machine(mining_machine_id).ok_or_else(|| {
+            PlannerError::MissingMinerChoice {
+                commodity: commodity.clone(),
+                miner: mining_machine_id.clone(),
+            }
+        })?;
+        if !mining_machine.supports_resource_category(resource.category()) {
+            return Err(PlannerError::IncompatibleMinerChoice {
+                commodity: commodity.clone(),
+                miner: mining_machine_id.clone(),
+                category: resource.category().clone(),
+            });
+        }
+        return Ok(Some(mining_machine_id.clone()));
+    }
+
+    Ok(catalog
+        .mining_machines_for_resource_category(resource.category())
+        .iter()
+        .filter_map(|mining_machine_id| catalog.mining_machine(mining_machine_id))
+        .max_by(|left, right| compare_mining_machines(left, right))
+        .map(|mining_machine| mining_machine.id().clone()))
+}
+
 fn compare_machines(left: &Machine, right: &Machine) -> std::cmp::Ordering {
     left.crafting_speed()
         .get()
         .total_cmp(&right.crafting_speed().get())
         .then_with(|| right.id().cmp(left.id()))
+}
+
+fn compare_mining_machines(left: &MiningMachine, right: &MiningMachine) -> std::cmp::Ordering {
+    left.mining_speed()
+        .get()
+        .total_cmp(&right.mining_speed().get())
+        .then_with(|| right.id().cmp(left.id()))
+}
+
+fn select_mining_fuel(catalog: &Catalog, mining_machine: &MiningMachine) -> Option<FuelId> {
+    let MachineEnergySource::Burner {
+        fuel_categories, ..
+    } = mining_machine.energy_source()
+    else {
+        return None;
+    };
+
+    fuel_categories
+        .iter()
+        .flat_map(|category| compatible_fuels(catalog, category))
+        .max_by(|left, right| compare_fuels(left, right))
+        .map(|fuel| fuel.id().clone())
 }
 
 fn ensure_supported_energy_source(recipe: &Recipe, machine: &Machine) -> Result<(), PlannerError> {
@@ -1994,14 +2327,39 @@ struct ProductionStepAccumulator {
 struct ExtractionStepAccumulator {
     planning_product: CommodityId,
     source: ProductionSource,
+    mining_machine: Option<MiningMachineId>,
     required_output_rate: f64,
     extraction_rate: f64,
+    fractional_machine_count: Option<f64>,
+    modules: Vec<ModuleId>,
+    speed_multiplier: Positive,
+    productivity_effect: Finite,
+    consumption_multiplier: Positive,
+    energy: Option<StepEnergyConfiguration>,
     required_fluids: BTreeMap<CommodityId, f64>,
     products: BTreeMap<CommodityId, f64>,
 }
 
 impl ExtractionStepAccumulator {
     fn finish(self) -> Result<ExtractionStep, PlannerError> {
+        let fractional_machine_count = self
+            .fractional_machine_count
+            .map(|count| checked_positive(count, "aggregated fractional mining machine count"))
+            .transpose()?;
+        let installed_machine_count = fractional_machine_count
+            .map(|count| checked_installed_machine_count(count.get()))
+            .transpose()?;
+        let energy = match (
+            self.energy,
+            fractional_machine_count,
+            installed_machine_count,
+        ) {
+            (Some(energy), Some(fractional_machine_count), Some(installed_machine_count)) => {
+                Some(energy.finish(fractional_machine_count, installed_machine_count)?)
+            }
+            (None, None, None) => None,
+            _ => unreachable!("machine-backed extraction steps must have counts and energy"),
+        };
         let required_fluids = self
             .required_fluids
             .into_iter()
@@ -2022,6 +2380,7 @@ impl ExtractionStepAccumulator {
         Ok(ExtractionStep {
             planning_product: self.planning_product,
             source: self.source,
+            mining_machine: self.mining_machine,
             required_output_rate: checked_positive(
                 self.required_output_rate,
                 "aggregated resource required output rate per second",
@@ -2030,6 +2389,13 @@ impl ExtractionStepAccumulator {
                 self.extraction_rate,
                 "aggregated resource extraction rate per second",
             )?,
+            fractional_machine_count,
+            installed_machine_count,
+            modules: self.modules,
+            speed_multiplier: self.speed_multiplier,
+            productivity_effect: self.productivity_effect,
+            consumption_multiplier: self.consumption_multiplier,
+            energy,
             required_fluids,
             products,
         })
@@ -2196,10 +2562,11 @@ fn aggregate_recipe_products(
 fn aggregate_resource_products(
     resource: &ResourceSource,
     extraction_rate: Positive,
+    productivity_effect: Finite,
 ) -> Result<Vec<CommodityRate>, PlannerError> {
     let mut rates = BTreeMap::<CommodityId, f64>::new();
     for product in resource.products() {
-        let rate = extraction_rate.get() * product.amount().get();
+        let rate = extraction_rate.get() * effective_product_amount(product, productivity_effect)?;
         checked_positive(rate, "resource product rate per second")?;
         let total = rates.entry(product.commodity().clone()).or_default();
         *total += rate;
@@ -2285,6 +2652,15 @@ struct ModuleConfiguration {
     speed_multiplier: Positive,
     productivity_effect: Finite,
     consumption_multiplier: Positive,
+}
+
+fn empty_module_configuration() -> ModuleConfiguration {
+    ModuleConfiguration {
+        modules: Vec::new(),
+        speed_multiplier: Positive::new(1.0).expect("one is positive"),
+        productivity_effect: Finite::new(0.0).expect("zero is finite"),
+        consumption_multiplier: Positive::new(1.0).expect("one is positive"),
+    }
 }
 
 fn resolve_modules(
@@ -2381,6 +2757,97 @@ fn resolve_modules(
     let speed_multiplier =
         checked_positive((1.0_f64 + speed_effect).max(0.2), "module speed multiplier")?;
     let productivity_effect = productivity_effect.min(recipe.maximum_productivity().get());
+    let productivity_effect =
+        Finite::new(productivity_effect).map_err(|_| PlannerError::InvalidCalculatedValue {
+            quantity: "module productivity effect",
+            value: productivity_effect,
+        })?;
+    let consumption_multiplier = checked_positive(
+        (1.0_f64 + consumption_effect).max(0.2),
+        "module consumption multiplier",
+    )?;
+
+    Ok(ModuleConfiguration {
+        modules: module_ids.to_vec(),
+        speed_multiplier,
+        productivity_effect,
+        consumption_multiplier,
+    })
+}
+
+fn resolve_mining_modules(
+    catalog: &Catalog,
+    plan: &FactoryPlan,
+    commodity: &CommodityId,
+    mining_machine: &MiningMachine,
+) -> Result<ModuleConfiguration, PlannerError> {
+    let module_ids = plan.modules_for(commodity);
+    if module_ids.len() > usize::from(mining_machine.module_slots()) {
+        return Err(PlannerError::TooManyMiningModules {
+            commodity: commodity.clone(),
+            miner: mining_machine.id().clone(),
+            selected: module_ids.len(),
+            slots: mining_machine.module_slots(),
+        });
+    }
+
+    let mut speed_effect = 0.0;
+    let mut productivity_effect = 0.0;
+    let mut consumption_effect = 0.0;
+    for module_id in module_ids {
+        let module =
+            catalog
+                .module(module_id)
+                .ok_or_else(|| PlannerError::MissingModuleChoice {
+                    commodity: commodity.clone(),
+                    module: module_id.clone(),
+                })?;
+        if !module.is_selectable() {
+            return Err(PlannerError::UnsupportedModuleChoice {
+                commodity: commodity.clone(),
+                module: module_id.clone(),
+            });
+        }
+        if mining_machine
+            .allowed_module_categories()
+            .is_some_and(|categories| !categories.contains(module.category()))
+        {
+            return Err(PlannerError::MiningMachineDisallowsModuleCategory {
+                commodity: commodity.clone(),
+                miner: mining_machine.id().clone(),
+                module: module_id.clone(),
+                category: module.category().clone(),
+            });
+        }
+
+        for (effect, value) in [
+            (ModuleEffect::Speed, module.speed_effect().get()),
+            (
+                ModuleEffect::Productivity,
+                module.productivity_effect().get(),
+            ),
+            (ModuleEffect::Consumption, module.consumption_effect().get()),
+        ] {
+            if value == 0.0 {
+                continue;
+            }
+            if !mining_machine.allowed_effects().contains(&effect) {
+                return Err(PlannerError::MiningMachineDisallowsModuleEffect {
+                    commodity: commodity.clone(),
+                    miner: mining_machine.id().clone(),
+                    module: module_id.clone(),
+                    effect,
+                });
+            }
+        }
+
+        speed_effect += module.speed_effect().get();
+        productivity_effect += module.productivity_effect().get();
+        consumption_effect += module.consumption_effect().get();
+    }
+
+    let speed_multiplier =
+        checked_positive((1.0_f64 + speed_effect).max(0.2), "module speed multiplier")?;
     let productivity_effect =
         Finite::new(productivity_effect).map_err(|_| PlannerError::InvalidCalculatedValue {
             quantity: "module productivity effect",
@@ -2844,7 +3311,16 @@ fn aggregate_surplus(
             *total += product.rate().get();
             checked_positive(*total, "aggregated resource surplus rate per second")?;
         }
-        if let ProductionSource::Fluid(source_id) = step.source() {
+        if let Some(StepEnergy::Burner(fuel_usage)) = step.energy()
+            && let Some(burnt_result) = fuel_usage.burnt_result()
+        {
+            let total = surplus.entry(burnt_result.commodity().clone()).or_default();
+            *total += burnt_result.rate().get();
+            checked_positive(
+                *total,
+                "aggregated extraction burnt-result surplus rate per second",
+            )?;
+        } else if let ProductionSource::Fluid(source_id) = step.source() {
             let source = catalog
                 .fluid_source(source_id)
                 .expect("calculated fluid source IDs must remain present in the catalog");
@@ -2872,12 +3348,28 @@ fn aggregate_surplus(
 
 fn aggregate_electric_power(
     production_steps: &[ProductionStep],
+    extraction_steps: &[ExtractionStep],
 ) -> Result<Option<ElectricPower>, PlannerError> {
     let mut fractional_process_watts = 0.0;
     let mut installed_full_load_watts = 0.0;
     let mut has_electric_power = false;
     for step in production_steps {
         if let StepEnergy::Electric(power) = step.energy() {
+            has_electric_power = true;
+            fractional_process_watts += power.fractional_process_watts().get();
+            checked_positive(
+                fractional_process_watts,
+                "aggregated fractional-process electric power",
+            )?;
+            installed_full_load_watts += power.installed_full_load_watts().get();
+            checked_positive(
+                installed_full_load_watts,
+                "aggregated installed full-load electric power",
+            )?;
+        }
+    }
+    for step in extraction_steps {
+        if let Some(StepEnergy::Electric(power)) = step.energy() {
             has_electric_power = true;
             fractional_process_watts += power.fractional_process_watts().get();
             checked_positive(
@@ -2920,7 +3412,9 @@ fn aggregate_burner_fuel_demand(
         }
     }
     for step in extraction_steps {
-        if let ProductionSource::Fluid(source_id) = step.source() {
+        if let Some(StepEnergy::Burner(fuel_usage)) = step.energy() {
+            add_fuel_usage(&mut rates, fuel_usage)?;
+        } else if let ProductionSource::Fluid(source_id) = step.source() {
             let source = catalog
                 .fluid_source(source_id)
                 .expect("calculated fluid source IDs must remain present in the catalog");
@@ -3000,7 +3494,15 @@ fn aggregate_logistics_flows(
                 "aggregated resource logistics flow rate per second",
             )?;
         }
-        if let ProductionSource::Fluid(source_id) = step.source() {
+        if let Some(StepEnergy::Burner(fuel_usage)) = step.energy()
+            && let Some(burnt_result) = fuel_usage.burnt_result()
+        {
+            add_rate(
+                &mut flows,
+                burnt_result,
+                "aggregated extraction burnt-result logistics flow rate per second",
+            )?;
+        } else if let ProductionSource::Fluid(source_id) = step.source() {
             let source = catalog
                 .fluid_source(source_id)
                 .expect("calculated fluid source IDs must remain present in the catalog");

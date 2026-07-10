@@ -25,8 +25,8 @@ use crate::app::{
     SelectionKind, TextPromptKind, WorkspaceView,
 };
 use crate::catalog::{
-    BeltId, Catalog, CommodityId, FluidSourceKind, FuelId, MachineId, ModuleId, Positive,
-    ProductionSource, RecipeId,
+    BeltId, Catalog, CommodityId, FluidSourceKind, FuelId, MachineId, MiningMachineId, ModuleId,
+    Positive, ProductionSource, RecipeId, ResourceSourceId,
 };
 use crate::import::DiagnosticSeverity;
 use crate::persistence::{PlanFileStore, ProfileStore};
@@ -1266,6 +1266,19 @@ fn selection_option_labels(app: &App, kind: &SelectionKind) -> Vec<String> {
                     .collect()
             })
         }
+        SelectionKind::Miner { commodity } => selected_resource_source_for(app, commodity)
+            .and_then(|source| catalog.resource_source(&source))
+            .map_or_else(Vec::new, |resource| {
+                catalog
+                    .mining_machines_for_resource_category(resource.category())
+                    .iter()
+                    .filter_map(|miner_id| catalog.mining_machine(miner_id))
+                    .filter(|miner| {
+                        matches_query(&query, miner.id().as_str(), miner.localized_name())
+                    })
+                    .map(|miner| mining_machine_label(Some(catalog), miner.id()))
+                    .collect()
+            }),
         SelectionKind::Modules { .. } => catalog
             .modules()
             .filter(|module| {
@@ -1285,6 +1298,32 @@ fn selection_option_labels(app: &App, kind: &SelectionKind) -> Vec<String> {
             .map(|belt| belt_label(Some(catalog), belt.id()))
             .collect(),
     }
+}
+
+fn selected_resource_source_for(app: &App, commodity: &CommodityId) -> Option<ResourceSourceId> {
+    app.calculation()
+        .and_then(|calculation| {
+            calculation
+                .extraction_steps()
+                .iter()
+                .find(|step| step.planning_product() == commodity)
+                .and_then(|step| match step.source() {
+                    ProductionSource::Resource(resource) => Some(resource.clone()),
+                    ProductionSource::Recipe(_)
+                    | ProductionSource::Fluid(_)
+                    | ProductionSource::RocketLaunch(_) => None,
+                })
+        })
+        .or_else(|| {
+            app.plan()
+                .and_then(|document| document.plan().source_choice(commodity))
+                .and_then(|source| match source {
+                    ProductionSource::Resource(resource) => Some(resource.clone()),
+                    ProductionSource::Recipe(_)
+                    | ProductionSource::Fluid(_)
+                    | ProductionSource::RocketLaunch(_) => None,
+                })
+        })
 }
 
 fn overlay_title(overlay: &Overlay) -> &'static str {
@@ -1347,6 +1386,15 @@ fn machine_label(catalog: Option<&Catalog>, id: &MachineId) -> String {
         || id.to_string(),
         |machine| label_with_id(id.as_str(), machine.localized_name()),
     )
+}
+
+fn mining_machine_label(catalog: Option<&Catalog>, id: &MiningMachineId) -> String {
+    catalog
+        .and_then(|catalog| catalog.mining_machine(id))
+        .map_or_else(
+            || id.to_string(),
+            |machine| label_with_id(id.as_str(), machine.localized_name()),
+        )
 }
 
 fn module_label(catalog: Option<&Catalog>, id: &ModuleId) -> String {
@@ -1485,6 +1533,7 @@ fn selection_kind_title(kind: &SelectionKind) -> &'static str {
         SelectionKind::Source { .. } => "Source",
         SelectionKind::Recipe { .. } => "Recipe",
         SelectionKind::Machine { .. } => "Machine",
+        SelectionKind::Miner { .. } => "Miner",
         SelectionKind::Modules { .. } => "Modules",
         SelectionKind::Fuel { .. } => "Fuel",
         SelectionKind::Belt => "Belt",

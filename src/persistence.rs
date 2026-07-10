@@ -728,6 +728,11 @@ pub enum MissingPlanReference {
         recipe: RecipeId,
         machine: MachineId,
     },
+    MinerChoiceCommodity(CommodityId),
+    MinerChoiceMiner {
+        commodity: CommodityId,
+        miner: MiningMachineId,
+    },
     ModuleChoiceCommodity(CommodityId),
     ModuleChoiceModule {
         commodity: CommodityId,
@@ -1683,6 +1688,8 @@ struct FactoryPlanDto {
     #[serde(default)]
     recipe_choices: Vec<RecipeChoiceDto>,
     machine_choices: Vec<MachineChoiceDto>,
+    #[serde(default)]
+    miner_choices: Vec<MinerChoiceDto>,
     module_choices: Vec<ModuleChoiceDto>,
     fuel_choices: Vec<FuelChoiceDto>,
     selected_belt: Option<String>,
@@ -1720,6 +1727,14 @@ impl From<&FactoryPlan> for FactoryPlanDto {
                 .map(|(recipe, machine)| MachineChoiceDto {
                     recipe: recipe.as_str().to_owned(),
                     machine: machine.as_str().to_owned(),
+                })
+                .collect(),
+            miner_choices: plan
+                .miner_choices()
+                .iter()
+                .map(|(commodity, miner)| MinerChoiceDto {
+                    commodity: commodity.into(),
+                    miner: miner.as_str().to_owned(),
                 })
                 .collect(),
             module_choices: plan
@@ -1805,6 +1820,15 @@ impl FactoryPlanDto {
             if plan.set_machine_choice(recipe.clone(), machine).is_some() {
                 return Err(invalid_plan(format!(
                     "duplicate machine choice for recipe {recipe}"
+                )));
+            }
+        }
+        for choice in self.miner_choices {
+            let commodity = plan_commodity_id(choice.commodity)?;
+            let miner = plan_mining_machine_id(choice.miner)?;
+            if plan.set_miner_choice(commodity.clone(), miner).is_some() {
+                return Err(invalid_plan(format!(
+                    "duplicate miner choice for commodity {commodity}"
                 )));
             }
         }
@@ -1919,6 +1943,12 @@ impl ProductionSourceDto {
 struct MachineChoiceDto {
     recipe: String,
     machine: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct MinerChoiceDto {
+    commodity: CommodityIdDto,
+    miner: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2720,6 +2750,19 @@ fn missing_plan_references(plan: &FactoryPlan, catalog: &Catalog) -> Vec<Missing
             });
         }
     }
+    for (commodity, miner) in plan.miner_choices() {
+        if catalog.commodity(commodity).is_none() {
+            references.insert(MissingPlanReference::MinerChoiceCommodity(
+                commodity.clone(),
+            ));
+        }
+        if catalog.mining_machine(miner).is_none() {
+            references.insert(MissingPlanReference::MinerChoiceMiner {
+                commodity: commodity.clone(),
+                miner: miner.clone(),
+            });
+        }
+    }
     for (commodity, modules) in plan.module_choices() {
         if catalog.commodity(commodity).is_none() {
             references.insert(MissingPlanReference::ModuleChoiceCommodity(
@@ -2891,6 +2934,10 @@ fn plan_recipe_id(value: String) -> Result<RecipeId, PlanFileError> {
 
 fn plan_machine_id(value: String) -> Result<MachineId, PlanFileError> {
     MachineId::new(value).map_err(|error| invalid_plan(error.to_string()))
+}
+
+fn plan_mining_machine_id(value: String) -> Result<MiningMachineId, PlanFileError> {
+    MiningMachineId::new(value).map_err(|error| invalid_plan(error.to_string()))
 }
 
 fn plan_module_id(value: String) -> Result<ModuleId, PlanFileError> {

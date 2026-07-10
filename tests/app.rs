@@ -5,7 +5,8 @@ use factorio_planner_tui::app::{
     Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, WorkspaceView,
 };
 use factorio_planner_tui::catalog::{
-    CommodityId, FluidId, ItemId, MachineId, ProductionSource, RecipeId, ResourceSourceId,
+    CommodityId, FluidId, ItemId, MachineId, MiningMachineId, ProductionSource, RecipeId,
+    ResourceSourceId,
 };
 use factorio_planner_tui::cli::{StartupInputError, StartupMode, StartupRequest};
 use factorio_planner_tui::persistence::{
@@ -36,6 +37,10 @@ fn recipe_id(name: &str) -> RecipeId {
 
 fn resource_id(name: &str) -> ResourceSourceId {
     ResourceSourceId::new(name).expect("test resource source ID should be valid")
+}
+
+fn mining_machine_id(name: &str) -> MiningMachineId {
+    MiningMachineId::new(name).expect("test mining machine ID should be valid")
 }
 
 fn machine_id(name: &str) -> MachineId {
@@ -178,6 +183,42 @@ fn mixed_source_data() -> &'static str {
                 "name": "assembler",
                 "crafting_categories": ["crafting"],
                 "crafting_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            }
+        }
+    }"#
+}
+
+fn mining_data() -> &'static str {
+    r#"{
+        "item": {
+            "iron-ore": {"type": "item", "name": "iron-ore"}
+        },
+        "resource": {
+            "iron-ore": {
+                "type": "resource",
+                "name": "iron-ore",
+                "minable": {
+                    "mining_time": 1,
+                    "result": "iron-ore"
+                }
+            }
+        },
+        "mining-drill": {
+            "fast-miner": {
+                "type": "mining-drill",
+                "name": "fast-miner",
+                "resource_categories": ["basic-solid"],
+                "mining_speed": 1,
+                "energy_usage": "90kW",
+                "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
+            },
+            "slow-miner": {
+                "type": "mining-drill",
+                "name": "slow-miner",
+                "resource_categories": ["basic-solid"],
+                "mining_speed": 0.25,
                 "energy_usage": "90kW",
                 "energy_source": {"type": "electric", "usage_priority": "secondary-input"}
             }
@@ -849,6 +890,90 @@ fn source_selector_can_choose_non_recipe_sources() {
     assert_eq!(
         app.calculation().unwrap().extraction_steps()[0].source(),
         &ProductionSource::Resource(resource_id("iron-ore"))
+    );
+}
+
+#[test]
+fn app_action_sets_miner_choice_and_recalculates() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "mining.json", mining_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-ore"), 2.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::SetMinerChoice {
+            commodity: item("iron-ore"),
+            miner: mining_machine_id("slow-miner"),
+        },
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert_eq!(
+        app.plan().unwrap().plan().miner_choice(&item("iron-ore")),
+        Some(&mining_machine_id("slow-miner"))
+    );
+    assert_eq!(
+        app.calculation().unwrap().extraction_steps()[0].mining_machine(),
+        Some(&mining_machine_id("slow-miner"))
+    );
+    assert!(app.plan().unwrap().is_dirty());
+}
+
+#[test]
+fn miner_selector_lists_compatible_miners_and_updates_plan() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "mining.json", mining_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        FactoryPlan::new(target(item("iron-ore"), 2.0)),
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    app.dispatch(
+        Action::OpenMachineSelectionForSelected,
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    assert_eq!(
+        app.overlay(),
+        Some(&Overlay::Selection(SelectionKind::Miner {
+            commodity: item("iron-ore")
+        }))
+    );
+
+    app.dispatch(
+        Action::SetSelectionQuery("slow".to_owned()),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profile_store, &plan_store)
+        .unwrap();
+
+    assert_eq!(
+        app.plan().unwrap().plan().miner_choice(&item("iron-ore")),
+        Some(&mining_machine_id("slow-miner"))
     );
 }
 
