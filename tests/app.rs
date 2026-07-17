@@ -12,7 +12,7 @@ use factorio_planner_tui::cli::{StartupInputError, StartupMode, StartupRequest};
 use factorio_planner_tui::persistence::{
     PlanDocument, PlanFileStore, PlanName, ProfileImportRequest, ProfileName, ProfileStore,
 };
-use factorio_planner_tui::planner::{FactoryPlan, PlannerError, Target};
+use factorio_planner_tui::planner::{FactoryPlan, PlannerError, RateUnit, Target};
 use tempfile::TempDir;
 
 fn profile_name(name: &str) -> ProfileName {
@@ -644,6 +644,33 @@ fn opens_a_ready_plan_and_recalculates_after_action_edits() {
     )
     .unwrap();
     assert_eq!(app.workspace_view(), WorkspaceView::DependencyTree);
+}
+
+#[test]
+fn cycles_display_rate_unit_as_a_dirty_plan_edit_without_changing_base_rates() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "full.json", full_data());
+    let profile_store = ProfileStore::new(root.path());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let mut document = sample_document(&profile);
+    plan_store.save(&path, &mut document).unwrap();
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+
+    for expected in [RateUnit::Minute, RateUnit::Hour, RateUnit::Second] {
+        app.dispatch(Action::CycleDisplayRateUnit, &profile_store, &plan_store)
+            .unwrap();
+        assert_eq!(app.plan().unwrap().plan().display_rate_unit(), expected);
+        assert_eq!(app.calculation().unwrap().display_rate_unit(), expected);
+        assert_close(
+            app.calculation().unwrap().production_steps()[0]
+                .required_output_rate()
+                .get(),
+            2.0,
+        );
+    }
+    assert!(app.plan().unwrap().is_dirty());
 }
 
 #[test]

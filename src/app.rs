@@ -484,6 +484,12 @@ impl App {
                 })?;
                 true
             }
+            Action::CycleDisplayRateUnit => {
+                self.edit_plan(|plan| {
+                    plan.set_display_rate_unit(plan.display_rate_unit().next());
+                })?;
+                true
+            }
             _ => false,
         };
         if changed {
@@ -1519,6 +1525,7 @@ pub enum Action {
     SetDisplayRateUnit {
         unit: RateUnit,
     },
+    CycleDisplayRateUnit,
     SetWorkspaceView(WorkspaceView),
     MoveFocus(FocusTarget),
     CycleFocus {

@@ -1877,6 +1877,13 @@ fn converts_display_units_without_changing_base_rates() {
 }
 
 #[test]
+fn display_rate_units_cycle_second_minute_hour_and_wrap() {
+    assert_eq!(RateUnit::Second.next(), RateUnit::Minute);
+    assert_eq!(RateUnit::Minute.next(), RateUnit::Hour);
+    assert_eq!(RateUnit::Hour.next(), RateUnit::Second);
+}
+
+#[test]
 fn rejects_unknown_targets() {
     let plate = item("iron-plate");
     let empty_catalog = catalog([], vec![], vec![]);

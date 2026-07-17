@@ -148,6 +148,9 @@ fn translate_key_event(key: KeyEvent, context: EventContext) -> TranslatedEvent 
                 WorkspaceView::DependencyTree => WorkspaceView::AggregatedTable,
             }))
         }
+        KeyCode::Char('v' | 'V') if context.screen == Screen::PlanningWorkspace => {
+            TranslatedEvent::Action(Action::CycleDisplayRateUnit)
+        }
         KeyCode::Char('r' | 'R') => TranslatedEvent::Action(Action::OpenRecipeSelectionForSelected),
         KeyCode::Char('m' | 'M') => {
             TranslatedEvent::Action(Action::OpenMachineSelectionForSelected)
@@ -508,7 +511,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     let footer_text = if app.overlay().is_some() {
         "Enter confirm | Esc cancel | q quit"
     } else if app.screen() == Screen::PlanningWorkspace {
-        "j/k move | Tab focus | t table/tree | r recipe | m machine | u modules | f fuel | b belt | ? help | q quit"
+        "j/k move | Tab focus | t table/tree | v units | r recipe | m machine | u modules | f fuel | b belt | ? help | q quit"
     } else {
         "j/k move | Tab focus | Enter select | ? help | q quit"
     };
@@ -886,7 +889,7 @@ fn aggregated_table_lines(app: &App) -> Vec<Line<'static>> {
             machine_label(catalog, step.machine()),
             format_quantity(step.fractional_machine_count().get()),
             step.installed_machine_count(),
-            step_energy_summary(step.energy()),
+            step_energy_summary(step.energy(), unit),
         )));
     }
     let production_count = calculation.production_steps().len();
@@ -915,8 +918,10 @@ fn aggregated_table_lines(app: &App) -> Vec<Line<'static>> {
                 |miner| mining_machine_label(catalog, miner)
             ),
             extraction_machine_count_summary(step),
-            step.energy()
-                .map_or_else(|| "-".to_owned(), step_energy_summary),
+            step.energy().map_or_else(
+                || "-".to_owned(),
+                |energy| step_energy_summary(energy, unit)
+            ),
         )));
     }
     lines
@@ -929,7 +934,13 @@ fn dependency_tree_lines(
     let catalog = active_catalog(app);
     let mut lines = vec![Line::from("Dependency Tree")];
     for tree in calculation.dependency_trees() {
-        push_dependency_node_lines(catalog, tree, 0, &mut lines);
+        push_dependency_node_lines(
+            catalog,
+            tree,
+            calculation.display_rate_unit(),
+            0,
+            &mut lines,
+        );
     }
     lines
 }
@@ -937,6 +948,7 @@ fn dependency_tree_lines(
 fn push_dependency_node_lines(
     catalog: Option<&Catalog>,
     node: &DependencyNode,
+    unit: RateUnit,
     depth: usize,
     lines: &mut Vec<Line<'static>>,
 ) {
@@ -966,10 +978,10 @@ fn push_dependency_node_lines(
     lines.push(Line::from(format!(
         "{indent}- {} {}{tag_text}{machine_text}",
         commodity_label(catalog, node.commodity()),
-        format_rate(node.required_rate(), RateUnit::Second),
+        format_rate(node.required_rate(), unit),
     )));
     for child in node.children() {
-        push_dependency_node_lines(catalog, child, depth + 1, lines);
+        push_dependency_node_lines(catalog, child, unit, depth + 1, lines);
     }
 }
 
@@ -1025,7 +1037,10 @@ fn selected_step_detail_lines(app: &App) -> Vec<Line<'static>> {
                 "Modules: {}",
                 module_list_label(catalog, step.modules())
             )),
-            Line::from(format!("Energy: {}", step_energy_summary(step.energy()))),
+            Line::from(format!(
+                "Energy: {}",
+                step_energy_summary(step.energy(), calculation.display_rate_unit())
+            )),
             Line::from(""),
             Line::from("Ingredients"),
         ];
@@ -1110,8 +1125,10 @@ fn selected_step_detail_lines(app: &App) -> Vec<Line<'static>> {
         )),
         Line::from(format!(
             "Energy: {}",
-            step.energy()
-                .map_or_else(|| "none".to_owned(), step_energy_summary)
+            step.energy().map_or_else(
+                || "none".to_owned(),
+                |energy| step_energy_summary(energy, calculation.display_rate_unit()),
+            )
         )),
         Line::from(""),
         Line::from("Required fluids"),
@@ -1175,6 +1192,7 @@ fn render_overlay(app: &App, overlay: &Overlay, frame: &mut Frame<'_>, area: Rec
             Line::from("j/k or arrows move selection"),
             Line::from("Tab changes focus"),
             Line::from("t switches table and dependency tree"),
+            Line::from("v cycles rate units /s -> /min -> /h -> /s"),
             Line::from("r recipe | m machine | u modules | f fuel | b belt"),
             Line::from("x toggles external input"),
             Line::from("Esc close"),
@@ -1604,7 +1622,7 @@ fn format_quantity(value: f64) -> String {
     }
 }
 
-fn step_energy_summary(energy: &StepEnergy) -> String {
+fn step_energy_summary(energy: &StepEnergy, unit: RateUnit) -> String {
     match energy {
         StepEnergy::Electric(power) => format!(
             "Electric {}",
@@ -1613,7 +1631,7 @@ fn step_energy_summary(energy: &StepEnergy) -> String {
         StepEnergy::Burner(fuel) => format!(
             "Fuel {} {}",
             fuel.fuel(),
-            format_rate(fuel.rate_per_second(), RateUnit::Second)
+            format_rate(fuel.rate_per_second(), unit)
         ),
     }
 }

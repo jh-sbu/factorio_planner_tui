@@ -11,7 +11,7 @@ use factorio_planner_tui::cli::StartupMode;
 use factorio_planner_tui::persistence::{
     PlanDocument, PlanFileStore, PlanName, ProfileImportRequest, ProfileName, ProfileStore,
 };
-use factorio_planner_tui::planner::{FactoryPlan, Target};
+use factorio_planner_tui::planner::{FactoryPlan, RateUnit, Target};
 use factorio_planner_tui::tui::{EventContext, TranslatedEvent, render, translate_event};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -515,6 +515,39 @@ fn table_tree_toggle_uses_current_workspace_view() {
             },
         ),
         TranslatedEvent::Action(Action::SetWorkspaceView(WorkspaceView::AggregatedTable))
+    );
+}
+
+#[test]
+fn workspace_v_cycles_units_but_modal_inputs_keep_printable_keys() {
+    let workspace = EventContext {
+        screen: Screen::PlanningWorkspace,
+        ..EventContext::default()
+    };
+    for value in ['v', 'V'] {
+        assert_eq!(
+            translate_event(&key(KeyCode::Char(value), KeyEventKind::Press), workspace),
+            TranslatedEvent::Action(Action::CycleDisplayRateUnit)
+        );
+    }
+    assert_eq!(
+        translate_event(
+            &key(KeyCode::Char('v'), KeyEventKind::Press),
+            EventContext::default()
+        ),
+        TranslatedEvent::Ignored
+    );
+    assert_eq!(
+        translate_event(
+            &key(KeyCode::Char('v'), KeyEventKind::Press),
+            EventContext {
+                screen: Screen::PlanningWorkspace,
+                overlay_open: true,
+                overlay_kind: Some(OverlayKind::TextPrompt),
+                ..EventContext::default()
+            }
+        ),
+        TranslatedEvent::Action(Action::AppendPromptText("v".to_owned()))
     );
 }
 
@@ -1183,6 +1216,47 @@ fn renders_dependency_tree_with_shared_and_external_labels() {
     assert!(screen.contains("[shared]"));
     assert!(screen.contains("[external]"));
     assert!(screen.contains("iron-plate"));
+}
+
+#[test]
+fn dependency_tree_and_workspace_controls_use_selected_rate_unit() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    let profile = create_profile(&root, &sources, "main", "workspace.json", workspace_data());
+    let plan_store = PlanFileStore::new();
+    let path = root.path().join("starter.fptplan.json");
+    let plan = FactoryPlan::new(target(item("iron-gear-wheel"), 3.0))
+        .with_display_rate_unit(RateUnit::Hour);
+    let mut document = PlanDocument::new(
+        plan_name("Starter Base"),
+        profile.name().clone(),
+        profile.fingerprint().clone(),
+        plan,
+    );
+    plan_store.save(&path, &mut document).unwrap();
+    let profile_store = ProfileStore::new(root.path());
+    let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
+    app.dispatch(
+        Action::SetWorkspaceView(WorkspaceView::DependencyTree),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+
+    let screen = render_to_string(&app, 120, 32);
+    assert!(screen.contains("10800/h"));
+    assert!(screen.contains("v units"));
+
+    app.dispatch(
+        Action::OpenOverlay(Overlay::Help),
+        &profile_store,
+        &plan_store,
+    )
+    .unwrap();
+    let help = render_to_string(&app, 120, 32);
+    assert!(help.contains("/s"));
+    assert!(help.contains("/min"));
+    assert!(help.contains("/h"));
 }
 
 #[test]

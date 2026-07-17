@@ -20,6 +20,15 @@ pub enum RateUnit {
 
 impl RateUnit {
     #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Second => Self::Minute,
+            Self::Minute => Self::Hour,
+            Self::Hour => Self::Second,
+        }
+    }
+
+    #[must_use]
     pub fn convert_rate(self, rate_per_second: Positive) -> f64 {
         let multiplier = match self {
             Self::Second => 1.0,

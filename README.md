@@ -120,6 +120,7 @@ represent mutually exclusive startup paths.
 | `Enter` | Activate or confirm |
 | `Esc` | Close or cancel the current overlay |
 | `t` | Toggle aggregated table/dependency tree |
+| `v` | Cycle displayed commodity rates: `/s` → `/min` → `/h` → `/s` |
 | `r` | Select a recipe for the selected production step |
 | `m` | Select a machine |
 | `u` | Configure modules |
