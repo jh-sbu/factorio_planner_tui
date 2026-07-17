@@ -2,8 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use factorio_planner_tui::app::{
-    Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, TargetRateFocus,
-    WorkspaceView,
+    Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, WorkspaceView,
 };
 use factorio_planner_tui::catalog::{
     CommodityId, FluidId, ItemId, MachineId, MiningMachineId, ModuleId, ProductionSource, RecipeId,
@@ -546,7 +545,7 @@ fn create_plan_prompt_flow_builds_a_workspace() {
 }
 
 #[test]
-fn target_rate_focus_cycles_activates_units_and_restricts_editing() {
+fn target_rate_unit_cycles_both_directions_without_restricting_editing() {
     let root = TempDir::new().unwrap();
     let sources = TempDir::new().unwrap();
     create_profile(&root, &sources, "main", "full.json", full_data());
@@ -574,32 +573,30 @@ fn target_rate_focus_cycles_activates_units_and_restricts_editing() {
     app.dispatch(Action::ConfirmSelection, &profiles, &plans)
         .unwrap();
 
-    assert_eq!(app.target_rate_focus(), TargetRateFocus::Input);
     assert_eq!(app.target_rate_unit(), RateUnit::Minute);
     app.dispatch(Action::AppendPromptText("120".into()), &profiles, &plans)
         .unwrap();
-    for (focus, unit) in [
-        (TargetRateFocus::Second, RateUnit::Second),
-        (TargetRateFocus::Minute, RateUnit::Minute),
-        (TargetRateFocus::Hour, RateUnit::Hour),
-        (TargetRateFocus::Input, RateUnit::Hour),
-    ] {
+    for unit in [RateUnit::Hour, RateUnit::Second, RateUnit::Minute] {
         app.dispatch(
-            Action::CycleTargetRateFocus { reverse: false },
+            Action::CycleTargetRateUnit { reverse: false },
             &profiles,
             &plans,
         )
         .unwrap();
-        assert_eq!(app.target_rate_focus(), focus);
         assert_eq!(app.target_rate_unit(), unit);
+        app.dispatch(Action::AppendPromptText("9".into()), &profiles, &plans)
+            .unwrap();
+        app.dispatch(Action::BackspacePromptText, &profiles, &plans)
+            .unwrap();
+        assert_eq!(app.prompt_input(), "120");
     }
     app.dispatch(
-        Action::CycleTargetRateFocus { reverse: true },
+        Action::CycleTargetRateUnit { reverse: true },
         &profiles,
         &plans,
     )
     .unwrap();
-    assert_eq!(app.target_rate_focus(), TargetRateFocus::Hour);
+    assert_eq!(app.target_rate_unit(), RateUnit::Second);
     app.dispatch(Action::AppendPromptText("9".into()), &profiles, &plans)
         .unwrap();
     app.dispatch(Action::BackspacePromptText, &profiles, &plans)
@@ -611,15 +608,15 @@ fn target_rate_focus_cycles_activates_units_and_restricts_editing() {
         app.plan().unwrap().plan().targets()[0]
             .rate_per_second()
             .get(),
-        120.0 / 3600.0,
+        120.0,
     );
     assert_eq!(
         app.plan().unwrap().plan().display_rate_unit(),
-        RateUnit::Hour
+        RateUnit::Second
     );
     assert_eq!(
         app.calculation().unwrap().display_rate_unit(),
-        RateUnit::Hour
+        RateUnit::Second
     );
 }
 

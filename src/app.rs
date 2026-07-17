@@ -76,35 +76,6 @@ pub enum TextPromptKind {
     TargetRate,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum TargetRateFocus {
-    #[default]
-    Input,
-    Second,
-    Minute,
-    Hour,
-}
-
-impl TargetRateFocus {
-    const fn cycle(self, reverse: bool) -> Self {
-        match (self, reverse) {
-            (Self::Input, false) | (Self::Minute, true) => Self::Second,
-            (Self::Second, false) | (Self::Hour, true) => Self::Minute,
-            (Self::Minute, false) | (Self::Input, true) => Self::Hour,
-            (Self::Hour, false) | (Self::Second, true) => Self::Input,
-        }
-    }
-
-    const fn unit(self) -> Option<RateUnit> {
-        match self {
-            Self::Input => None,
-            Self::Second => Some(RateUnit::Second),
-            Self::Minute => Some(RateUnit::Minute),
-            Self::Hour => Some(RateUnit::Hour),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayKind {
     Selection,
@@ -196,7 +167,6 @@ struct CreatePlanDraft {
     name: Option<PlanName>,
     commodity: Option<CommodityId>,
     rate_unit: RateUnit,
-    rate_focus: TargetRateFocus,
 }
 
 #[derive(Clone, Debug)]
@@ -382,7 +352,7 @@ impl App {
                     self.prompt_input.pop();
                 }
             }
-            Action::CycleTargetRateFocus { reverse } => self.cycle_target_rate_focus(*reverse),
+            Action::CycleTargetRateUnit { reverse } => self.cycle_target_rate_unit(*reverse),
             Action::SubmitPrompt => self.submit_prompt(profiles)?,
             Action::CancelPrompt => self.cancel_prompt(),
             Action::ConfirmSelection => self.confirm_selection()?,
@@ -634,27 +604,17 @@ impl App {
     }
 
     #[must_use]
-    pub fn target_rate_focus(&self) -> TargetRateFocus {
-        self.create_plan_draft
-            .as_ref()
-            .map_or(TargetRateFocus::Input, |draft| draft.rate_focus)
-    }
-
-    #[must_use]
     pub fn target_rate_unit(&self) -> RateUnit {
         self.create_plan_draft
             .as_ref()
             .map_or_else(RateUnit::default, |draft| draft.rate_unit)
     }
 
-    fn prompt_editing_enabled(&self) -> bool {
-        !matches!(
-            self.overlay,
-            Some(Overlay::TextPrompt(TextPromptKind::TargetRate))
-        ) || self.target_rate_focus() == TargetRateFocus::Input
+    const fn prompt_editing_enabled(&self) -> bool {
+        true
     }
 
-    fn cycle_target_rate_focus(&mut self, reverse: bool) {
+    fn cycle_target_rate_unit(&mut self, reverse: bool) {
         if !matches!(
             self.overlay,
             Some(Overlay::TextPrompt(TextPromptKind::TargetRate))
@@ -662,10 +622,11 @@ impl App {
             return;
         }
         if let Some(draft) = self.create_plan_draft.as_mut() {
-            draft.rate_focus = draft.rate_focus.cycle(reverse);
-            if let Some(unit) = draft.rate_focus.unit() {
-                draft.rate_unit = unit;
-            }
+            draft.rate_unit = if reverse {
+                draft.rate_unit.previous()
+            } else {
+                draft.rate_unit.next()
+            };
         }
     }
 
@@ -1018,7 +979,6 @@ impl App {
             name: None,
             commodity: None,
             rate_unit: RateUnit::default(),
-            rate_focus: TargetRateFocus::Input,
         });
         self.prompt_input.clear();
         self.selection_query.clear();
@@ -1633,7 +1593,7 @@ pub enum Action {
     BackspaceSelectionQuery,
     AppendPromptText(String),
     BackspacePromptText,
-    CycleTargetRateFocus {
+    CycleTargetRateUnit {
         reverse: bool,
     },
     SubmitPrompt,

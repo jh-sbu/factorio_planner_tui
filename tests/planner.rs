@@ -1881,6 +1881,9 @@ fn display_rate_units_cycle_second_minute_hour_and_wrap() {
     assert_eq!(RateUnit::Second.next(), RateUnit::Minute);
     assert_eq!(RateUnit::Minute.next(), RateUnit::Hour);
     assert_eq!(RateUnit::Hour.next(), RateUnit::Second);
+    assert_eq!(RateUnit::Second.previous(), RateUnit::Hour);
+    assert_eq!(RateUnit::Minute.previous(), RateUnit::Second);
+    assert_eq!(RateUnit::Hour.previous(), RateUnit::Minute);
 }
 
 #[test]

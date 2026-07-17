@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use factorio_planner_tui::app::{
     Action, App, ExitState, FocusTarget, MoveDirection, Overlay, OverlayKind, Screen,
-    SelectionKind, TargetRateFocus, TextPromptKind, WorkspaceView,
+    SelectionKind, TextPromptKind, WorkspaceView,
 };
 use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, MachineId, ModuleId, RecipeId};
 use factorio_planner_tui::cli::StartupMode;
@@ -614,41 +614,36 @@ fn text_prompt_keys_edit_and_submit_without_treating_q_as_quit() {
 }
 
 #[test]
-fn target_rate_prompt_translates_focus_sensitive_keys() {
+fn target_rate_prompt_translates_unit_keys_without_suppressing_editing() {
     let base = EventContext {
         overlay_kind: Some(OverlayKind::TextPrompt),
         text_prompt_kind: Some(TextPromptKind::TargetRate),
-        target_rate_focus: TargetRateFocus::Input,
         ..EventContext::default()
     };
     assert_eq!(
         translate_event(&key(KeyCode::Tab, KeyEventKind::Press), base),
-        TranslatedEvent::Action(Action::CycleTargetRateFocus { reverse: false })
+        TranslatedEvent::Action(Action::CycleTargetRateUnit { reverse: false })
     );
     assert_eq!(
         translate_event(&key(KeyCode::BackTab, KeyEventKind::Press), base),
-        TranslatedEvent::Action(Action::CycleTargetRateFocus { reverse: true })
-    );
-    let unit = EventContext {
-        target_rate_focus: TargetRateFocus::Minute,
-        ..base
-    };
-    assert_eq!(
-        translate_event(&key(KeyCode::Char('9'), KeyEventKind::Press), unit),
-        TranslatedEvent::Ignored
+        TranslatedEvent::Action(Action::CycleTargetRateUnit { reverse: true })
     );
     assert_eq!(
-        translate_event(&key(KeyCode::Backspace, KeyEventKind::Press), unit),
-        TranslatedEvent::Ignored
+        translate_event(&key(KeyCode::Char('9'), KeyEventKind::Press), base),
+        TranslatedEvent::Action(Action::AppendPromptText("9".to_owned()))
     );
     assert_eq!(
-        translate_event(&key(KeyCode::Enter, KeyEventKind::Press), unit),
+        translate_event(&key(KeyCode::Backspace, KeyEventKind::Press), base),
+        TranslatedEvent::Action(Action::BackspacePromptText)
+    );
+    assert_eq!(
+        translate_event(&key(KeyCode::Enter, KeyEventKind::Press), base),
         TranslatedEvent::Action(Action::SubmitPrompt)
     );
 }
 
 #[test]
-fn target_rate_prompt_renders_vertical_radio_options_and_focus_cursor() {
+fn target_rate_prompt_keeps_input_cursor_and_highlights_only_selected_unit() {
     let root = TempDir::new().unwrap();
     let sources = TempDir::new().unwrap();
     create_profile(&root, &sources, "main", "full.json", full_data());
@@ -683,20 +678,23 @@ fn target_rate_prompt_renders_vertical_radio_options_and_focus_cursor() {
     assert!(initial.contains("Tab/Shift+Tab select unit"));
 
     app.dispatch(
-        Action::CycleTargetRateFocus { reverse: false },
+        Action::CycleTargetRateUnit { reverse: false },
         &profiles,
         &plans,
     )
     .unwrap();
     let focused = render_to_buffer(&app, 100, 24);
     let text = buffer_to_string(&focused);
-    assert!(text.contains("> (*) per second"));
+    assert!(text.contains("(*) per hour"));
+    assert!(!text.contains("> (*) per hour"));
     let (x, y) = text
         .lines()
         .enumerate()
-        .find_map(|(y, line)| line.find("> (*) per second").map(|x| (x as u16, y as u16)))
+        .find_map(|(y, line)| line.find("(*) per hour").map(|x| (x as u16, y as u16)))
         .unwrap();
-    assert!(focused[(x, y)].modifier.contains(Modifier::REVERSED));
+    assert!(focused[(x, y)].modifier.contains(Modifier::BOLD));
+    assert!(!focused[(x, y)].modifier.contains(Modifier::REVERSED));
+    assert!(text.lines().any(|line| line.contains("> ")));
 }
 
 #[test]

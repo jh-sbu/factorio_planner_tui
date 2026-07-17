@@ -29,6 +29,15 @@ impl RateUnit {
     }
 
     #[must_use]
+    pub const fn previous(self) -> Self {
+        match self {
+            Self::Second => Self::Hour,
+            Self::Minute => Self::Second,
+            Self::Hour => Self::Minute,
+        }
+    }
+
+    #[must_use]
     pub fn convert_rate(self, rate_per_second: Positive) -> f64 {
         let multiplier = match self {
             Self::Second => 1.0,

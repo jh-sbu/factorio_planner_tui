@@ -22,7 +22,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::app::{
     Action, App, AppError, ExitState, FocusTarget, MoveDirection, Overlay, OverlayKind, Screen,
-    SelectionKind, TargetRateFocus, TextPromptKind, WorkspaceView,
+    SelectionKind, TextPromptKind, WorkspaceView,
 };
 use crate::catalog::{
     BeltId, Catalog, CommodityId, FluidSourceKind, FuelId, MachineId, MiningMachineId, ModuleId,
@@ -43,7 +43,6 @@ pub struct EventContext {
     pub overlay_open: bool,
     pub overlay_kind: Option<OverlayKind>,
     pub text_prompt_kind: Option<TextPromptKind>,
-    pub target_rate_focus: TargetRateFocus,
     pub create_plan_in_progress: bool,
     pub exit_state: ExitState,
     pub workspace_view: WorkspaceView,
@@ -61,7 +60,6 @@ impl EventContext {
                 Some(Overlay::TextPrompt(kind)) => Some(*kind),
                 _ => None,
             },
-            target_rate_focus: app.target_rate_focus(),
             create_plan_in_progress: app.create_plan_in_progress(),
             exit_state: app.exit_state(),
             workspace_view: app.workspace_view(),
@@ -77,7 +75,6 @@ impl Default for EventContext {
             overlay_open: false,
             overlay_kind: None,
             text_prompt_kind: None,
-            target_rate_focus: TargetRateFocus::Input,
             create_plan_in_progress: false,
             exit_state: ExitState::Running,
             workspace_view: WorkspaceView::AggregatedTable,
@@ -180,15 +177,10 @@ fn translate_text_prompt_key_event(key: KeyEvent, context: EventContext) -> Tran
     if context.text_prompt_kind == Some(TextPromptKind::TargetRate) {
         match key.code {
             KeyCode::Tab => {
-                return TranslatedEvent::Action(Action::CycleTargetRateFocus { reverse: false });
+                return TranslatedEvent::Action(Action::CycleTargetRateUnit { reverse: false });
             }
             KeyCode::BackTab => {
-                return TranslatedEvent::Action(Action::CycleTargetRateFocus { reverse: true });
-            }
-            KeyCode::Backspace | KeyCode::Char(_)
-                if context.target_rate_focus != TargetRateFocus::Input =>
-            {
-                return TranslatedEvent::Ignored;
+                return TranslatedEvent::Action(Action::CycleTargetRateUnit { reverse: true });
             }
             _ => {}
         }
@@ -1256,42 +1248,32 @@ fn text_prompt_lines(app: &App, kind: TextPromptKind) -> Vec<Line<'static>> {
 
 fn target_rate_prompt_lines(app: &App) -> Vec<Line<'static>> {
     let unit = app.target_rate_unit();
-    let focus = app.target_rate_focus();
     let unit_name = match unit {
         RateUnit::Second => "second",
         RateUnit::Minute => "minute",
         RateUnit::Hour => "hour",
     };
-    let input_cursor = if focus == TargetRateFocus::Input {
-        "> "
-    } else {
-        "  "
-    };
     let mut lines = vec![
         Line::from(format!("Target rate per {unit_name}")),
         Line::from(""),
         Line::from(vec![
-            Span::styled(input_cursor, Style::default().fg(Color::Cyan)),
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
             Span::raw(app.prompt_input().to_owned()),
         ]),
         Line::from(""),
     ];
-    for (option_focus, option_unit, label) in [
-        (TargetRateFocus::Second, RateUnit::Second, "per second"),
-        (TargetRateFocus::Minute, RateUnit::Minute, "per minute"),
-        (TargetRateFocus::Hour, RateUnit::Hour, "per hour"),
+    for (option_unit, label) in [
+        (RateUnit::Second, "per second"),
+        (RateUnit::Minute, "per minute"),
+        (RateUnit::Hour, "per hour"),
     ] {
-        let cursor = if focus == option_focus { ">" } else { " " };
         let marker = if unit == option_unit { "(*)" } else { "( )" };
         let mut style = Style::default();
         if unit == option_unit {
             style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
         }
-        if focus == option_focus {
-            style = style.bg(Color::DarkGray).add_modifier(Modifier::REVERSED);
-        }
         lines.push(Line::from(Span::styled(
-            format!("{cursor} {marker} {label}"),
+            format!("  {marker} {label}"),
             style,
         )));
     }
