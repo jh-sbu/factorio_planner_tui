@@ -12,8 +12,8 @@ use crate::catalog::{
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RateUnit {
-    #[default]
     Second,
+    #[default]
     Minute,
     Hour,
 }
@@ -36,6 +36,17 @@ impl RateUnit {
             Self::Hour => 3_600.0,
         };
         rate_per_second.get() * multiplier
+    }
+
+    /// Converts a value expressed in this unit to the normalized per-second rate.
+    #[must_use]
+    pub fn to_rate_per_second(self, rate: f64) -> f64 {
+        let divisor = match self {
+            Self::Second => 1.0,
+            Self::Minute => 60.0,
+            Self::Hour => 3_600.0,
+        };
+        rate / divisor
     }
 }
 

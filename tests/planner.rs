@@ -1884,6 +1884,14 @@ fn display_rate_units_cycle_second_minute_hour_and_wrap() {
 }
 
 #[test]
+fn rate_units_default_to_minutes_and_normalize_entered_values() {
+    assert_eq!(RateUnit::default(), RateUnit::Minute);
+    assert_close(RateUnit::Second.to_rate_per_second(2.0), 2.0);
+    assert_close(RateUnit::Minute.to_rate_per_second(120.0), 2.0);
+    assert_close(RateUnit::Hour.to_rate_per_second(7_200.0), 2.0);
+}
+
+#[test]
 fn rejects_unknown_targets() {
     let plate = item("iron-plate");
     let empty_catalog = catalog([], vec![], vec![]);

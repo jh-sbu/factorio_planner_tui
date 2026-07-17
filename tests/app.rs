@@ -2,7 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use factorio_planner_tui::app::{
-    Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, WorkspaceView,
+    Action, App, ExitState, MoveDirection, Overlay, Screen, SelectionKind, TargetRateFocus,
+    WorkspaceView,
 };
 use factorio_planner_tui::catalog::{
     CommodityId, FluidId, ItemId, MachineId, MiningMachineId, ModuleId, ProductionSource, RecipeId,
@@ -540,7 +541,86 @@ fn create_plan_prompt_flow_builds_a_workspace() {
     assert_eq!(plan.dataset_profile(), &profile_name("main"));
     assert!(plan.is_dirty());
     assert_eq!(plan.plan().targets()[0].commodity(), &item("iron-plate"));
-    assert_close(plan.plan().targets()[0].rate_per_second().get(), 2.5);
+    assert_close(plan.plan().targets()[0].rate_per_second().get(), 2.5 / 60.0);
+    assert_eq!(plan.plan().display_rate_unit(), RateUnit::Minute);
+}
+
+#[test]
+fn target_rate_focus_cycles_activates_units_and_restricts_editing() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    let profiles = ProfileStore::new(root.path());
+    let plans = PlanFileStore::new();
+    let mut app = App::start(StartupMode::StartScreen, &profiles, &plans).unwrap();
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profiles,
+        &plans,
+    )
+    .unwrap();
+    app.dispatch(Action::ActivateSelection, &profiles, &plans)
+        .unwrap();
+    app.dispatch(Action::AppendPromptText("Units".into()), &profiles, &plans)
+        .unwrap();
+    app.dispatch(Action::SubmitPrompt, &profiles, &plans)
+        .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("iron-plate".into()),
+        &profiles,
+        &plans,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profiles, &plans)
+        .unwrap();
+
+    assert_eq!(app.target_rate_focus(), TargetRateFocus::Input);
+    assert_eq!(app.target_rate_unit(), RateUnit::Minute);
+    app.dispatch(Action::AppendPromptText("120".into()), &profiles, &plans)
+        .unwrap();
+    for (focus, unit) in [
+        (TargetRateFocus::Second, RateUnit::Second),
+        (TargetRateFocus::Minute, RateUnit::Minute),
+        (TargetRateFocus::Hour, RateUnit::Hour),
+        (TargetRateFocus::Input, RateUnit::Hour),
+    ] {
+        app.dispatch(
+            Action::CycleTargetRateFocus { reverse: false },
+            &profiles,
+            &plans,
+        )
+        .unwrap();
+        assert_eq!(app.target_rate_focus(), focus);
+        assert_eq!(app.target_rate_unit(), unit);
+    }
+    app.dispatch(
+        Action::CycleTargetRateFocus { reverse: true },
+        &profiles,
+        &plans,
+    )
+    .unwrap();
+    assert_eq!(app.target_rate_focus(), TargetRateFocus::Hour);
+    app.dispatch(Action::AppendPromptText("9".into()), &profiles, &plans)
+        .unwrap();
+    app.dispatch(Action::BackspacePromptText, &profiles, &plans)
+        .unwrap();
+    assert_eq!(app.prompt_input(), "120");
+    app.dispatch(Action::SubmitPrompt, &profiles, &plans)
+        .unwrap();
+    assert_close(
+        app.plan().unwrap().plan().targets()[0]
+            .rate_per_second()
+            .get(),
+        120.0 / 3600.0,
+    );
+    assert_eq!(
+        app.plan().unwrap().plan().display_rate_unit(),
+        RateUnit::Hour
+    );
+    assert_eq!(
+        app.calculation().unwrap().display_rate_unit(),
+        RateUnit::Hour
+    );
 }
 
 #[test]
@@ -658,7 +738,7 @@ fn cycles_display_rate_unit_as_a_dirty_plan_edit_without_changing_base_rates() {
     plan_store.save(&path, &mut document).unwrap();
     let mut app = App::start(StartupMode::OpenPlan { path }, &profile_store, &plan_store).unwrap();
 
-    for expected in [RateUnit::Minute, RateUnit::Hour, RateUnit::Second] {
+    for expected in [RateUnit::Hour, RateUnit::Second, RateUnit::Minute] {
         app.dispatch(Action::CycleDisplayRateUnit, &profile_store, &plan_store)
             .unwrap();
         assert_eq!(app.plan().unwrap().plan().display_rate_unit(), expected);

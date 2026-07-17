@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use factorio_planner_tui::app::{
     Action, App, ExitState, FocusTarget, MoveDirection, Overlay, OverlayKind, Screen,
-    SelectionKind, TextPromptKind, WorkspaceView,
+    SelectionKind, TargetRateFocus, TextPromptKind, WorkspaceView,
 };
 use factorio_planner_tui::catalog::{CommodityId, FluidId, ItemId, MachineId, ModuleId, RecipeId};
 use factorio_planner_tui::cli::StartupMode;
@@ -614,6 +614,92 @@ fn text_prompt_keys_edit_and_submit_without_treating_q_as_quit() {
 }
 
 #[test]
+fn target_rate_prompt_translates_focus_sensitive_keys() {
+    let base = EventContext {
+        overlay_kind: Some(OverlayKind::TextPrompt),
+        text_prompt_kind: Some(TextPromptKind::TargetRate),
+        target_rate_focus: TargetRateFocus::Input,
+        ..EventContext::default()
+    };
+    assert_eq!(
+        translate_event(&key(KeyCode::Tab, KeyEventKind::Press), base),
+        TranslatedEvent::Action(Action::CycleTargetRateFocus { reverse: false })
+    );
+    assert_eq!(
+        translate_event(&key(KeyCode::BackTab, KeyEventKind::Press), base),
+        TranslatedEvent::Action(Action::CycleTargetRateFocus { reverse: true })
+    );
+    let unit = EventContext {
+        target_rate_focus: TargetRateFocus::Minute,
+        ..base
+    };
+    assert_eq!(
+        translate_event(&key(KeyCode::Char('9'), KeyEventKind::Press), unit),
+        TranslatedEvent::Ignored
+    );
+    assert_eq!(
+        translate_event(&key(KeyCode::Backspace, KeyEventKind::Press), unit),
+        TranslatedEvent::Ignored
+    );
+    assert_eq!(
+        translate_event(&key(KeyCode::Enter, KeyEventKind::Press), unit),
+        TranslatedEvent::Action(Action::SubmitPrompt)
+    );
+}
+
+#[test]
+fn target_rate_prompt_renders_vertical_radio_options_and_focus_cursor() {
+    let root = TempDir::new().unwrap();
+    let sources = TempDir::new().unwrap();
+    create_profile(&root, &sources, "main", "full.json", full_data());
+    let profiles = ProfileStore::new(root.path());
+    let plans = PlanFileStore::new();
+    let mut app = App::start(StartupMode::StartScreen, &profiles, &plans).unwrap();
+    app.dispatch(
+        Action::MoveSelection(MoveDirection::Next),
+        &profiles,
+        &plans,
+    )
+    .unwrap();
+    app.dispatch(Action::ActivateSelection, &profiles, &plans)
+        .unwrap();
+    app.dispatch(Action::AppendPromptText("Render".into()), &profiles, &plans)
+        .unwrap();
+    app.dispatch(Action::SubmitPrompt, &profiles, &plans)
+        .unwrap();
+    app.dispatch(
+        Action::SetSelectionQuery("iron-plate".into()),
+        &profiles,
+        &plans,
+    )
+    .unwrap();
+    app.dispatch(Action::ConfirmSelection, &profiles, &plans)
+        .unwrap();
+
+    let initial = render_to_string(&app, 100, 24);
+    assert!(initial.contains("( ) per second"));
+    assert!(initial.contains("(*) per minute"));
+    assert!(initial.contains("( ) per hour"));
+    assert!(initial.contains("Tab/Shift+Tab select unit"));
+
+    app.dispatch(
+        Action::CycleTargetRateFocus { reverse: false },
+        &profiles,
+        &plans,
+    )
+    .unwrap();
+    let focused = render_to_buffer(&app, 100, 24);
+    let text = buffer_to_string(&focused);
+    assert!(text.contains("> (*) per second"));
+    let (x, y) = text
+        .lines()
+        .enumerate()
+        .find_map(|(y, line)| line.find("> (*) per second").map(|x| (x as u16, y as u16)))
+        .unwrap();
+    assert!(focused[(x, y)].modifier.contains(Modifier::REVERSED));
+}
+
+#[test]
 fn selection_overlay_printable_keys_edit_query() {
     let context = EventContext {
         overlay_kind: Some(OverlayKind::Selection),
@@ -978,7 +1064,7 @@ fn renders_mining_machine_rows_in_the_aggregated_table() {
 
     let screen = render_to_string(&app, 150, 24);
 
-    assert!(screen.contains("> uranium-ore | 10/s | resource: uranium-ore"));
+    assert!(screen.contains("> uranium-ore | 600/min | resource: uranium-ore"));
     assert!(screen.contains("electric-mining-drill"));
     assert!(screen.contains("10/10"));
     assert!(screen.contains("Electric 930kW"));
@@ -1012,7 +1098,7 @@ fn renders_selected_non_recipe_source_details() {
     assert!(screen.contains("Source: offshore pump"));
     assert!(screen.contains("Extraction rate:"));
     assert!(screen.contains("Products"));
-    assert!(screen.contains("water 60/s"));
+    assert!(screen.contains("water 3600/min"));
     assert!(!screen.contains("No production steps"));
 }
 
@@ -1054,9 +1140,9 @@ fn renders_selected_mining_machine_details() {
     assert!(screen.contains("Modules: productivity-module"));
     assert!(screen.contains("Energy: Electric 744kW"));
     assert!(screen.contains("Required fluids"));
-    assert!(screen.contains("sulfuric-acid 80/s"));
+    assert!(screen.contains("sulfuric-acid 4800/min"));
     assert!(screen.contains("Products"));
-    assert!(screen.contains("uranium-ore 10/s"));
+    assert!(screen.contains("uranium-ore 600/min"));
 }
 
 #[test]

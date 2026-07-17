@@ -76,6 +76,35 @@ pub enum TextPromptKind {
     TargetRate,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TargetRateFocus {
+    #[default]
+    Input,
+    Second,
+    Minute,
+    Hour,
+}
+
+impl TargetRateFocus {
+    const fn cycle(self, reverse: bool) -> Self {
+        match (self, reverse) {
+            (Self::Input, false) | (Self::Minute, true) => Self::Second,
+            (Self::Second, false) | (Self::Hour, true) => Self::Minute,
+            (Self::Minute, false) | (Self::Input, true) => Self::Hour,
+            (Self::Hour, false) | (Self::Second, true) => Self::Input,
+        }
+    }
+
+    const fn unit(self) -> Option<RateUnit> {
+        match self {
+            Self::Input => None,
+            Self::Second => Some(RateUnit::Second),
+            Self::Minute => Some(RateUnit::Minute),
+            Self::Hour => Some(RateUnit::Hour),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OverlayKind {
     Selection,
@@ -166,6 +195,8 @@ struct CreatePlanDraft {
     profile: ProfileName,
     name: Option<PlanName>,
     commodity: Option<CommodityId>,
+    rate_unit: RateUnit,
+    rate_focus: TargetRateFocus,
 }
 
 #[derive(Clone, Debug)]
@@ -343,10 +374,15 @@ impl App {
                 self.selection_query.pop();
                 self.selector_index = 0;
             }
-            Action::AppendPromptText(text) => self.prompt_input.push_str(text),
-            Action::BackspacePromptText => {
-                self.prompt_input.pop();
+            Action::AppendPromptText(text) if self.prompt_editing_enabled() => {
+                self.prompt_input.push_str(text);
             }
+            Action::BackspacePromptText => {
+                if self.prompt_editing_enabled() {
+                    self.prompt_input.pop();
+                }
+            }
+            Action::CycleTargetRateFocus { reverse } => self.cycle_target_rate_focus(*reverse),
             Action::SubmitPrompt => self.submit_prompt(profiles)?,
             Action::CancelPrompt => self.cancel_prompt(),
             Action::ConfirmSelection => self.confirm_selection()?,
@@ -482,6 +518,7 @@ impl App {
                 self.edit_plan(|plan| {
                     plan.set_display_rate_unit(unit);
                 })?;
+                self.recalculate_current()?;
                 true
             }
             Action::CycleDisplayRateUnit => {
@@ -594,6 +631,42 @@ impl App {
     #[must_use]
     pub fn prompt_input(&self) -> &str {
         &self.prompt_input
+    }
+
+    #[must_use]
+    pub fn target_rate_focus(&self) -> TargetRateFocus {
+        self.create_plan_draft
+            .as_ref()
+            .map_or(TargetRateFocus::Input, |draft| draft.rate_focus)
+    }
+
+    #[must_use]
+    pub fn target_rate_unit(&self) -> RateUnit {
+        self.create_plan_draft
+            .as_ref()
+            .map_or_else(RateUnit::default, |draft| draft.rate_unit)
+    }
+
+    fn prompt_editing_enabled(&self) -> bool {
+        !matches!(
+            self.overlay,
+            Some(Overlay::TextPrompt(TextPromptKind::TargetRate))
+        ) || self.target_rate_focus() == TargetRateFocus::Input
+    }
+
+    fn cycle_target_rate_focus(&mut self, reverse: bool) {
+        if !matches!(
+            self.overlay,
+            Some(Overlay::TextPrompt(TextPromptKind::TargetRate))
+        ) {
+            return;
+        }
+        if let Some(draft) = self.create_plan_draft.as_mut() {
+            draft.rate_focus = draft.rate_focus.cycle(reverse);
+            if let Some(unit) = draft.rate_focus.unit() {
+                draft.rate_unit = unit;
+            }
+        }
     }
 
     #[must_use]
@@ -944,6 +1017,8 @@ impl App {
             profile,
             name: None,
             commodity: None,
+            rate_unit: RateUnit::default(),
+            rate_focus: TargetRateFocus::Input,
         });
         self.prompt_input.clear();
         self.selection_query.clear();
@@ -1150,7 +1225,9 @@ impl App {
                     self.prompt_input.clear();
                     self.selection_query.clear();
                     self.selector_index = 0;
-                    self.status_message = Some("Enter target rate per second".to_owned());
+                    self.status_message = Some(
+                        "Enter target rate per minute; Tab/Shift+Tab selects units".to_owned(),
+                    );
                     return Ok(());
                 }
                 self.status_message = Some(format!("selected commodity {commodity}"));
@@ -1276,9 +1353,12 @@ impl App {
                 self.status_message = Some("Choose target commodity".to_owned());
             }
             TextPromptKind::TargetRate => {
-                let Ok(rate_per_second) = self.prompt_input.trim().parse::<f64>() else {
-                    self.status_message =
-                        Some("Target rate must be a positive number per second".to_owned());
+                let unit = self.target_rate_unit();
+                let Ok(entered_rate) = self.prompt_input.trim().parse::<f64>() else {
+                    self.status_message = Some(format!(
+                        "Target rate must be a positive number {}",
+                        rate_unit_words(unit)
+                    ));
                     return Ok(());
                 };
                 let Some(draft) = self.create_plan_draft.clone() else {
@@ -1295,12 +1375,19 @@ impl App {
                     self.overlay = Some(Overlay::Selection(SelectionKind::Commodity));
                     return Ok(());
                 };
-                let Ok(target) = Target::new(commodity, rate_per_second) else {
-                    self.status_message =
-                        Some("Target rate must be positive per second".to_owned());
+                let Ok(target) = Target::new(commodity, unit.to_rate_per_second(entered_rate))
+                else {
+                    self.status_message = Some(format!(
+                        "Target rate must be positive {}",
+                        rate_unit_words(unit)
+                    ));
                     return Ok(());
                 };
                 self.create_plan(name, &draft.profile, target, profiles)?;
+                self.edit_plan(|plan| {
+                    plan.set_display_rate_unit(unit);
+                })?;
+                self.recalculate_current()?;
                 self.create_plan_draft = None;
                 self.prompt_input.clear();
                 self.selection_query.clear();
@@ -1546,6 +1633,9 @@ pub enum Action {
     BackspaceSelectionQuery,
     AppendPromptText(String),
     BackspacePromptText,
+    CycleTargetRateFocus {
+        reverse: bool,
+    },
     SubmitPrompt,
     CancelPrompt,
     ConfirmSelection,
@@ -1555,6 +1645,14 @@ pub enum Action {
     ConfirmExit,
     CancelExit,
     DismissStatus,
+}
+
+fn rate_unit_words(unit: RateUnit) -> &'static str {
+    match unit {
+        RateUnit::Second => "per second",
+        RateUnit::Minute => "per minute",
+        RateUnit::Hour => "per hour",
+    }
 }
 
 fn pluralize(count: usize, unit: &str) -> String {
